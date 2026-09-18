@@ -22,6 +22,8 @@ pub enum RequestState {
 pub struct SchedulerConfig {
     /// Maximum independent rows in one latency-sensitive decode batch.
     pub decode_capacity: usize,
+    /// Maximum live branch rows in one native decision group.
+    pub decision_branch_capacity: usize,
     /// Maximum independent prompt chunks in one prefill batch.
     pub prefill_sequence_capacity: usize,
     /// Maximum total prompt tokens consumed by one prefill batch.
@@ -38,6 +40,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             decode_capacity: 8,
+            decision_branch_capacity: 8,
             prefill_sequence_capacity: 8,
             prefill_token_capacity: 2_048,
             max_active_sequences: 8,
@@ -51,6 +54,7 @@ impl SchedulerConfig {
     /// Validates model-independent execution and admission limits.
     pub fn validate(self) -> Result<()> {
         if self.decode_capacity == 0
+            || self.decision_branch_capacity == 0
             || self.prefill_sequence_capacity == 0
             || self.prefill_token_capacity == 0
             || self.max_active_sequences == 0
@@ -60,8 +64,9 @@ impl SchedulerConfig {
                 label: "scheduler configuration",
                 expected: "all capacities greater than zero".to_string(),
                 actual: format!(
-                    "decode={} prefill_sequences={} prefill_tokens={} active={} context={}",
+                    "decode={} decision_branches={} prefill_sequences={} prefill_tokens={} active={} context={}",
                     self.decode_capacity,
+                    self.decision_branch_capacity,
                     self.prefill_sequence_capacity,
                     self.prefill_token_capacity,
                     self.max_active_sequences,
@@ -131,6 +136,14 @@ mod tests {
         assert!(
             SchedulerConfig {
                 decode_capacity: 0,
+                ..SchedulerConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SchedulerConfig {
+                decision_branch_capacity: 0,
                 ..SchedulerConfig::default()
             }
             .validate()

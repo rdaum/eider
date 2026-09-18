@@ -100,6 +100,51 @@ impl Qwen36Sequence {
             )
             .map_err(qwen36_cache_error)
     }
+
+    /// Forks one unaligned live sequence with shared sealed pages.
+    pub fn branch(
+        model: &Qwen36TextModel,
+        source: &Self,
+        cache: &mut Qwen36SequenceCache,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Option<Self>> {
+        let mut state = model.new_sequence_state(max_tokens)?;
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let outcome = cache
+            .branch(
+                source.cache_id,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(qwen36_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Ok(None);
+        };
+        if let Err(error) = model.fork_sequence_state_on_stream(&source.state, &mut state, stream) {
+            let _ = cache.finish(
+                cache_id,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            );
+            return Err(error);
+        }
+        Ok(Some(Self {
+            cache_id,
+            page_table,
+            state,
+        }))
+    }
 }
 
 pub fn new_qwen36_sequence_cache(

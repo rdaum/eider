@@ -218,6 +218,51 @@ impl Qwen38FlashNextSequence {
             )
             .map_err(qwen38_flash_next_cache_error)
     }
+
+    /// Forks one live sequence with shared sealed QSA pages and copied private state.
+    pub(crate) fn branch(
+        model: &Qwen38FlashNextModel,
+        source: &Self,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Option<Self>> {
+        let mut state = model.new_decode_state(max_tokens)?;
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let outcome = cache
+            .branch(
+                source.cache_id,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Ok(None);
+        };
+        if let Err(error) = model.fork_sequence_state_on_stream(&source.state, &mut state, stream) {
+            let _ = cache.finish(
+                cache_id,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            );
+            return Err(error);
+        }
+        Ok(Some(Self {
+            cache_id,
+            page_table,
+            state,
+        }))
+    }
 }
 
 /// Allocates the fixed QSA page budget for active sequences.

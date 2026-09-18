@@ -5,9 +5,10 @@
 //! allocate model execution resources.
 
 use super::{
-    Qwen36DecodeBatchWorkspace, Qwen36MtpDraftWorkspace, Qwen36PrefillBatchWorkspace,
-    Qwen36Sequence, Qwen36SequenceCache, Qwen36SpeculativeCycleWorkspace, Qwen36TextModel,
-    Qwen38DFlash2PrefixCache, Qwen38DFlash2Workspace,
+    Qwen36DecisionReadout, Qwen36DecodeBatchWorkspace, Qwen36MtpDraftWorkspace,
+    Qwen36PrefillBatchWorkspace, Qwen36Sequence, Qwen36SequenceCache,
+    Qwen36SpeculativeCycleWorkspace, Qwen36TextModel, Qwen38DFlash2PrefixCache,
+    Qwen38DFlash2Workspace,
 };
 use crate::sm12x_cache::{Sm12xPageBackend, Sm12xPageTable};
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
@@ -170,6 +171,7 @@ impl Drop for Qwen36SequenceBatch<'_> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen36ExecutionConfig {
     pub(crate) decode_capacity: usize,
+    pub(crate) decision_branch_capacity: usize,
     pub(crate) prefill_sequence_capacity: usize,
     pub(crate) prefill_token_capacity: usize,
     pub(crate) max_active_sequences: usize,
@@ -190,6 +192,7 @@ pub(crate) struct Qwen36ExecutionState<'model> {
     pub(crate) mtp_hidden_scratch: Option<DeviceBuffer<f32>>,
     pub(crate) dflash2_workspace: Option<Qwen38DFlash2Workspace>,
     pub(crate) dflash2_prefix_cache: Qwen38DFlash2PrefixCache,
+    pub(crate) decision_readout: Option<Qwen36DecisionReadout>,
     pub(crate) sequences: Qwen36SequencePool,
 }
 
@@ -199,7 +202,8 @@ impl<'model> Qwen36ExecutionState<'model> {
         model: &'model Qwen36TextModel,
         config: Qwen36ExecutionConfig,
     ) -> Result<Self> {
-        let mut decode_workspaces = decode_capacity_classes(config.decode_capacity)
+        let workspace_capacity = config.decode_capacity.max(config.decision_branch_capacity);
+        let mut decode_workspaces = decode_capacity_classes(workspace_capacity)
             .into_iter()
             .map(|capacity| model.new_decode_batch_workspace(capacity, config.max_context_tokens))
             .collect::<Result<Vec<_>>>()?;
@@ -350,6 +354,7 @@ impl<'model> Qwen36ExecutionState<'model> {
             mtp_hidden_scratch: None,
             dflash2_workspace: None,
             dflash2_prefix_cache: Qwen38DFlash2PrefixCache::new(dflash2_retained_bytes),
+            decision_readout: None,
             sequences: Qwen36SequencePool::new(),
         })
     }

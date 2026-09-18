@@ -1,21 +1,28 @@
 //! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionSequence,
-    Qwen38FlashNextExecutionState, Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceCache,
-    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot, Qwen38FlashNextSequence,
-    Qwen38FlashNextSequenceCache, Qwen38FlashNextSequenceId, Qwen38FlashNextSpeculativeFrontier,
-    Qwen38LogitsMode, Qwen38NextToken, qwen38_flash_next_cache_error,
+    Qwen38FlashNextDecisionReadout, Qwen38FlashNextExecutionConfig,
+    Qwen38FlashNextExecutionSequence, Qwen38FlashNextExecutionState, Qwen38FlashNextModel,
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot,
+    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSequenceId,
+    Qwen38FlashNextSpeculativeFrontier, Qwen38LogitsMode, Qwen38NextToken,
+    qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
-use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::decision::{
+    DECISION_PROMPT_FORMAT, DecisionBranch, DecisionBranchLogits, DecisionCompletion,
+    DecisionRequest, DecisionTimings, DecisionUsage, answers_from_logits,
+    validated_decision_labels,
+};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
-    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick, EngineVerificationProgress,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineCapabilities,
+    EngineDecisionAdmission, EngineDecisionFailed, EngineDecisionFinished, EngineDelta,
+    EngineError, EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId,
+    EngineResult, EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
@@ -74,6 +81,26 @@ struct ActiveRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
+struct DecisionBranchState {
+    branch: DecisionBranch,
+    sequence_id: Qwen38FlashNextSequenceId,
+    suffix_position: usize,
+    sequence_device_bytes: usize,
+}
+
+struct DecisionGroup {
+    id: Qwen38FlashNextRequestId,
+    request: DecisionRequest,
+    parent_sequence_id: Option<Qwen38FlashNextSequenceId>,
+    parent_position: usize,
+    parent_sequence_device_bytes: usize,
+    next_branch: usize,
+    active_branches: Vec<DecisionBranchState>,
+    logits: Vec<DecisionBranchLogits>,
+    released_sequence_device_bytes: usize,
+    timings: DecisionTimings,
+}
+
 /// Decode-first multi-session service for the native QSA runtime.
 pub(crate) struct Qwen38FlashNextChatService<'template> {
     execution: Qwen38FlashNextExecutionState,
@@ -84,6 +111,10 @@ pub(crate) struct Qwen38FlashNextChatService<'template> {
     prefilling: VecDeque<Qwen38FlashNextRequestId>,
     decoding: VecDeque<Qwen38FlashNextRequestId>,
     requests: BTreeMap<Qwen38FlashNextRequestId, ActiveRequest<'template>>,
+    decision_readout: Qwen38FlashNextDecisionReadout,
+    decision_fork_stream: CudaStream,
+    decision_queue: VecDeque<Qwen38FlashNextRequestId>,
+    decisions: BTreeMap<Qwen38FlashNextRequestId, Box<DecisionGroup>>,
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
@@ -107,6 +138,15 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 detail: "native MTP weights were not enabled while loading the model".to_string(),
             });
         }
+        let label_ids = validated_decision_labels(template.tokenizer())
+            .map_err(|error| Error::Format {
+                label: "Qwen3.8 Flash Next decision labels",
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        let decision_readout = model.new_decision_readout(&label_ids)?;
         let execution = Qwen38FlashNextExecutionState::new(
             model,
             Qwen38FlashNextExecutionConfig {
@@ -126,7 +166,111 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
             requests: BTreeMap::new(),
+            decision_readout,
+            decision_fork_stream: CudaStream::new_blocking()?,
+            decision_queue: VecDeque::new(),
+            decisions: BTreeMap::new(),
         })
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> Result<Qwen38FlashNextRequestId> {
+        if self.config.max_active_sequences < 2 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision capacity",
+                expected: "at least two active sequences for a parent and branch".to_string(),
+                actual: self.config.max_active_sequences.to_string(),
+            });
+        }
+        if request.prompt_format != DECISION_PROMPT_FORMAT {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next decision prompt",
+                detail: format!("unsupported prompt format {:?}", request.prompt_format),
+            });
+        }
+        if request.label_token_ids != self.decision_readout.token_ids() {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next decision label head",
+                detail: "request labels differ from the loaded fixed label head".to_string(),
+            });
+        }
+        if request.prefix_tokens.is_empty() || request.branches.is_empty() {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next decision request",
+                detail: "prefix and branches must not be empty".to_string(),
+            });
+        }
+        let vocab = self.execution.model.config().vocab;
+        let validate_tokens = |label: &'static str, tokens: &[u32]| -> Result<()> {
+            if tokens.is_empty() {
+                return Err(Error::Format {
+                    label,
+                    detail: "token sequence must not be empty".to_string(),
+                });
+            }
+            if let Some(token) = tokens.iter().find(|token| **token as usize >= vocab) {
+                return Err(Error::Shape {
+                    label,
+                    expected: format!("token < {vocab}"),
+                    actual: token.to_string(),
+                });
+            }
+            Ok(())
+        };
+        validate_tokens("Qwen3.8 Flash Next decision prefix", &request.prefix_tokens)?;
+        for branch in &request.branches {
+            validate_tokens("Qwen3.8 Flash Next decision suffix", &branch.suffix_tokens)?;
+            validate_tokens(
+                "Qwen3.8 Flash Next decision labels",
+                &branch.label_token_ids,
+            )?;
+            if branch.label_token_ids.len() > request.label_token_ids.len()
+                || branch.label_token_ids.len() != branch.option_keys.len()
+                || request.label_token_ids[..branch.label_token_ids.len()] != branch.label_token_ids
+            {
+                return Err(Error::Format {
+                    label: "Qwen3.8 Flash Next decision labels",
+                    detail: "branch options and fixed label prefix do not match".to_string(),
+                });
+            }
+            let tokens = request
+                .prefix_tokens
+                .len()
+                .checked_add(branch.suffix_tokens.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 Flash Next decision branch length",
+                    expected: "prefix + suffix without overflow".to_string(),
+                    actual: "overflow".to_string(),
+                })?;
+            if tokens > self.config.max_context_tokens {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 Flash Next decision branch length",
+                    expected: format!("at most {} tokens", self.config.max_context_tokens),
+                    actual: tokens.to_string(),
+                });
+            }
+        }
+        let id = Qwen38FlashNextRequestId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next request ID",
+            detail: "request ID space exhausted".to_string(),
+        })?;
+        self.decisions.insert(
+            id,
+            Box::new(DecisionGroup {
+                id,
+                request,
+                parent_sequence_id: None,
+                parent_position: 0,
+                parent_sequence_device_bytes: 0,
+                next_branch: 0,
+                active_branches: Vec::new(),
+                logits: Vec::new(),
+                released_sequence_device_bytes: 0,
+                timings: DecisionTimings::default(),
+            }),
+        );
+        self.decision_queue.push_back(id);
+        Ok(id)
     }
 
     fn add_request(&mut self, request: ChatRequest) -> Result<Qwen38FlashNextAdmission> {
@@ -265,10 +409,325 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
+        self.run_decision_phase(&mut tick, on_lifecycle)?;
         Ok(tick)
     }
 
+    fn run_decision_phase(
+        &mut self,
+        tick: &mut EngineTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
+        ),
+    ) -> Result<()> {
+        let Some(id) = self.decision_queue.pop_front() else {
+            return Ok(());
+        };
+        let mut group = self
+            .decisions
+            .remove(&id)
+            .expect("queued decision group is retained");
+        match self.advance_decision_group(&mut group, tick, on_lifecycle) {
+            Ok(Some(completion)) => tick.decisions_finished.push(EngineDecisionFinished {
+                request_id: EngineRequestId::new(id.get()),
+                completion,
+            }),
+            Ok(None) => {
+                self.decisions.insert(id, group);
+                self.decision_queue.push_back(id);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if let Err(release_error) = self.release_decision_group(&mut group) {
+                    warn!(
+                        request = id.get(),
+                        %release_error,
+                        "failed to release part of Flash Next decision group"
+                    );
+                }
+                tick.decisions_failed.push(EngineDecisionFailed {
+                    request_id: EngineRequestId::new(id.get()),
+                    message,
+                    released_sequence_device_bytes: group.released_sequence_device_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_decision_group(
+        &mut self,
+        group: &mut DecisionGroup,
+        tick: &mut EngineTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
+        ),
+    ) -> Result<Option<DecisionCompletion>> {
+        if group.parent_sequence_id.is_none() {
+            if self.execution.sequences.len() >= self.config.max_active_sequences {
+                return Ok(None);
+            }
+            let started = Instant::now();
+            let sequence = Qwen38FlashNextSequence::admit(
+                &self.execution.model,
+                &mut self.execution.sequence_cache,
+                group.request.prefix_tokens.len(),
+            )?;
+            let sequence_device_bytes = sequence.device_bytes();
+            let id = self
+                .execution
+                .sequences
+                .insert(Qwen38FlashNextExecutionSequence::new(
+                    sequence,
+                    None,
+                    None,
+                    None,
+                    sequence_device_bytes,
+                ))?;
+            group.parent_sequence_id = Some(id);
+            group.parent_sequence_device_bytes = sequence_device_bytes;
+            on_lifecycle(RequestLifecycleEvent::Admitted(
+                Qwen38FlashNextAdmissionProgress {
+                    request_id: group.id,
+                    sequence_device_bytes,
+                    cached_prompt_tokens: 0,
+                    allocation_duration: started.elapsed(),
+                    admitted_after_tick_start: Duration::ZERO,
+                },
+            ));
+            return Ok(None);
+        }
+
+        if group.parent_position < group.request.prefix_tokens.len() {
+            let remaining = group.request.prefix_tokens.len() - group.parent_position;
+            let chunk = remaining.min(self.config.prefill_token_capacity);
+            let start = group.parent_position;
+            let end = start + chunk;
+            let id = group
+                .parent_sequence_id
+                .expect("admitted decision has a parent sequence");
+            on_lifecycle(RequestLifecycleEvent::PrefillStarted(group.id));
+            let started = Instant::now();
+            let mut sequence = self.execution.sequences.lease(id)?;
+            sequence.sequence_mut().sequence.forward_tokens(
+                &mut self.execution.model,
+                &mut self.execution.prefill_workspace,
+                &mut self.execution.sequence_cache,
+                &group.request.prefix_tokens[start..end],
+                Qwen38LogitsMode::None,
+            )?;
+            group.timings.shared_prefill += started.elapsed();
+            group.parent_position = end;
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(group.id.get()),
+                prompt_position: end,
+            });
+            return Ok(None);
+        }
+
+        let available = self
+            .config
+            .max_active_sequences
+            .saturating_sub(self.execution.sequences.len());
+        let wave_capacity = available.min(self.config.decision_branch_capacity);
+        let mut admitted = 0;
+        let fork_started = Instant::now();
+        while admitted < wave_capacity && group.next_branch < group.request.branches.len() {
+            let branch = group.request.branches[group.next_branch].clone();
+            let max_tokens = group.request.prefix_tokens.len() + branch.suffix_tokens.len();
+            let parent_id = group
+                .parent_sequence_id
+                .expect("prefilled decision has a parent sequence");
+            let mut parent = self.execution.sequences.lease(parent_id)?;
+            let sequence = Qwen38FlashNextSequence::branch(
+                &self.execution.model,
+                &parent.sequence_mut().sequence,
+                &mut self.execution.sequence_cache,
+                max_tokens,
+                &self.decision_fork_stream,
+            )?;
+            drop(parent);
+            let Some(sequence) = sequence else {
+                break;
+            };
+            let sequence_device_bytes = sequence.device_bytes();
+            let sequence_id =
+                self.execution
+                    .sequences
+                    .insert(Qwen38FlashNextExecutionSequence::new(
+                        sequence,
+                        None,
+                        None,
+                        None,
+                        sequence_device_bytes,
+                    ))?;
+            group.active_branches.push(DecisionBranchState {
+                branch,
+                sequence_id,
+                suffix_position: 0,
+                sequence_device_bytes,
+            });
+            group.next_branch += 1;
+            admitted += 1;
+        }
+        if admitted != 0 {
+            self.decision_fork_stream.synchronize()?;
+            group.timings.branch_fork += fork_started.elapsed();
+            return Ok(None);
+        }
+
+        let mut token_budget = self.config.prefill_token_capacity;
+        let mut progressed = false;
+        for branch in group
+            .active_branches
+            .iter_mut()
+            .take(self.config.prefill_sequence_capacity)
+        {
+            if token_budget == 0 {
+                break;
+            }
+            let target = branch.branch.suffix_tokens.len().saturating_sub(1);
+            let remaining = target.saturating_sub(branch.suffix_position);
+            if remaining == 0 {
+                continue;
+            }
+            let chunk = remaining.min(token_budget);
+            let start = branch.suffix_position;
+            let end = start + chunk;
+            let started = Instant::now();
+            let mut sequence = self.execution.sequences.lease(branch.sequence_id)?;
+            sequence.sequence_mut().sequence.forward_tokens(
+                &mut self.execution.model,
+                &mut self.execution.prefill_workspace,
+                &mut self.execution.sequence_cache,
+                &branch.branch.suffix_tokens[start..end],
+                Qwen38LogitsMode::None,
+            )?;
+            group.timings.branch_inference += started.elapsed();
+            branch.suffix_position = end;
+            token_budget -= chunk;
+            progressed = true;
+        }
+        if progressed {
+            return Ok(None);
+        }
+
+        let ready = group
+            .active_branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.suffix_position + 1 == branch.branch.suffix_tokens.len())
+            .take(self.config.decision_branch_capacity)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if !ready.is_empty() {
+            for index in ready.iter().copied() {
+                let branch = &group.active_branches[index];
+                let token = branch.branch.suffix_tokens[branch.suffix_position];
+                let started = Instant::now();
+                let logits = {
+                    let mut sequence = self.execution.sequences.lease(branch.sequence_id)?;
+                    let execution_sequence = sequence.sequence_mut();
+                    execution_sequence.sequence.forward_token(
+                        &mut self.execution.model,
+                        &mut self.execution.sequence_cache,
+                        token,
+                        Qwen38LogitsMode::Decision,
+                    )?;
+                    self.execution.model.decision_logits(
+                        &execution_sequence.sequence.state,
+                        &mut self.decision_readout,
+                    )?
+                };
+                group.timings.branch_inference += started.elapsed();
+                group.logits.push(DecisionBranchLogits {
+                    question_id: branch.branch.question_id.clone(),
+                    logits: logits[..branch.branch.label_token_ids.len()].to_vec(),
+                });
+            }
+            for index in ready.into_iter().rev() {
+                let branch = group.active_branches.swap_remove(index);
+                let released = self.release_decision_sequence(branch.sequence_id)?;
+                group.released_sequence_device_bytes = group
+                    .released_sequence_device_bytes
+                    .saturating_add(released.max(branch.sequence_device_bytes));
+            }
+            return Ok(None);
+        }
+
+        if group.next_branch != group.request.branches.len() || !group.active_branches.is_empty() {
+            return Ok(None);
+        }
+        if let Some(parent) = group.parent_sequence_id.take() {
+            let released = self.release_decision_sequence(parent)?;
+            group.released_sequence_device_bytes = group
+                .released_sequence_device_bytes
+                .saturating_add(released.max(group.parent_sequence_device_bytes));
+        }
+        let answers = answers_from_logits(&group.request, &group.logits, 1.0).map_err(|error| {
+            Error::Format {
+                label: "Qwen3.8 Flash Next decision answers",
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Some(DecisionCompletion {
+            answers,
+            usage: DecisionUsage {
+                input_tokens: group.request.logical_input_tokens(),
+                output_tokens: group.request.branches.len(),
+            },
+            timings: group.timings,
+            released_sequence_device_bytes: group.released_sequence_device_bytes,
+        }))
+    }
+
+    fn release_decision_sequence(&mut self, id: Qwen38FlashNextSequenceId) -> Result<usize> {
+        let sequence = self.execution.sequences.release(id)?;
+        let bytes = sequence.device_bytes();
+        sequence.finish(&mut self.execution.sequence_cache, None)?;
+        Ok(bytes)
+    }
+
+    fn release_decision_group(&mut self, group: &mut DecisionGroup) -> Result<()> {
+        let mut first_error = None;
+        for branch in group.active_branches.drain(..) {
+            match self.release_decision_sequence(branch.sequence_id) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(branch.sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(parent) = group.parent_sequence_id.take() {
+            match self.release_decision_sequence(parent) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(group.parent_sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn cancel_request(&mut self, id: Qwen38FlashNextRequestId) -> Qwen38FlashNextCancelOutcome {
+        if let Some(mut group) = self.decisions.remove(&id) {
+            self.decision_queue.retain(|&queued| queued != id);
+            let _ = self.release_decision_group(&mut group);
+            return Qwen38FlashNextCancelOutcome::Cancelled {
+                released_sequence_device_bytes: group.released_sequence_device_bytes,
+            };
+        }
         let Some(request) = self.requests.remove(&id) else {
             return Qwen38FlashNextCancelOutcome::NotFound;
         };
@@ -810,6 +1269,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
 }
 
 impl EngineService for Qwen38FlashNextChatService<'_> {
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities { decisions: true }
+    }
+
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
         let admission =
             Qwen38FlashNextChatService::add_request(self, request).map_err(EngineError::new)?;
@@ -820,6 +1283,19 @@ impl EngineService for Qwen38FlashNextChatService<'_> {
             max_output_tokens: admission.max_output_tokens,
         })
     }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        let input_tokens = request.logical_input_tokens();
+        let branches = request.branches.len();
+        let id =
+            Qwen38FlashNextChatService::add_decision(self, request).map_err(EngineError::new)?;
+        Ok(EngineDecisionAdmission {
+            request_id: EngineRequestId::new(id.get()),
+            input_tokens,
+            branches,
+        })
+    }
+
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),

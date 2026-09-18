@@ -2,12 +2,14 @@
 
 use crate::actor::{ActorRequestId, InferenceActor};
 use crate::chat_completions::{ChatCompletionRequest, ChatCompletionStream};
+use crate::decisions::{DecisionApiRequest, DecisionApiResponse, DecisionCalibration};
 use crate::metrics::{ServerEndpoint, StreamingMode, metrics as server_metrics};
 use crate::protocol::{ApiError, ErrorEnvelope, ResponseRequest, ResponseStream};
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,12 +23,17 @@ use tokio::net::TcpListener;
 
 const MIN_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_BODY_BYTES_PER_CONTEXT_TOKEN: usize = 32;
+const DECISION_MAX_LOGICAL_INPUT_TOKENS: usize = 64 * 1024;
+const DECISION_MAX_BRANCH_INPUT_TOKENS: usize = 32 * 1024;
+const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// HTTP-facing configuration independent of model execution limits.
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
     pub listen: SocketAddr,
     pub model: String,
+    pub decision_model: String,
+    pub decision_calibration: Option<DecisionCalibration>,
     pub bearer_token: Option<String>,
     pub context_window: usize,
 }
@@ -36,9 +43,19 @@ impl ApiConfig {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             model: model.into(),
+            decision_model: String::new(),
+            decision_calibration: None,
             bearer_token: None,
             context_window: 32_768,
         }
+        .with_default_decision_model()
+    }
+
+    fn with_default_decision_model(mut self) -> Self {
+        if self.decision_model.is_empty() {
+            self.decision_model.clone_from(&self.model);
+        }
+        self
     }
 }
 
@@ -77,7 +94,8 @@ pub async fn serve_listener(
 
 fn router(actor: InferenceActor, config: ApiConfig) -> Router {
     let request_body_limit = request_body_limit(config.context_window);
-    Router::new()
+    let decision_capable = actor.capabilities().decisions;
+    let mut router = Router::new()
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
@@ -88,8 +106,14 @@ fn router(actor: InferenceActor, config: ApiConfig) -> Router {
         .route(
             "/v1/chat/completions",
             post(chat_completions).layer(DefaultBodyLimit::max(request_body_limit)),
-        )
-        .with_state(ApiState { actor, config })
+        );
+    if decision_capable {
+        router = router.route(
+            "/v1/decisions",
+            post(decisions).layer(DefaultBodyLimit::max(request_body_limit)),
+        );
+    }
+    router.with_state(ApiState { actor, config })
 }
 
 fn request_body_limit(context_window: usize) -> usize {
@@ -303,6 +327,128 @@ async fn chat_completions(
     non_streaming_chat_completion(state.actor, response.id, response.events, stream).await
 }
 
+async fn decisions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    request: Result<Json<DecisionApiRequest>, JsonRejection>,
+) -> Result<Response, ApiFailure> {
+    server_metrics().requests.inc(ServerEndpoint::Decisions);
+    let _request_duration = RequestDuration::start();
+    authorise(&state.config, &headers)?;
+    let Json(request) = request
+        .map_err(|error| ApiFailure::unprocessable(ApiError::invalid("body", error.body_text())))?;
+    if request.model != state.config.model && request.model != "decision-latest" {
+        server_metrics()
+            .request_errors
+            .inc(ServerEndpoint::Decisions);
+        return Err(ApiFailure::unprocessable(ApiError::invalid(
+            "model",
+            format!(
+                "model {:?} is not served; expected {:?} or \"decision-latest\"",
+                request.model, state.config.model
+            ),
+        )));
+    }
+    let prompt_started = Instant::now();
+    let prompt = request
+        .into_prompt_request()
+        .map_err(ApiFailure::unprocessable)?;
+    let decision = state
+        .actor
+        .prepare_decision(prompt)
+        .map_err(ApiFailure::unprocessable)?;
+    let prompt_preparation = prompt_started.elapsed();
+    server_metrics()
+        .decision_prompt_preparation_us
+        .record(duration_us(prompt_preparation));
+    let logical_tokens = decision.logical_input_tokens();
+    if logical_tokens > DECISION_MAX_LOGICAL_INPUT_TOKENS {
+        return Err(ApiFailure::unprocessable(ApiError::invalid(
+            "questions",
+            format!(
+                "decision input has {logical_tokens} logical tokens; the limit is {DECISION_MAX_LOGICAL_INPUT_TOKENS}"
+            ),
+        )));
+    }
+    let longest_branch = decision.longest_branch_tokens();
+    let branch_limit = DECISION_MAX_BRANCH_INPUT_TOKENS.min(state.config.context_window);
+    if longest_branch > branch_limit {
+        return Err(ApiFailure::unprocessable(ApiError::invalid(
+            "state",
+            format!(
+                "longest decision branch has {longest_branch} tokens; the limit is {branch_limit}"
+            ),
+        )));
+    }
+    let branches = decision.branches.len();
+    let shared_prefix_tokens = decision.prefix_tokens.len();
+    let branch_input_tokens = decision
+        .branches
+        .iter()
+        .map(|branch| branch.suffix_tokens.len())
+        .sum::<usize>();
+    let response = state
+        .actor
+        .submit_decision(decision)
+        .map_err(ApiFailure::server)?;
+    server_metrics().decision_requests_submitted.inc();
+    server_metrics().decision_branches.add(branches as isize);
+    server_metrics()
+        .decision_shared_prefix_tokens
+        .add(shared_prefix_tokens as isize);
+    server_metrics()
+        .decision_branch_input_tokens
+        .add(branch_input_tokens as isize);
+    let mut cancellation = CancellationGuard::new(state.actor, response.id);
+    let completion = tokio::time::timeout(DECISION_TIMEOUT, response.completion)
+        .await
+        .map_err(|_| {
+            ApiFailure::gateway_timeout(ApiError::server(
+                "decision request exceeded the 120 second timeout",
+            ))
+        })?
+        .map_err(|_| {
+            ApiFailure::server(ApiError::server(
+                "inference actor closed the decision before completion",
+            ))
+        })?
+        .map_err(|message| ApiFailure::server(ApiError::server(message)))?;
+    cancellation.disarm();
+    let timings = completion.timings;
+    server_metrics()
+        .decision_shared_prefill_us
+        .record(duration_us(timings.shared_prefill));
+    server_metrics()
+        .decision_branch_fork_us
+        .record(duration_us(timings.branch_fork));
+    server_metrics()
+        .decision_branch_inference_us
+        .record(duration_us(timings.branch_inference));
+    server_metrics()
+        .decision_sequence_device_bytes_released
+        .add(completion.released_sequence_device_bytes as isize);
+    let response = DecisionApiResponse::from_completion(
+        state.config.decision_model,
+        completion,
+        state.config.decision_calibration.as_ref(),
+    )
+    .map_err(ApiFailure::server)?;
+    let server_timing = format!(
+        "prompt;dur={:.3}, shared_prefill;dur={:.3}, fork;dur={:.3}, branches;dur={:.3}",
+        duration_ms(prompt_preparation),
+        duration_ms(timings.shared_prefill),
+        duration_ms(timings.branch_fork),
+        duration_ms(timings.branch_inference),
+    );
+    let mut response = Json(response).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("server-timing"),
+        HeaderValue::from_str(&server_timing)
+            .expect("decision server timing contains only finite decimal values"),
+    );
+    Ok(response)
+}
+
 fn streaming_response(
     actor: InferenceActor,
     request_id: ActorRequestId,
@@ -499,6 +645,20 @@ impl ApiFailure {
             error,
         }
     }
+
+    fn unprocessable(error: ApiError) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            error,
+        }
+    }
+
+    fn gateway_timeout(error: ApiError) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error,
+        }
+    }
 }
 
 impl IntoResponse for ApiFailure {
@@ -529,6 +689,10 @@ impl Drop for RequestDuration {
 
 fn duration_us(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_ms(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1_000.0
 }
 
 #[cfg(test)]

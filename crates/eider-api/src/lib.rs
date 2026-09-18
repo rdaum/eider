@@ -4,6 +4,7 @@
 
 pub mod actor;
 pub mod chat_completions;
+pub mod decisions;
 pub mod deployment;
 pub mod metrics;
 pub mod protocol;

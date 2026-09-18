@@ -105,6 +105,20 @@ curl -fsS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"eider-qwen3.8-flash-next","input":"What is 2+2?","max_output_tokens":64}'
 ```
 
+The same server exposes the experimental native decision path at
+`POST /v1/decisions`. Qwen3.6 remains the measured decision target; Flash Next
+is available for correctness and task-quality evaluation:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"eider-qwen3.8-flash-next","state":"Payouts have failed for three days.","questions":{"urgent":{"type":"noul","instructions":"Is this urgent?"}}}'
+```
+
+Start Qwen3.6 with `EIDER_MODEL=qwen3.6-35b-a3b scripts/run-eider`. See
+[`docs/decision-endpoint.md`](docs/decision-endpoint.md) for
+the complete request contract and current evaluation evidence.
+
 ## Qwen3.8 27B
 
 Qwen3.8 27B is the primary dense model in Eider. The standard launcher uses

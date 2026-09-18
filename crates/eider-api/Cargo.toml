@@ -19,6 +19,7 @@ fast-telemetry.workspace = true
 fast-telemetry-export.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+indexmap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

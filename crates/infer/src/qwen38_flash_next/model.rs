@@ -510,9 +510,60 @@ pub enum Qwen38LogitsMode {
     Top1,
     /// Compute full logits for top-k/top-p sampling.
     Full,
+    /// Preserve the final hidden row for a compact decision projection.
+    Decision,
+}
+
+/// Fixed 64-row BF16 label projection used by native decision requests.
+pub(crate) struct Qwen38FlashNextDecisionReadout {
+    token_ids: Vec<u32>,
+    head: Bf16Linear,
+    logits: DeviceBuffer<f32>,
+}
+
+impl Qwen38FlashNextDecisionReadout {
+    pub(crate) fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
 }
 
 impl Qwen38FlashNextModel {
+    pub(crate) fn new_decision_readout(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<Qwen38FlashNextDecisionReadout> {
+        if token_ids.len() != 64
+            || token_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != token_ids.len()
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision label head",
+                expected: "64 distinct vocabulary token IDs".to_string(),
+                actual: format!("{} token IDs", token_ids.len()),
+            });
+        }
+        Ok(Qwen38FlashNextDecisionReadout {
+            token_ids: token_ids.to_vec(),
+            head: self.lm_head.select_bf16_rows(token_ids)?,
+            logits: DeviceBuffer::zeroed(token_ids.len())?,
+        })
+    }
+
+    pub(crate) fn decision_logits(
+        &self,
+        state: &Qwen38FlashNextDecodeState,
+        readout: &mut Qwen38FlashNextDecisionReadout,
+    ) -> Result<Vec<f32>> {
+        readout
+            .head
+            .run_into(&state.hidden, &mut readout.logits, &state.stream)?;
+        Ok(readout.logits.copy_to_host(&state.stream)?.into_vec())
+    }
+
     /// Loads the released Inferact checkpoint without materializing the PLE table.
     pub fn open(model_dir: impl AsRef<Path>, artifact_dir: impl Into<PathBuf>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
@@ -2039,6 +2090,14 @@ impl Qwen38FlashNextModel {
                 actual: max_tokens.to_string(),
             });
         }
+        let attention_capacity = max_tokens
+            .div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            .checked_mul(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next attention capacity",
+                expected: "page-rounded capacity without overflow".to_string(),
+                actual: max_tokens.to_string(),
+            })?;
         let linear = self
             .manifest
             .linear_attention
@@ -2063,7 +2122,12 @@ impl Qwen38FlashNextModel {
                 }
                 Qwen38AttentionWeights::Qsa(weights) => {
                     attention_workspaces.push(Qwen38AttentionWorkspace::Qsa(
-                        Qwen38QsaWorkspace::new(&self.config, &self.manifest, weights, max_tokens)?,
+                        Qwen38QsaWorkspace::new(
+                            &self.config,
+                            &self.manifest,
+                            weights,
+                            attention_capacity,
+                        )?,
                     ));
                     attention_states.push(Qwen38AttentionState::Qsa);
                     rollback_linear_states.push(None);
@@ -2329,6 +2393,62 @@ impl Qwen38FlashNextModel {
         destination.ple_window.restore_from(&snapshot.ple_window)?;
         destination.stream.synchronize()?;
         destination.position = snapshot.position;
+        Ok(())
+    }
+
+    /// Forks exact recurrent, PLE, and hyperconnection state into an empty sequence.
+    pub(crate) fn fork_sequence_state_on_stream(
+        &self,
+        source: &Qwen38FlashNextDecodeState,
+        destination: &mut Qwen38FlashNextDecodeState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if source.model_id != self.model_id
+            || destination.model_id != self.model_id
+            || destination.position != 0
+            || source.position == 0
+            || source.position > destination.max_tokens
+            || source.attention_states.len() != destination.attention_states.len()
+        {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next live sequence fork",
+                detail: format!(
+                    "incompatible source or destination: source_position={} destination_position={} destination_capacity={}",
+                    source.position, destination.position, destination.max_tokens
+                ),
+            });
+        }
+        for (source, destination) in source
+            .attention_states
+            .iter()
+            .zip(&mut destination.attention_states)
+        {
+            match (source, destination) {
+                (
+                    Qwen38AttentionState::Linear(source),
+                    Qwen38AttentionState::Linear(destination),
+                ) => {
+                    destination.copy_from_on_stream(source, stream)?;
+                }
+                (Qwen38AttentionState::Qsa, Qwen38AttentionState::Qsa) => {}
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.8 Flash Next live sequence fork",
+                        detail: "source and destination layer kinds differ".to_string(),
+                    });
+                }
+            }
+        }
+        destination
+            .ple_state
+            .copy_from_on_stream(&source.ple_state, stream)?;
+        destination.ple_window.restore_from(&source.ple_window)?;
+        destination.streams_a.copy_prefix_from_device_on_stream(
+            &source.streams_a,
+            source.streams_a.len(),
+            stream,
+        )?;
+        destination.position = source.position;
         Ok(())
     }
 
@@ -2925,6 +3045,7 @@ impl Qwen38FlashNextModel {
                 state.stream.synchronize()?;
                 Ok(None)
             }
+            Qwen38LogitsMode::Decision => Ok(None),
         }
     }
 
@@ -3324,6 +3445,7 @@ impl Qwen38FlashNextModel {
                 state.stream.synchronize()?;
                 Ok(None)
             }
+            Qwen38LogitsMode::Decision => Ok(None),
         }
     }
 

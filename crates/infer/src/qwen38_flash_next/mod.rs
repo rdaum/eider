@@ -19,13 +19,14 @@ pub(crate) use execution::{
     Qwen38FlashNextExecutionState, Qwen38FlashNextSequenceId,
 };
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
+pub(crate) use model::{
+    Qwen38FlashNextDecisionReadout, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace,
+    Qwen38FlashNextPrefillWorkspace, Qwen38FlashNextSpeculativeFrontier,
+    Qwen38FlashNextSpeculativeWorkspace,
+};
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
     Qwen38LogitsMode, Qwen38NextToken, Qwen38VectorVerifierProbeMode,
-};
-pub(crate) use model::{
-    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace, Qwen38FlashNextPrefillWorkspace,
-    Qwen38FlashNextSpeculativeFrontier, Qwen38FlashNextSpeculativeWorkspace,
 };
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use probe::{
@@ -357,5 +358,82 @@ mod tests {
             actual.value,
             expected.value
         );
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.8 Flash Next checkpoint"]
+    fn released_live_fork_and_compact_head_match_full_head() {
+        let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_FULL_MODEL_DIR") else {
+            return;
+        };
+        let artifact_dir =
+            std::env::temp_dir().join(format!("eider-qwen38-decision-{}", std::process::id()));
+        let mut model = Qwen38FlashNextModel::open(&model_dir, artifact_dir).expect("full model");
+        let mut cache =
+            new_qwen38_flash_next_sequence_cache(&model, 3, 64).expect("sequence cache");
+        let mut parent = Qwen38FlashNextSequence::admit(&model, &mut cache, 64).expect("parent");
+        let prefix = [17, 29, 41, 53, 67, 79, 83];
+        for token in prefix {
+            parent
+                .forward_token(&mut model, &mut cache, token, Qwen38LogitsMode::None)
+                .expect("parent prefill");
+        }
+        let stream = CudaStream::new_blocking().expect("fork stream");
+        let mut full_branch =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &stream)
+                .expect("full branch")
+                .expect("full branch admission");
+        let mut compact_branch =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &stream)
+                .expect("compact branch")
+                .expect("compact branch admission");
+        stream.synchronize().expect("fork completion");
+
+        let token = 97;
+        parent
+            .forward_token(&mut model, &mut cache, token, Qwen38LogitsMode::Full)
+            .expect("parent full head");
+        let parent_logits = model.logits_to_host(&parent.state).expect("parent logits");
+        full_branch
+            .forward_token(&mut model, &mut cache, token, Qwen38LogitsMode::Full)
+            .expect("branch full head");
+        let branch_logits = model
+            .logits_to_host(&full_branch.state)
+            .expect("branch logits");
+        assert_eq!(
+            parent_logits, branch_logits,
+            "live fork changed full logits"
+        );
+
+        let labels = (0..64).collect::<Vec<_>>();
+        let mut readout = model
+            .new_decision_readout(&labels)
+            .expect("compact decision head");
+        compact_branch
+            .forward_token(&mut model, &mut cache, token, Qwen38LogitsMode::Decision)
+            .expect("compact branch decode");
+        let compact_logits = model
+            .decision_logits(&compact_branch.state, &mut readout)
+            .expect("compact logits");
+        let max_error = compact_logits
+            .iter()
+            .zip(&branch_logits[..64])
+            .map(|(compact, full)| (compact - full).abs())
+            .fold(0.0f32, f32::max);
+        let scale = branch_logits[..64]
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(1.0f32, f32::max);
+        assert!(
+            max_error <= scale * 1e-3,
+            "compact-head error {max_error} exceeds tolerance at scale {scale}"
+        );
+
+        parent.finish(&mut cache).expect("finish parent");
+        full_branch.finish(&mut cache).expect("finish full branch");
+        compact_branch
+            .finish(&mut cache)
+            .expect("finish compact branch");
     }
 }

@@ -121,6 +121,7 @@ pub fn with_loaded_engine<R>(
         model_dir = %model_dir.display(),
         architecture = ?architecture,
         decode_capacity = scheduler.decode_capacity,
+        decision_branch_capacity = scheduler.decision_branch_capacity,
         prefill_sequence_capacity = scheduler.prefill_sequence_capacity,
         prefill_token_capacity = scheduler.prefill_token_capacity,
         max_active_sequences = scheduler.max_active_sequences,

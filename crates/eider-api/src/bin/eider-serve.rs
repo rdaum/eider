@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use eider_api::decisions::DecisionCalibration;
 use eider_api::deployment::{ArtifactKind, resolve_catalogue_model, resolve_local_model};
 use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve_with_shutdown};
@@ -163,6 +164,14 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     decode_capacity: usize,
 
+    /// Maximum live branches in one native decision group.
+    #[arg(long, default_value_t = 8)]
+    decision_branch_capacity: usize,
+
+    /// Validated calibration artifact for the exact decision model.
+    #[arg(long, value_name = "FILE")]
+    decision_calibration: Option<PathBuf>,
+
     /// Maximum simultaneous prefill rows.
     #[arg(long, default_value_t = 8)]
     prefill_sequence_capacity: usize,
@@ -326,12 +335,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let speculative_drafts = args
         .speculative_drafts
         .unwrap_or(resolved.default_speculative_drafts);
+    let decision_calibration = args
+        .decision_calibration
+        .as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)?;
+            DecisionCalibration::from_json(&bytes, &resolved.identity).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.message)
+            })
+        })
+        .transpose()?;
     let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
     actor_config.engine.artifact_dir = resolved.artifact_dir.clone();
     actor_config.engine.dflash_gguf = resolved.dflash_gguf.clone();
     actor_config.engine.dflash2_dir = resolved.dflash2_dir.clone();
     actor_config.engine.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
+        decision_branch_capacity: args.decision_branch_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,
         prefill_token_capacity,
         max_active_sequences: args.max_active_sequences,
@@ -368,6 +388,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ApiConfig {
         listen: args.listen,
         model: served_model_name,
+        decision_model: resolved.identity.clone(),
+        decision_calibration,
         bearer_token: std::env::var(&args.api_key_env).ok(),
         context_window: max_context_tokens,
     };
@@ -376,6 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity = %resolved.identity,
         checkpoint_dir = %resolved.checkpoint_dir.display(),
         artifact_dir = %resolved.artifact_dir.display(),
+        decision_calibrated = config.decision_calibration.is_some(),
         listen = %config.listen,
         "serving model"
     );

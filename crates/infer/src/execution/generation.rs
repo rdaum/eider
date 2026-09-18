@@ -99,6 +99,7 @@ impl<'a> Qwen36GenerationSession<'a> {
             .max(1);
         let scheduler_config = SchedulerConfig {
             decode_capacity: 1,
+            decision_branch_capacity: 1,
             prefill_sequence_capacity: 1,
             prefill_token_capacity: max_tokens
                 .min(SchedulerConfig::default().prefill_token_capacity),

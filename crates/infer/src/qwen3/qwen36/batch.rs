@@ -1,11 +1,11 @@
 //! Qwen3.6 batched prefill, decode, and speculative-execution workspaces.
 
 use super::{
-    Fp8Linear, Qwen36Attention, Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock,
-    Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
-    Qwen36LmHead, Qwen36MoeWeights, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
-    Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage,
-    Qwen36TextModel, maybe_round_device_f32_to_bf16,
+    Bf16Linear, Fp8Linear, Qwen36Attention, Qwen36FullAttentionWeights, Qwen36GateUpStorage,
+    Qwen36LayerBlock, Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState,
+    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36MtpDraftWorkspace,
+    Qwen36MtpSequenceState, Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState,
+    Qwen36SharedExpertStorage, Qwen36TextModel, maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
 
@@ -177,6 +177,190 @@ pub struct Qwen36DecodedBatch<'a> {
     workspace: &'a mut Qwen36DecodeBatchWorkspace,
     rows: usize,
     vocab: usize,
+}
+
+/// Final-normalized hidden rows from a decision decode without a vocabulary head.
+pub struct Qwen36DecisionDecodedBatch<'a> {
+    workspace: &'a mut Qwen36DecodeBatchWorkspace,
+    rows: usize,
+}
+
+enum Qwen36DecisionLabelHead {
+    Nvfp4 {
+        packed_weight: DeviceBuffer<u8>,
+        weight_scale: DeviceBuffer<u8>,
+        weight_scale_2: f32,
+        hidden: usize,
+    },
+    Bf16(Bf16Linear),
+    Fp8(Fp8Linear),
+}
+
+struct Qwen36DecisionReadoutWorkspace {
+    capacity: usize,
+    logits: DeviceBuffer<f32>,
+    quantized: DeviceBuffer<u8>,
+    dynamic_scale: DeviceBuffer<f32>,
+    fp8_plan: Option<BatchFp8LinearPlan>,
+}
+
+/// Fixed 64-row label projection and capacity-class workspaces.
+pub struct Qwen36DecisionReadout {
+    token_ids: Vec<u32>,
+    head: Qwen36DecisionLabelHead,
+    workspaces: Vec<Qwen36DecisionReadoutWorkspace>,
+}
+
+impl Qwen36DecisionReadout {
+    /// Returns the vocabulary rows retained by this compact head.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
+    /// Returns exact device bytes owned by the head and its workspaces.
+    pub fn device_bytes(&self) -> usize {
+        let head = match &self.head {
+            Qwen36DecisionLabelHead::Nvfp4 {
+                packed_weight,
+                weight_scale,
+                ..
+            } => packed_weight.device_bytes() + weight_scale.device_bytes(),
+            Qwen36DecisionLabelHead::Bf16(linear) => linear.weight.device_bytes(),
+            Qwen36DecisionLabelHead::Fp8(linear) => {
+                linear.weight.device_bytes()
+                    + linear
+                        .channel_weight_scale
+                        .as_ref()
+                        .map_or(0, DeviceBuffer::device_bytes)
+            }
+        };
+        head + self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                workspace.logits.device_bytes()
+                    + workspace.quantized.device_bytes()
+                    + workspace.dynamic_scale.device_bytes()
+                    + workspace
+                        .fp8_plan
+                        .as_ref()
+                        .map_or(0, BatchFp8LinearPlan::device_bytes)
+            })
+            .sum::<usize>()
+    }
+
+    /// Projects final hidden rows onto only the retained vocabulary rows.
+    pub fn selected_logits(
+        &mut self,
+        model: &Qwen36TextModel,
+        decoded: &Qwen36DecisionDecodedBatch<'_>,
+    ) -> Result<Vec<f32>> {
+        let rows = decoded.len();
+        let capacity = decoded.capacity();
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.capacity == capacity)
+            .ok_or_else(|| eider_cuda::Error::Shape {
+                label: "Qwen3.6 decision readout capacity",
+                expected: "a configured decode capacity class".to_string(),
+                actual: capacity.to_string(),
+            })?;
+        match &self.head {
+            Qwen36DecisionLabelHead::Nvfp4 {
+                packed_weight,
+                weight_scale,
+                weight_scale_2,
+                hidden,
+            } => eider_cuda::nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+                decoded.final_hidden(),
+                packed_weight,
+                weight_scale,
+                workspace.logits.output(),
+                capacity,
+                self.token_ids.len(),
+                *hidden,
+                *weight_scale_2,
+                decoded.stream(),
+            )?,
+            Qwen36DecisionLabelHead::Bf16(linear) => {
+                bf16_linear_logits_f32_batch_into_on_stream(
+                    decoded.final_hidden(),
+                    &linear.weight,
+                    workspace.logits.output(),
+                    capacity,
+                    linear.rows,
+                    linear.cols,
+                    decoded.stream(),
+                )?;
+            }
+            Qwen36DecisionLabelHead::Fp8(linear) => {
+                let input_quantization = if capacity >= STATIC_FP8_PREFILL_MIN_ROWS
+                    && let Some(input_scale) = linear
+                        .input_scale
+                        .filter(|_| linear.channel_weight_scale.is_none() && !linear.weight_only)
+                {
+                    quantize_fp8_e4m3_f32_into_on_stream(
+                        decoded.final_hidden(),
+                        workspace.quantized.output(),
+                        input_scale,
+                        decoded.stream(),
+                    )?;
+                    BatchFp8InputQuantization::Static(input_scale)
+                } else {
+                    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                        decoded.final_hidden(),
+                        &mut workspace.quantized,
+                        &mut workspace.dynamic_scale,
+                        capacity,
+                        linear.cols,
+                        decoded.stream(),
+                    )?;
+                    BatchFp8InputQuantization::Dynamic
+                };
+                let plan = workspace
+                    .fp8_plan
+                    .as_mut()
+                    .expect("FP8 decision head has a plan");
+                run_fp8_batch(
+                    model,
+                    linear,
+                    plan,
+                    decoded.final_hidden(),
+                    &workspace.quantized,
+                    &workspace.dynamic_scale,
+                    input_quantization,
+                    &mut workspace.logits,
+                    capacity,
+                    256,
+                    false,
+                    decoded.stream(),
+                )?;
+            }
+        }
+        Ok(workspace
+            .logits
+            .copy_prefix_to_host(rows * self.token_ids.len(), decoded.stream())?
+            .into_vec())
+    }
+}
+
+impl Qwen36DecisionDecodedBatch<'_> {
+    pub(crate) fn len(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.workspace.capacity
+    }
+
+    pub(crate) fn final_hidden(&self) -> &DeviceBuffer<f32> {
+        &self.workspace.final_hidden
+    }
+
+    pub(crate) fn stream(&self) -> &CudaStream {
+        self.workspace.stream()
+    }
 }
 
 /// Host-side layer outputs captured by a diagnostic decode.
@@ -3473,6 +3657,144 @@ impl Qwen36TextModel {
         Ok(graphs)
     }
 
+    /// Prepares the fixed label projection used by native decision requests.
+    pub fn new_decision_readout(
+        &self,
+        token_ids: &[u32],
+        capacities: &[usize],
+    ) -> Result<Qwen36DecisionReadout> {
+        if token_ids.len() != 64
+            || token_ids
+                .iter()
+                .any(|token| *token as usize >= self.manifest.vocab)
+            || token_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != token_ids.len()
+        {
+            return Err(eider_cuda::Error::Shape {
+                label: "Qwen3.6 decision label head",
+                expected: "64 distinct vocabulary token IDs".to_string(),
+                actual: format!("{} token IDs", token_ids.len()),
+            });
+        }
+        let stream = CudaStream::new_blocking()?;
+        let head = match &self.lm_head {
+            Qwen36LmHead::Nvfp4(linear) => {
+                let packed_per_row = linear.in_features / 2;
+                let scales_per_row = linear.in_features / 16;
+                let mut packed_weight = DeviceBuffer::zeroed(token_ids.len() * packed_per_row)?;
+                let mut weight_scale = DeviceBuffer::zeroed(token_ids.len() * scales_per_row)?;
+                for (row, token) in token_ids.iter().copied().enumerate() {
+                    packed_weight.copy_range_from_device_on_stream(
+                        row * packed_per_row,
+                        &linear.packed_weight,
+                        token as usize * packed_per_row,
+                        packed_per_row,
+                        &stream,
+                    )?;
+                    weight_scale.copy_range_from_device_on_stream(
+                        row * scales_per_row,
+                        &linear.weight_scale,
+                        token as usize * scales_per_row,
+                        scales_per_row,
+                        &stream,
+                    )?;
+                }
+                Qwen36DecisionLabelHead::Nvfp4 {
+                    packed_weight,
+                    weight_scale,
+                    weight_scale_2: linear.weight_scale_2,
+                    hidden: linear.in_features,
+                }
+            }
+            Qwen36LmHead::Bf16(linear) => {
+                let mut weight = DeviceBuffer::zeroed(token_ids.len() * linear.cols)?;
+                for (row, token) in token_ids.iter().copied().enumerate() {
+                    weight.copy_range_from_device_on_stream(
+                        row * linear.cols,
+                        &linear.weight,
+                        token as usize * linear.cols,
+                        linear.cols,
+                        &stream,
+                    )?;
+                }
+                Qwen36DecisionLabelHead::Bf16(Bf16Linear {
+                    weight,
+                    rows: token_ids.len(),
+                    cols: linear.cols,
+                })
+            }
+            Qwen36LmHead::Fp8 { linear, .. } => {
+                let mut weight = DeviceBuffer::zeroed(token_ids.len() * linear.cols)?;
+                for (row, token) in token_ids.iter().copied().enumerate() {
+                    weight.copy_range_from_device_on_stream(
+                        row * linear.cols,
+                        &linear.weight,
+                        token as usize * linear.cols,
+                        linear.cols,
+                        &stream,
+                    )?;
+                }
+                let channel_weight_scale = if let Some(source) = &linear.channel_weight_scale {
+                    let mut selected = DeviceBuffer::zeroed(token_ids.len())?;
+                    for (row, token) in token_ids.iter().copied().enumerate() {
+                        selected.copy_range_from_device_on_stream(
+                            row,
+                            source,
+                            token as usize,
+                            1,
+                            &stream,
+                        )?;
+                    }
+                    Some(selected)
+                } else {
+                    None
+                };
+                Qwen36DecisionLabelHead::Fp8(Fp8Linear {
+                    weight,
+                    rows: token_ids.len(),
+                    cols: linear.cols,
+                    weight_scale: linear.weight_scale,
+                    channel_weight_scale,
+                    input_scale: linear.input_scale,
+                    weight_only: linear.weight_only,
+                })
+            }
+        };
+        stream.synchronize()?;
+        let mut workspaces = Vec::with_capacity(capacities.len());
+        for &capacity in capacities {
+            if capacity == 0 {
+                return Err(eider_cuda::Error::Shape {
+                    label: "Qwen3.6 decision readout capacity",
+                    expected: "positive capacities".to_string(),
+                    actual: capacity.to_string(),
+                });
+            }
+            let fp8_plan = match &head {
+                Qwen36DecisionLabelHead::Fp8(linear) => {
+                    Some(BatchFp8LinearPlan::new(self, linear, capacity)?)
+                }
+                Qwen36DecisionLabelHead::Nvfp4 { .. } | Qwen36DecisionLabelHead::Bf16(_) => None,
+            };
+            workspaces.push(Qwen36DecisionReadoutWorkspace {
+                capacity,
+                logits: DeviceBuffer::zeroed(capacity * token_ids.len())?,
+                quantized: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
+                dynamic_scale: DeviceBuffer::zeroed(capacity)?,
+                fp8_plan,
+            });
+        }
+        Ok(Qwen36DecisionReadout {
+            token_ids: token_ids.to_vec(),
+            head,
+            workspaces,
+        })
+    }
+
     /// Allocates shared scratch and execution plans for batched decode.
     pub fn new_decode_batch_workspace(
         &self,
@@ -3785,11 +4107,26 @@ impl Qwen36TextModel {
         cache: &mut Qwen36SequenceCache,
     ) -> Result<Qwen36DecodedBatch<'w>> {
         let active_rows = rows.len();
-        self.execute_decode_batch(workspace, rows, cache, None)?;
+        self.execute_decode_batch(workspace, rows, cache, None, true)?;
         Ok(Qwen36DecodedBatch {
             workspace,
             rows: active_rows,
             vocab: self.manifest.vocab,
+        })
+    }
+
+    /// Decodes decision rows through final normalization without the vocabulary head.
+    pub fn decode_batch_for_decision<'w>(
+        &self,
+        workspace: &'w mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+        cache: &mut Qwen36SequenceCache,
+    ) -> Result<Qwen36DecisionDecodedBatch<'w>> {
+        let active_rows = rows.len();
+        self.execute_decode_batch(workspace, rows, cache, None, false)?;
+        Ok(Qwen36DecisionDecodedBatch {
+            workspace,
+            rows: active_rows,
         })
     }
 
@@ -3802,7 +4139,7 @@ impl Qwen36TextModel {
     ) -> Result<Qwen36DecodeBatchTrace> {
         let mut layers = Vec::with_capacity(self.layers.len());
         let active_rows = rows.len();
-        self.execute_decode_batch(workspace, rows, cache, Some(&mut layers))?;
+        self.execute_decode_batch(workspace, rows, cache, Some(&mut layers), true)?;
         let decoded = Qwen36DecodedBatch {
             workspace,
             rows: active_rows,
@@ -3820,6 +4157,7 @@ impl Qwen36TextModel {
         rows: &mut [Qwen36DecodeRow<'_>],
         cache: &mut Qwen36SequenceCache,
         trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
+        run_lm_head: bool,
     ) -> Result<()> {
         let mut reservations = Vec::with_capacity(rows.len());
         for index in 0..rows.len() {
@@ -3885,7 +4223,14 @@ impl Qwen36TextModel {
                     page_table: sequence.page_table.device(),
                 });
             }
-            self.decode_batch_impl(workspace, &mut state_rows, cache, &appends, trace)
+            self.decode_batch_impl(
+                workspace,
+                &mut state_rows,
+                cache,
+                &appends,
+                trace,
+                run_lm_head,
+            )
         };
         if let Err(error) = result {
             let mut rollback_error = None;
@@ -3957,6 +4302,7 @@ impl Qwen36TextModel {
         cache: &mut Qwen36SequenceCache,
         appends: &[Qwen36Append<'_>],
         mut trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
+        run_lm_head: bool,
     ) -> Result<()> {
         if workspace.model_id != self.model_id {
             return Err(eider_cuda::Error::Format {
@@ -4183,6 +4529,9 @@ impl Qwen36TextModel {
             stream,
         )?;
         round_f32_to_bf16_in_place_on_stream(workspace.final_hidden.inout(), stream)?;
+        if !run_lm_head {
+            return Ok(());
+        }
         match &self.lm_head {
             Qwen36LmHead::Nvfp4(linear) => linear.run_f32_batch_into(
                 &workspace.final_hidden,

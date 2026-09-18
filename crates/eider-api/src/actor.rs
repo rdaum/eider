@@ -4,9 +4,13 @@ use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use eider_inference::metrics::metrics as infer_metrics;
 use eider_inference::{InferenceEngineConfig, with_loaded_engine};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::decision::{
+    DecisionCompletion, DecisionPromptCompiler, DecisionPromptRequest, DecisionRequest,
+};
 use eider_runtime::engine::{
-    EngineCancelOutcome, EngineDraftStats, EngineFinished, EngineLifecycleEvent, EngineRequestId,
-    EngineService, EngineVerificationProgress,
+    EngineCancelOutcome, EngineCapabilities, EngineDraftStats, EngineFinished,
+    EngineLifecycleEvent, EngineRequestId, EngineService, EngineVerificationProgress,
 };
 use eider_runtime::generation::GenerationConfig;
 use eider_runtime::request::{ChatFinishReason, ChatRequest};
@@ -15,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
@@ -49,11 +53,19 @@ pub struct ActorResponse {
     pub events: mpsc::Receiver<InferenceEvent>,
 }
 
+/// Accepted non-streaming decision request.
+pub struct DecisionActorResponse {
+    pub id: ActorRequestId,
+    pub completion: oneshot::Receiver<Result<DecisionCompletion, String>>,
+}
+
 /// Cloneable async-side handle for the CUDA-owning inference thread.
 #[derive(Clone)]
 pub struct InferenceActor {
     inner: Arc<ActorInner>,
     defaults: GenerationConfig,
+    capabilities: EngineCapabilities,
+    decision_compiler: Option<Arc<DecisionPromptCompiler>>,
 }
 
 struct ActorInner {
@@ -70,6 +82,12 @@ enum ActorCommand {
         events: mpsc::Sender<InferenceEvent>,
         submitted_at: Instant,
     },
+    SubmitDecision {
+        id: ActorRequestId,
+        request: DecisionRequest,
+        completion: oneshot::Sender<Result<DecisionCompletion, String>>,
+        submitted_at: Instant,
+    },
     Cancel(ActorRequestId),
     Shutdown,
 }
@@ -78,6 +96,17 @@ struct ActiveRequest {
     external_id: ActorRequestId,
     events: mpsc::Sender<InferenceEvent>,
     metrics: SessionMetrics,
+}
+
+struct ActiveDecision {
+    external_id: ActorRequestId,
+    completion: oneshot::Sender<Result<DecisionCompletion, String>>,
+    submitted_at: Instant,
+}
+
+struct ActorReady {
+    defaults: GenerationConfig,
+    capabilities: EngineCapabilities,
 }
 
 struct SessionMetrics {
@@ -132,6 +161,11 @@ impl InferenceActor {
                 "actor event capacity must be greater than zero",
             ));
         }
+        let decision_template = CheckpointChatTemplate::from_model_dir(&config.engine.model_dir)
+            .map_err(|error| {
+                ApiError::server(format!("failed to load decision template: {error}"))
+            })?;
+        let decision_compiler = DecisionPromptCompiler::new(decision_template);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let event_capacity = config.event_capacity;
@@ -141,10 +175,17 @@ impl InferenceActor {
             .map_err(|error| {
                 ApiError::server(format!("failed to start inference actor: {error}"))
             })?;
-        let defaults = ready_rx
+        let ready = ready_rx
             .recv()
             .map_err(|_| ApiError::server("inference actor exited during startup"))?
             .map_err(ApiError::server)?;
+        let decision_compiler = if ready.capabilities.decisions {
+            Some(Arc::new(decision_compiler.map_err(|error| {
+                ApiError::server(format!("failed to initialize decision labels: {error}"))
+            })?))
+        } else {
+            None
+        };
         Ok(Self {
             inner: Arc::new(ActorInner {
                 commands: commands_tx,
@@ -152,12 +193,37 @@ impl InferenceActor {
                 event_capacity,
                 worker: Some(worker),
             }),
-            defaults,
+            defaults: ready.defaults,
+            capabilities: ready.capabilities,
+            decision_compiler,
         })
     }
 
     pub fn generation_defaults(&self) -> &GenerationConfig {
         &self.defaults
+    }
+
+    /// Returns the capabilities of the loaded model service.
+    pub fn capabilities(&self) -> EngineCapabilities {
+        self.capabilities
+    }
+
+    /// Compiles and validates a decision prompt before GPU admission.
+    pub fn prepare_decision(
+        &self,
+        request: DecisionPromptRequest,
+    ) -> Result<DecisionRequest, ApiError> {
+        if !self.capabilities.decisions {
+            return Err(ApiError::invalid(
+                "model",
+                "the loaded model does not support decision requests",
+            ));
+        }
+        self.decision_compiler
+            .as_ref()
+            .ok_or_else(|| ApiError::server("decision prompt compiler is unavailable"))?
+            .prepare(request)
+            .map_err(|error| ApiError::invalid("questions", error.to_string()))
     }
 
     /// Queues a request without blocking an async executor on CUDA work.
@@ -176,6 +242,28 @@ impl InferenceActor {
         Ok(ActorResponse {
             id,
             events: events_rx,
+        })
+    }
+
+    /// Queues one compiled decision group without blocking the async executor.
+    pub fn submit_decision(
+        &self,
+        request: DecisionRequest,
+    ) -> Result<DecisionActorResponse, ApiError> {
+        let id = ActorRequestId(self.inner.next_request_id.fetch_add(1, Ordering::Relaxed));
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(ActorCommand::SubmitDecision {
+                id,
+                request,
+                completion: completion_tx,
+                submitted_at: Instant::now(),
+            })
+            .map_err(|_| ApiError::server("inference actor is not running"))?;
+        Ok(DecisionActorResponse {
+            id,
+            completion: completion_rx,
         })
     }
 
@@ -204,7 +292,7 @@ impl Drop for ActorInner {
 fn actor_main(
     config: InferenceActorConfig,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
-    ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
+    ready: std::sync::mpsc::SyncSender<Result<ActorReady, String>>,
 ) {
     let result = with_loaded_engine(config.engine, |service, defaults| {
         run_actor_loop(service, &mut commands, &ready, defaults);
@@ -217,7 +305,7 @@ fn actor_main(
 fn run_actor_loop(
     service: &mut dyn EngineService,
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
-    ready: &std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
+    ready: &std::sync::mpsc::SyncSender<Result<ActorReady, String>>,
     defaults: GenerationConfig,
 ) {
     info!(
@@ -229,30 +317,54 @@ fn run_actor_loop(
         frequency_penalty = %defaults.sampling.frequency_penalty,
         "inference actor ready"
     );
-    if ready.send(Ok(defaults)).is_err() {
+    if ready
+        .send(Ok(ActorReady {
+            defaults,
+            capabilities: service.capabilities(),
+        }))
+        .is_err()
+    {
         return;
     }
 
     let mut active = BTreeMap::<EngineRequestId, ActiveRequest>::new();
+    let mut active_decisions = BTreeMap::<EngineRequestId, ActiveDecision>::new();
     let mut scheduler_by_external = BTreeMap::<ActorRequestId, EngineRequestId>::new();
     loop {
-        if active.is_empty() {
+        if active.is_empty() && active_decisions.is_empty() {
             let Some(command) = commands.blocking_recv() else {
                 break;
             };
-            if !handle_command(command, service, &mut active, &mut scheduler_by_external) {
+            if !handle_command(
+                command,
+                service,
+                &mut active,
+                &mut active_decisions,
+                &mut scheduler_by_external,
+            ) {
                 break;
             }
         }
 
         while let Ok(command) = commands.try_recv() {
-            if !handle_command(command, service, &mut active, &mut scheduler_by_external) {
-                cancel_all(service, &mut active, &mut scheduler_by_external);
+            if !handle_command(
+                command,
+                service,
+                &mut active,
+                &mut active_decisions,
+                &mut scheduler_by_external,
+            ) {
+                cancel_all(
+                    service,
+                    &mut active,
+                    &mut active_decisions,
+                    &mut scheduler_by_external,
+                );
                 shutdown_service(service);
                 return;
             }
         }
-        if active.is_empty() {
+        if active.is_empty() && active_decisions.is_empty() {
             continue;
         }
 
@@ -309,15 +421,22 @@ fn run_actor_loop(
             Err(error) => {
                 let message = error.to_string();
                 error!(error = %message, "inference scheduler failed");
-                server_metrics()
-                    .request_errors
-                    .add(ServerEndpoint::Responses, active.len() as isize);
+                server_metrics().request_errors.add(
+                    ServerEndpoint::Responses,
+                    (active.len() + active_decisions.len()) as isize,
+                );
                 for request in active.values() {
                     let _ = request
                         .events
                         .try_send(InferenceEvent::Error(message.clone()));
                 }
-                fail_all(service, &mut active, &mut scheduler_by_external, &message);
+                fail_all(
+                    service,
+                    &mut active,
+                    &mut active_decisions,
+                    &mut scheduler_by_external,
+                    &message,
+                );
                 continue;
             }
         };
@@ -455,14 +574,64 @@ fn run_actor_loop(
                     }));
             }
         }
+        for finished in tick.decisions_finished {
+            if let Some(request) = active_decisions.remove(&finished.request_id) {
+                scheduler_by_external.remove(&request.external_id);
+                infer_metrics().requests_completed.inc();
+                server_metrics()
+                    .completion_tokens
+                    .add(finished.completion.usage.output_tokens as isize);
+                info!(
+                    session = request.external_id.0,
+                    input_tokens = finished.completion.usage.input_tokens,
+                    output_tokens = finished.completion.usage.output_tokens,
+                    elapsed_ms = now.duration_since(request.submitted_at).as_secs_f64() * 1000.0,
+                    state_released_bytes = finished.completion.released_sequence_device_bytes,
+                    "decision complete"
+                );
+                let _ = request.completion.send(Ok(finished.completion));
+            }
+        }
+        for failed in tick.decisions_failed {
+            if let Some(request) = active_decisions.remove(&failed.request_id) {
+                scheduler_by_external.remove(&request.external_id);
+                infer_metrics().requests_failed.inc();
+                server_metrics()
+                    .request_errors
+                    .inc(ServerEndpoint::Decisions);
+                warn!(
+                    session = request.external_id.0,
+                    error = %failed.message,
+                    state_released_bytes = failed.released_sequence_device_bytes,
+                    "decision failed"
+                );
+                let _ = request.completion.send(Err(failed.message));
+            }
+        }
+        disconnected.extend(
+            active_decisions
+                .iter()
+                .filter_map(|(id, request)| request.completion.is_closed().then_some(*id)),
+        );
         disconnected.sort_unstable();
         disconnected.dedup();
         for id in disconnected {
-            cancel_scheduler_request(id, service, &mut active, &mut scheduler_by_external);
+            cancel_scheduler_request(
+                id,
+                service,
+                &mut active,
+                &mut active_decisions,
+                &mut scheduler_by_external,
+            );
         }
-        update_current_counts(service, &active);
+        update_current_counts(service, &active, &active_decisions);
     }
-    cancel_all(service, &mut active, &mut scheduler_by_external);
+    cancel_all(
+        service,
+        &mut active,
+        &mut active_decisions,
+        &mut scheduler_by_external,
+    );
     shutdown_service(service);
 }
 
@@ -476,6 +645,7 @@ fn handle_command(
     command: ActorCommand,
     service: &mut dyn EngineService,
     active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    active_decisions: &mut BTreeMap<EngineRequestId, ActiveDecision>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) -> bool {
     match command {
@@ -513,9 +683,51 @@ fn handle_command(
                 let _ = events.try_send(InferenceEvent::Error(error.to_string()));
             }
         },
+        ActorCommand::SubmitDecision {
+            id,
+            request,
+            completion,
+            submitted_at,
+        } => match service.add_decision(request) {
+            Ok(admission) => {
+                active_decisions.insert(
+                    admission.request_id,
+                    ActiveDecision {
+                        external_id: id,
+                        completion,
+                        submitted_at,
+                    },
+                );
+                scheduler_by_external.insert(id, admission.request_id);
+                server_metrics()
+                    .active_requests
+                    .set((active.len() + active_decisions.len()) as i64);
+                server_metrics()
+                    .prompt_tokens
+                    .add(admission.input_tokens as isize);
+                info!(
+                    session = id.0,
+                    input_tokens = admission.input_tokens,
+                    branches = admission.branches,
+                    active_requests = active.len() + active_decisions.len(),
+                    "decision queued"
+                );
+            }
+            Err(error) => {
+                warn!(session = id.0, error = %error, "failed to admit decision");
+                server_metrics().responses_admission_errors.inc();
+                let _ = completion.send(Err(error.to_string()));
+            }
+        },
         ActorCommand::Cancel(id) => {
             if let Some(scheduler_id) = scheduler_by_external.get(&id).copied() {
-                cancel_scheduler_request(scheduler_id, service, active, scheduler_by_external);
+                cancel_scheduler_request(
+                    scheduler_id,
+                    service,
+                    active,
+                    active_decisions,
+                    scheduler_by_external,
+                );
             }
         }
         ActorCommand::Shutdown => return false,
@@ -527,6 +739,7 @@ fn cancel_scheduler_request(
     scheduler_id: EngineRequestId,
     service: &mut dyn EngineService,
     active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    active_decisions: &mut BTreeMap<EngineRequestId, ActiveDecision>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) {
     let outcome = service.cancel_request(scheduler_id);
@@ -551,16 +764,37 @@ fn cancel_scheduler_request(
             service.active_sequence_count(),
         );
     }
-    update_current_counts(service, active);
+    if let Some(request) = active_decisions.remove(&scheduler_id) {
+        scheduler_by_external.remove(&request.external_id);
+        infer_metrics().requests_cancelled.inc();
+        server_metrics()
+            .responses_completed
+            .inc(FinishReason::Cancelled);
+        info!(
+            session = request.external_id.0,
+            elapsed_ms = Instant::now()
+                .duration_since(request.submitted_at)
+                .as_secs_f64()
+                * 1000.0,
+            state_released_bytes = released_sequence_device_bytes,
+            "decision cancelled"
+        );
+    }
+    update_current_counts(service, active, active_decisions);
 }
 
 fn fail_all(
     service: &mut dyn EngineService,
     active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    active_decisions: &mut BTreeMap<EngineRequestId, ActiveDecision>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
     error: &str,
 ) {
-    let ids = active.keys().copied().collect::<Vec<_>>();
+    let ids = active
+        .keys()
+        .chain(active_decisions.keys())
+        .copied()
+        .collect::<Vec<_>>();
     for id in ids {
         let outcome = service.cancel_request(id);
         let released_sequence_device_bytes = match outcome {
@@ -584,26 +818,39 @@ fn fail_all(
                 error,
             );
         }
+        if let Some(request) = active_decisions.remove(&id) {
+            scheduler_by_external.remove(&request.external_id);
+            infer_metrics().requests_failed.inc();
+            let _ = request.completion.send(Err(error.to_string()));
+        }
     }
-    update_current_counts(service, active);
+    update_current_counts(service, active, active_decisions);
 }
 
 fn cancel_all(
     service: &mut dyn EngineService,
     active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    active_decisions: &mut BTreeMap<EngineRequestId, ActiveDecision>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) {
-    let ids = active.keys().copied().collect::<Vec<_>>();
+    let ids = active
+        .keys()
+        .chain(active_decisions.keys())
+        .copied()
+        .collect::<Vec<_>>();
     for id in ids {
-        cancel_scheduler_request(id, service, active, scheduler_by_external);
+        cancel_scheduler_request(id, service, active, active_decisions, scheduler_by_external);
     }
 }
 
 fn update_current_counts(
     service: &dyn EngineService,
     active: &BTreeMap<EngineRequestId, ActiveRequest>,
+    active_decisions: &BTreeMap<EngineRequestId, ActiveDecision>,
 ) {
-    server_metrics().active_requests.set(active.len() as i64);
+    server_metrics()
+        .active_requests
+        .set((active.len() + active_decisions.len()) as i64);
     infer_metrics()
         .active_sequences
         .set(service.active_sequence_count() as i64);
@@ -983,9 +1230,12 @@ mod tests {
     use super::*;
     use eider_inference::{CheckpointArchitecture, checkpoint_architecture};
     use eider_runtime::chat_output::ChatOutputEvent;
+    use eider_runtime::decision::{
+        DECISION_PROMPT_FORMAT, DecisionCompletion, DecisionRequest, DecisionUsage,
+    };
     use eider_runtime::engine::{
-        EngineAdmission, EngineAdmissionProgress, EngineDelta, EnginePrefillProgress, EngineResult,
-        EngineTick,
+        EngineAdmission, EngineAdmissionProgress, EngineDecisionAdmission, EngineDecisionFailed,
+        EngineDecisionFinished, EngineDelta, EnginePrefillProgress, EngineResult, EngineTick,
     };
     use eider_runtime::request::ChatUsage;
     use std::fs;
@@ -1095,6 +1345,157 @@ mod tests {
             }))
         ));
         assert!(engine.cancelled.is_empty());
+    }
+
+    struct FakeDecisionEngine {
+        ticked: bool,
+        fail: bool,
+    }
+
+    impl EngineService for FakeDecisionEngine {
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities { decisions: true }
+        }
+
+        fn add_request(&mut self, _request: ChatRequest) -> EngineResult<EngineAdmission> {
+            Err(eider_runtime::engine::EngineError::message(
+                "chat is not used in this test",
+            ))
+        }
+
+        fn add_decision(
+            &mut self,
+            request: DecisionRequest,
+        ) -> EngineResult<EngineDecisionAdmission> {
+            Ok(EngineDecisionAdmission {
+                request_id: EngineRequestId::new(7),
+                input_tokens: request.logical_input_tokens(),
+                branches: request.branches.len(),
+            })
+        }
+
+        fn tick(
+            &mut self,
+            _on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+        ) -> EngineResult<EngineTick> {
+            assert!(!self.ticked);
+            self.ticked = true;
+            if self.fail {
+                return Ok(EngineTick {
+                    decisions_failed: vec![EngineDecisionFailed {
+                        request_id: EngineRequestId::new(7),
+                        message: "one branch failed".to_string(),
+                        released_sequence_device_bytes: 32,
+                    }],
+                    ..EngineTick::default()
+                });
+            }
+            Ok(EngineTick {
+                decisions_finished: vec![EngineDecisionFinished {
+                    request_id: EngineRequestId::new(7),
+                    completion: DecisionCompletion {
+                        answers: Vec::new(),
+                        usage: DecisionUsage {
+                            input_tokens: 2,
+                            output_tokens: 0,
+                        },
+                        timings: Default::default(),
+                        released_sequence_device_bytes: 32,
+                    },
+                }],
+                ..EngineTick::default()
+            })
+        }
+
+        fn cancel_request(&mut self, _id: EngineRequestId) -> EngineCancelOutcome {
+            EngineCancelOutcome::NotFound
+        }
+
+        fn active_sequence_count(&self) -> usize {
+            usize::from(!self.ticked)
+        }
+    }
+
+    #[test]
+    fn actor_returns_one_decision_group_completion() {
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        commands_tx
+            .send(ActorCommand::SubmitDecision {
+                id: ActorRequestId(2),
+                request: DecisionRequest {
+                    prompt_format: DECISION_PROMPT_FORMAT,
+                    prefix_tokens: vec![1, 2],
+                    label_token_ids: (0..64).collect(),
+                    branches: Vec::new(),
+                },
+                completion: completion_tx,
+                submitted_at: Instant::now(),
+            })
+            .expect("actor command receiver is live");
+        drop(commands_tx);
+
+        let mut engine = FakeDecisionEngine {
+            ticked: false,
+            fail: false,
+        };
+        run_actor_loop(
+            &mut engine,
+            &mut commands,
+            &ready_tx,
+            GenerationConfig::default(),
+        );
+
+        let ready = ready_rx
+            .recv()
+            .expect("actor reports readiness")
+            .expect("actor is ready");
+        assert!(ready.capabilities.decisions);
+        let completion = completion_rx
+            .try_recv()
+            .expect("decision completion was delivered")
+            .expect("decision completed successfully");
+        assert_eq!(completion.usage.input_tokens, 2);
+        assert_eq!(completion.released_sequence_device_bytes, 32);
+    }
+
+    #[test]
+    fn actor_reports_one_decision_group_failure() {
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        let (ready_tx, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        commands_tx
+            .send(ActorCommand::SubmitDecision {
+                id: ActorRequestId(3),
+                request: DecisionRequest {
+                    prompt_format: DECISION_PROMPT_FORMAT,
+                    prefix_tokens: vec![1, 2],
+                    label_token_ids: (0..64).collect(),
+                    branches: Vec::new(),
+                },
+                completion: completion_tx,
+                submitted_at: Instant::now(),
+            })
+            .expect("actor command receiver is live");
+        drop(commands_tx);
+
+        let mut engine = FakeDecisionEngine {
+            ticked: false,
+            fail: true,
+        };
+        run_actor_loop(
+            &mut engine,
+            &mut commands,
+            &ready_tx,
+            GenerationConfig::default(),
+        );
+
+        let error = completion_rx
+            .try_recv()
+            .expect("decision failure was delivered")
+            .expect_err("decision must fail");
+        assert_eq!(error, "one branch failed");
     }
 
     #[test]

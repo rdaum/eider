@@ -4,6 +4,7 @@
 //! not expose model buffers, streams, logits, or model-specific sequence IDs.
 
 use crate::chat_output::ChatOutputEvent;
+use crate::decision::{DecisionCompletion, DecisionRequest};
 use crate::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use std::error::Error;
 use std::fmt;
@@ -38,7 +39,23 @@ impl EngineError {
             source: Box::new(source),
         }
     }
+
+    /// Creates an engine error from a stable boundary message.
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::new(EngineMessageError(message.into()))
+    }
 }
+
+#[derive(Debug)]
+struct EngineMessageError(String);
+
+impl fmt::Display for EngineMessageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for EngineMessageError {}
 
 impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,6 +81,21 @@ pub struct EngineAdmission {
     pub prompt_tokens: usize,
     /// Requested completion-token limit.
     pub max_output_tokens: usize,
+}
+
+/// Request metadata known once an engine accepts a decision group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineDecisionAdmission {
+    pub request_id: EngineRequestId,
+    pub input_tokens: usize,
+    pub branches: usize,
+}
+
+/// Stable capabilities exposed by one loaded engine.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineCapabilities {
+    /// The engine accepts native decision requests.
+    pub decisions: bool,
 }
 
 /// Persistent sequence state allocated during a scheduler tick.
@@ -177,6 +209,25 @@ pub struct EngineTick {
     pub output: Vec<EngineDelta>,
     /// Completed requests.
     pub finished: Vec<EngineFinished>,
+    /// Completed decision groups.
+    pub decisions_finished: Vec<EngineDecisionFinished>,
+    /// Decision groups that failed without stopping unrelated work.
+    pub decisions_failed: Vec<EngineDecisionFailed>,
+}
+
+/// Terminal decision group emitted by an engine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineDecisionFinished {
+    pub request_id: EngineRequestId,
+    pub completion: DecisionCompletion,
+}
+
+/// Request-scoped decision failure emitted by an engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineDecisionFailed {
+    pub request_id: EngineRequestId,
+    pub message: String,
+    pub released_sequence_device_bytes: usize,
 }
 
 /// Result of a cancellation request sent to an inference engine.
@@ -199,8 +250,20 @@ pub enum EngineCancelOutcome {
 /// per scheduler tick, outside model and kernel hot paths. Errors cross this
 /// boundary as runtime-owned [`EngineError`] values.
 pub trait EngineService {
+    /// Returns stable capabilities for this loaded service.
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities::default()
+    }
+
     /// Adds one rendered request to the model-specific scheduler.
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission>;
+
+    /// Adds one compiled decision group to a decision-capable engine.
+    fn add_decision(&mut self, _request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        Err(EngineError::message(
+            "the loaded model does not support decision requests",
+        ))
+    }
 
     /// Executes one scheduler tick and emits lifecycle transitions.
     fn tick(

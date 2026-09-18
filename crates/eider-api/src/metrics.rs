@@ -27,6 +27,7 @@ pub enum ServerEndpoint {
     Models,
     Responses,
     ChatCompletions,
+    Decisions,
     Metrics,
 }
 
@@ -62,6 +63,33 @@ pub struct ServerMetrics {
 
     #[help = "Chat Completions requests submitted to the inference actor by streaming mode"]
     pub chat_completions_submitted: LabeledCounter<StreamingMode>,
+
+    #[help = "Decision groups submitted"]
+    pub decision_requests_submitted: Counter,
+
+    #[help = "Question branches submitted through the decision endpoint"]
+    pub decision_branches: Counter,
+
+    #[help = "Shared prefix tokens submitted through the decision endpoint"]
+    pub decision_shared_prefix_tokens: Counter,
+
+    #[help = "Question suffix tokens submitted through the decision endpoint"]
+    pub decision_branch_input_tokens: Counter,
+
+    #[help = "Decision sequence device bytes released at group completion"]
+    pub decision_sequence_device_bytes_released: Counter,
+
+    #[help = "Decision prompt preparation duration in microseconds"]
+    pub decision_prompt_preparation_us: Histogram,
+
+    #[help = "Decision shared prefill duration in microseconds"]
+    pub decision_shared_prefill_us: Histogram,
+
+    #[help = "Decision branch fork duration in microseconds"]
+    pub decision_branch_fork_us: Histogram,
+
+    #[help = "Decision branch inference duration in microseconds"]
+    pub decision_branch_inference_us: Histogram,
 
     #[help = "Responses API requests rejected at admission"]
     pub responses_admission_errors: Counter,
@@ -125,6 +153,15 @@ impl ServerMetrics {
             request_errors: LabeledCounter::new(shard_count),
             responses_submitted: LabeledCounter::new(shard_count),
             chat_completions_submitted: LabeledCounter::new(shard_count),
+            decision_requests_submitted: Counter::new(shard_count),
+            decision_branches: Counter::new(shard_count),
+            decision_shared_prefix_tokens: Counter::new(shard_count),
+            decision_branch_input_tokens: Counter::new(shard_count),
+            decision_sequence_device_bytes_released: Counter::new(shard_count),
+            decision_prompt_preparation_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            decision_shared_prefill_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            decision_branch_fork_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            decision_branch_inference_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             responses_admission_errors: Counter::new(shard_count),
             responses_completed: LabeledCounter::new(shard_count),
             prompt_tokens: Counter::new(shard_count),

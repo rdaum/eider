@@ -10,9 +10,10 @@ pub(crate) use batch::{
     BatchFullAttentionWorkspace, Qwen36BatchModelView, Qwen36HybridPrefillWorkspace,
 };
 pub use batch::{
-    Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow,
-    Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
-    Qwen36SpeculativeCycleOutcome, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
+    Qwen36DecisionDecodedBatch, Qwen36DecisionReadout, Qwen36DecodeBatchTrace,
+    Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow, Qwen36DecodedBatch,
+    Qwen36PrefillBatchWorkspace, Qwen36PrefillRow, Qwen36SpeculativeCycleOutcome,
+    Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
 };
 pub use dflash2::{DFlash2Config, inspect_dflash2_config, validate_dflash2_checkpoint};
 pub(crate) use dflash2::{
@@ -8111,6 +8112,39 @@ impl Qwen36LmHead {
         Bf16Linear::load(checkpoint, "lm_head.weight", rows, cols).map(Self::Bf16)
     }
 
+    pub(crate) fn select_bf16_rows(&self, token_ids: &[u32]) -> Result<Bf16Linear> {
+        let Self::Bf16(linear) = self else {
+            return Err(Error::Format {
+                label: "BF16 selected vocabulary head",
+                detail: "the loaded vocabulary head is not BF16".to_string(),
+            });
+        };
+        if token_ids.iter().any(|token| *token as usize >= linear.rows) {
+            return Err(Error::Shape {
+                label: "BF16 selected vocabulary head",
+                expected: format!("token ID below {}", linear.rows),
+                actual: format!("{token_ids:?}"),
+            });
+        }
+        let stream = CudaStream::new_blocking()?;
+        let mut weight = DeviceBuffer::zeroed(token_ids.len() * linear.cols)?;
+        for (row, token) in token_ids.iter().copied().enumerate() {
+            weight.copy_range_from_device_on_stream(
+                row * linear.cols,
+                &linear.weight,
+                token as usize * linear.cols,
+                linear.cols,
+                &stream,
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(Bf16Linear {
+            weight,
+            rows: token_ids.len(),
+            cols: linear.cols,
+        })
+    }
+
     fn load(
         checkpoint: &ModelOptCheckpoint,
         lt: &CublasLt,
@@ -9080,6 +9114,53 @@ impl Qwen36TextModel {
         }
         stream.synchronize()?;
         destination.position = snapshot.position;
+        Ok(())
+    }
+
+    /// Forks exact recurrent state into an empty live sequence on one stream.
+    pub(crate) fn fork_sequence_state_on_stream(
+        &self,
+        source: &Qwen36SequenceState,
+        destination: &mut Qwen36SequenceState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if source.model_id != self.model_id
+            || destination.model_id != self.model_id
+            || source.append_pending
+            || destination.append_pending
+            || destination.position != 0
+            || source.position == 0
+            || source.position > destination.max_tokens
+            || source.linear_states.len() != destination.linear_states.len()
+        {
+            return Err(Error::Format {
+                label: "Qwen3.6 live sequence fork",
+                detail: format!(
+                    "incompatible source or destination: source_position={} destination_position={} destination_capacity={}",
+                    source.position, destination.position, destination.max_tokens
+                ),
+            });
+        }
+        for (source, destination) in source
+            .linear_states
+            .iter()
+            .zip(&mut destination.linear_states)
+        {
+            match (source, destination) {
+                (Some(source), Some(destination)) => {
+                    destination.copy_from_on_stream(source, stream)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.6 live sequence fork",
+                        detail: "source and destination layer kinds differ".to_string(),
+                    });
+                }
+            }
+        }
+        destination.position = source.position;
+        destination.rollback_position = source.position;
         Ok(())
     }
 

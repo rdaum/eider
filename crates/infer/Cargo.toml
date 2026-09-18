@@ -61,6 +61,10 @@ name = "qwen36_prefill"
 harness = false
 
 [[bench]]
+name = "qwen36_decision"
+harness = false
+
+[[bench]]
 name = "step37_prefill"
 harness = false
 

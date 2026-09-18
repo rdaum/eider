@@ -881,7 +881,6 @@ unsafe extern "C" {
         pv_splits: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_attention_pipelined_on_stream(
         query: *const f32,
         key_values: *const u8,

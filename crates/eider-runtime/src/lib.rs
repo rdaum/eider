@@ -9,6 +9,7 @@
 pub mod cache;
 pub mod chat;
 pub mod chat_output;
+pub mod decision;
 pub mod engine;
 pub mod generation;
 pub mod request;

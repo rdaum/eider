@@ -10,12 +10,19 @@ use crate::qwen3::qwen36::{
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::decision::{
+    DECISION_PROMPT_FORMAT, DecisionBranch, DecisionBranchLogits, DecisionCompletion,
+    DecisionRequest, DecisionTimings, DecisionUsage, answers_from_logits,
+};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
 use eider_runtime::scheduler::{
     RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
 use eider_runtime::tool_grammar::QwenXmlToolGrammar;
-use seqcache::{AdmissionOutcome, AdmissionRequest, CacheError, CacheStats};
+use seqcache::{
+    AdmissionOutcome, AdmissionRequest, CacheError, CacheStats, PrefixEntryId, PrefixMatch,
+    RetainOutcome,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -94,8 +101,27 @@ pub struct Qwen36SchedulerTick {
     pub speculative: Vec<Qwen38SpeculativeProgress>,
     /// Requests that finished during this tick.
     pub finished: Vec<Qwen36RequestId>,
+    /// Decision groups completed during this tick.
+    pub decisions_finished: Vec<Qwen36DecisionFinished>,
+    /// Decision groups that failed during this tick.
+    pub decisions_failed: Vec<Qwen36DecisionFailed>,
     /// Device-resident sequences remaining after the tick.
     pub active_sequences: usize,
+}
+
+/// One complete native decision group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Qwen36DecisionFinished {
+    pub request_id: Qwen36RequestId,
+    pub completion: DecisionCompletion,
+}
+
+/// One failed native decision group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen36DecisionFailed {
+    pub request_id: Qwen36RequestId,
+    pub message: String,
+    pub released_sequence_device_bytes: usize,
 }
 
 /// Request-scoped Qwen3.8 draft acceptance observed during one scheduler tick.
@@ -169,6 +195,28 @@ struct Qwen36Request {
     spec_frontier: Option<Qwen36SpeculativeFrontier>,
     spec_ready: bool,
     spec_started: bool,
+}
+
+struct Qwen36DecisionBranch {
+    branch: DecisionBranch,
+    sequence_id: Qwen36SequenceId,
+    suffix_position: usize,
+    sequence_device_bytes: usize,
+}
+
+struct Qwen36DecisionGroup {
+    id: Qwen36RequestId,
+    request: DecisionRequest,
+    parent_sequence_id: Option<Qwen36SequenceId>,
+    parent_position: usize,
+    parent_sequence_device_bytes: usize,
+    aligned_prefix: Option<PrefixMatch>,
+    aligned_prefix_entry: Option<PrefixEntryId>,
+    next_branch: usize,
+    active_branches: Vec<Qwen36DecisionBranch>,
+    logits: Vec<DecisionBranchLogits>,
+    released_sequence_device_bytes: usize,
+    timings: DecisionTimings,
 }
 
 impl Qwen36Request {
@@ -258,6 +306,8 @@ pub struct Qwen36Scheduler<'model> {
     waiting: VecDeque<Qwen36RequestId>,
     prefilling: VecDeque<Qwen36RequestId>,
     decoding: VecDeque<Qwen36RequestId>,
+    decisions: BTreeMap<Qwen36RequestId, Box<Qwen36DecisionGroup>>,
+    decision_queue: VecDeque<Qwen36RequestId>,
     next_id: u64,
 }
 
@@ -279,6 +329,7 @@ impl<'model> Qwen36Scheduler<'model> {
             model,
             Qwen36ExecutionConfig {
                 decode_capacity: config.decode_capacity,
+                decision_branch_capacity: config.decision_branch_capacity,
                 prefill_sequence_capacity: config.prefill_sequence_capacity,
                 prefill_token_capacity: config.prefill_token_capacity,
                 max_active_sequences: config.max_active_sequences,
@@ -294,6 +345,8 @@ impl<'model> Qwen36Scheduler<'model> {
             waiting: VecDeque::new(),
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
+            decisions: BTreeMap::new(),
+            decision_queue: VecDeque::new(),
             next_id: 0,
         })
     }
@@ -391,6 +444,123 @@ impl<'model> Qwen36Scheduler<'model> {
         Ok(id)
     }
 
+    /// Adds one compiled native decision group to the CPU waiting queue.
+    pub fn add_decision(&mut self, request: DecisionRequest) -> Result<Qwen36RequestId> {
+        let readout = self
+            .execution
+            .decision_readout
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.6 decision readout",
+                detail: "fixed label head was not prepared at model load".to_string(),
+            })?;
+        if readout.token_ids() != request.label_token_ids {
+            return Err(Error::Format {
+                label: "Qwen3.6 decision label head",
+                detail: "request labels differ from the loaded fixed label head".to_string(),
+            });
+        }
+        if request.prompt_format != DECISION_PROMPT_FORMAT {
+            return Err(Error::Format {
+                label: "Qwen3.6 decision prompt",
+                detail: format!("unsupported prompt format {:?}", request.prompt_format),
+            });
+        }
+        if request.prefix_tokens.is_empty() || request.branches.is_empty() {
+            return Err(Error::Format {
+                label: "Qwen3.6 decision request",
+                detail: "prefix and branches must not be empty".to_string(),
+            });
+        }
+        let vocab = self.execution.model.manifest().vocab;
+        let validate_tokens = |label: &'static str, tokens: &[u32]| -> Result<()> {
+            if tokens.is_empty() {
+                return Err(Error::Format {
+                    label,
+                    detail: "token sequence must not be empty".to_string(),
+                });
+            }
+            if let Some(token) = tokens.iter().find(|token| **token as usize >= vocab) {
+                return Err(Error::Shape {
+                    label,
+                    expected: format!("token < {vocab}"),
+                    actual: token.to_string(),
+                });
+            }
+            Ok(())
+        };
+        validate_tokens("Qwen3.6 decision prefix", &request.prefix_tokens)?;
+        validate_tokens("Qwen3.6 decision label head", &request.label_token_ids)?;
+        if request.label_token_ids.len() != 64 {
+            return Err(Error::Shape {
+                label: "Qwen3.6 decision label head",
+                expected: "64 token IDs".to_string(),
+                actual: request.label_token_ids.len().to_string(),
+            });
+        }
+        for branch in &request.branches {
+            validate_tokens("Qwen3.6 decision suffix", &branch.suffix_tokens)?;
+            validate_tokens("Qwen3.6 decision labels", &branch.label_token_ids)?;
+            if branch.label_token_ids.len() != branch.option_keys.len() {
+                return Err(Error::Shape {
+                    label: "Qwen3.6 decision labels",
+                    expected: format!("{} option labels", branch.option_keys.len()),
+                    actual: branch.label_token_ids.len().to_string(),
+                });
+            }
+            if request.label_token_ids[..branch.label_token_ids.len()] != branch.label_token_ids {
+                return Err(Error::Format {
+                    label: "Qwen3.6 decision labels",
+                    detail: "branch labels are not a prefix of the fixed label head".to_string(),
+                });
+            }
+            let branch_tokens = request
+                .prefix_tokens
+                .len()
+                .checked_add(branch.suffix_tokens.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.6 decision branch length",
+                    expected: "prefix + suffix without overflow".to_string(),
+                    actual: format!(
+                        "{} + {}",
+                        request.prefix_tokens.len(),
+                        branch.suffix_tokens.len()
+                    ),
+                })?;
+            if branch_tokens > self.config.max_context_tokens {
+                return Err(Error::Shape {
+                    label: "Qwen3.6 decision branch length",
+                    expected: format!("at most {} tokens", self.config.max_context_tokens),
+                    actual: branch_tokens.to_string(),
+                });
+            }
+        }
+        let id = Qwen36RequestId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
+            label: "Qwen3.6 request ID",
+            detail: "request ID space exhausted".to_string(),
+        })?;
+        self.decisions.insert(
+            id,
+            Box::new(Qwen36DecisionGroup {
+                id,
+                request,
+                parent_sequence_id: None,
+                parent_position: 0,
+                parent_sequence_device_bytes: 0,
+                aligned_prefix: None,
+                aligned_prefix_entry: None,
+                next_branch: 0,
+                active_branches: Vec::new(),
+                logits: Vec::new(),
+                released_sequence_device_bytes: 0,
+                timings: DecisionTimings::default(),
+            }),
+        );
+        self.decision_queue.push_back(id);
+        Ok(id)
+    }
+
     /// Runs one decode-first scheduling iteration followed by bounded prefill.
     pub fn tick(&mut self) -> Result<Qwen36SchedulerTick> {
         self.tick_with_lifecycle(&mut |_| {})
@@ -409,6 +579,7 @@ impl<'model> Qwen36Scheduler<'model> {
         self.admit_waiting(&mut tick, tick_started, on_lifecycle)?;
         self.run_decode_phase(&mut tick)?;
         self.run_prefill_phase(&mut tick, on_lifecycle)?;
+        self.run_decision_phase(&mut tick, on_lifecycle)?;
         tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
@@ -1514,8 +1685,479 @@ impl<'model> Qwen36Scheduler<'model> {
         Ok(())
     }
 
+    fn run_decision_phase(
+        &mut self,
+        tick: &mut Qwen36SchedulerTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
+    ) -> Result<()> {
+        let Some(id) = self.decision_queue.pop_front() else {
+            return Ok(());
+        };
+        let mut group = self
+            .decisions
+            .remove(&id)
+            .expect("queued decision group is retained");
+        match self.advance_decision_group(&mut group, tick, on_lifecycle) {
+            Ok(Some(completion)) => {
+                tick.decisions_finished.push(Qwen36DecisionFinished {
+                    request_id: id,
+                    completion,
+                });
+            }
+            Ok(None) => {
+                self.decisions.insert(id, group);
+                self.decision_queue.push_back(id);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if let Err(release_error) = self.release_decision_group(&mut group) {
+                    warn!(
+                        request = id.get(),
+                        %release_error,
+                        "failed to release part of decision group after execution error"
+                    );
+                }
+                tick.decisions_failed.push(Qwen36DecisionFailed {
+                    request_id: id,
+                    message,
+                    released_sequence_device_bytes: group.released_sequence_device_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_decision_group(
+        &mut self,
+        group: &mut Qwen36DecisionGroup,
+        tick: &mut Qwen36SchedulerTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
+    ) -> Result<Option<DecisionCompletion>> {
+        if group.parent_sequence_id.is_none() {
+            if self.execution.sequences.len() >= self.config.max_active_sequences {
+                return Ok(None);
+            }
+            let max_tokens = group.request.prefix_tokens.len();
+            let sequence = Qwen36Sequence::admit(
+                self.execution.model,
+                &mut self.execution.sequence_cache,
+                max_tokens,
+                &self.execution.cache_stream,
+            )?;
+            let (sequence_id, sequence_device_bytes) =
+                self.execution.sequences.insert(sequence, None)?;
+            group.parent_sequence_id = Some(sequence_id);
+            group.parent_sequence_device_bytes = sequence_device_bytes;
+            tick.admitted.push(Qwen36AdmissionProgress {
+                request_id: group.id,
+                sequence_device_bytes,
+                cached_prompt_tokens: 0,
+                admitted_after_tick_start: Duration::ZERO,
+            });
+            on_lifecycle(RequestLifecycleEvent::Admitted(
+                *tick.admitted.last().expect("decision admission was added"),
+            ));
+            return Ok(None);
+        }
+
+        if group.parent_position < group.request.prefix_tokens.len() {
+            let remaining = group.request.prefix_tokens.len() - group.parent_position;
+            let chunk = remaining.min(self.config.prefill_token_capacity);
+            let sequence_id = group
+                .parent_sequence_id
+                .expect("admitted decision has a parent sequence");
+            let mut sequences = self.execution.sequences.lease_many(&[sequence_id])?;
+            let start = group.parent_position;
+            let end = start + chunk;
+            on_lifecycle(RequestLifecycleEvent::PrefillStarted(group.id));
+            let started = Instant::now();
+            {
+                let mut rows = [Qwen36PrefillRow {
+                    token_ids: &group.request.prefix_tokens[start..end],
+                    sequence: &mut sequences.entry_mut(0).sequence,
+                }];
+                self.execution.model.prefill_batch(
+                    &mut self.execution.prefill_workspace,
+                    &mut rows,
+                    &mut self.execution.sequence_cache,
+                )?;
+            }
+            group.timings.shared_prefill += started.elapsed();
+            drop(sequences);
+            group.parent_position = end;
+            tick.prefilled.push(Qwen36PrefillProgress {
+                request_id: group.id,
+                tokens: chunk,
+                prompt_position: end,
+            });
+            return Ok(None);
+        }
+
+        if group.parent_position.is_multiple_of(SM12X_KV_PAGE_TOKENS)
+            && group.aligned_prefix.is_none()
+        {
+            let parent_id = group
+                .parent_sequence_id
+                .expect("prefilled decision has a parent sequence");
+            let mut sequences = self.execution.sequences.lease_many(&[parent_id])?;
+            let parent = &mut sequences.entry_mut(0).sequence;
+            let started = Instant::now();
+            let snapshot = self.execution.model.snapshot_sequence(&parent.state)?;
+            let retained = self
+                .execution
+                .sequence_cache
+                .retain_prefix(
+                    parent.cache_id,
+                    &group.request.prefix_tokens,
+                    snapshot,
+                    &mut Sm12xCacheContext {
+                        stream: &self.execution.cache_stream,
+                        page_table: &mut parent.page_table,
+                    },
+                )
+                .map_err(sequence_cache_error)?;
+            self.execution.cache_stream.synchronize()?;
+            group.timings.branch_fork += started.elapsed();
+            group.aligned_prefix_entry = match retained {
+                RetainOutcome::Inserted(entry) => Some(entry),
+                RetainOutcome::Duplicate(_) => None,
+            };
+            let mut lookup_tokens = group.request.prefix_tokens.clone();
+            lookup_tokens.push(0);
+            group.aligned_prefix = self.execution.sequence_cache.lookup_prefix(&lookup_tokens);
+            if group.aligned_prefix.is_none() {
+                return Err(Error::Format {
+                    label: "Qwen3.6 aligned decision fork",
+                    detail: "retained parent prefix was not found".to_string(),
+                });
+            }
+            return Ok(None);
+        }
+
+        let available = self
+            .config
+            .max_active_sequences
+            .saturating_sub(self.execution.sequences.len());
+        let wave_capacity = available.min(self.config.decision_branch_capacity);
+        let mut admitted = 0usize;
+        let fork_started = Instant::now();
+        while admitted < wave_capacity && group.next_branch < group.request.branches.len() {
+            let branch = group.request.branches[group.next_branch].clone();
+            let max_tokens = group.request.prefix_tokens.len() + branch.suffix_tokens.len();
+            let sequence = if let Some(prefix) = group.aligned_prefix {
+                self.admit_aligned_decision_branch(prefix, max_tokens)?
+            } else {
+                let parent_id = group
+                    .parent_sequence_id
+                    .expect("prefilled decision has a parent sequence");
+                let mut sequences = self.execution.sequences.lease_many(&[parent_id])?;
+                let parent = &sequences.entry_mut(0).sequence;
+                Qwen36Sequence::branch(
+                    self.execution.model,
+                    parent,
+                    &mut self.execution.sequence_cache,
+                    max_tokens,
+                    &self.execution.cache_stream,
+                )?
+            };
+            let Some(sequence) = sequence else {
+                break;
+            };
+            let (sequence_id, sequence_device_bytes) =
+                self.execution.sequences.insert(sequence, None)?;
+            group.active_branches.push(Qwen36DecisionBranch {
+                branch,
+                sequence_id,
+                suffix_position: 0,
+                sequence_device_bytes,
+            });
+            group.next_branch += 1;
+            admitted += 1;
+        }
+        if admitted != 0 {
+            // The children run on non-blocking prefill and decode streams. Make
+            // the cache-tail and recurrent-state fork visible before handoff.
+            self.execution.cache_stream.synchronize()?;
+            group.timings.branch_fork += fork_started.elapsed();
+            return Ok(None);
+        }
+
+        let mut selected = Vec::new();
+        let mut token_budget = self.config.prefill_token_capacity;
+        for (index, branch) in group.active_branches.iter().enumerate() {
+            if selected.len() == self.config.prefill_sequence_capacity || token_budget == 0 {
+                break;
+            }
+            let prefill_target = branch.branch.suffix_tokens.len().saturating_sub(1);
+            let remaining = prefill_target.saturating_sub(branch.suffix_position);
+            if remaining == 0 {
+                continue;
+            }
+            let chunk = remaining.min(token_budget);
+            selected.push((index, chunk));
+            token_budget -= chunk;
+        }
+        if !selected.is_empty() {
+            let sequence_ids = selected
+                .iter()
+                .map(|(index, _)| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
+            let mut rows = Vec::with_capacity(selected.len());
+            for ((index, chunk), sequence) in selected.iter().zip(sequences.entries_mut()) {
+                let branch = &group.active_branches[*index];
+                let start = branch.suffix_position;
+                let end = start + *chunk;
+                rows.push(Qwen36PrefillRow {
+                    token_ids: &branch.branch.suffix_tokens[start..end],
+                    sequence: &mut sequence.sequence,
+                });
+            }
+            let started = Instant::now();
+            self.execution.model.prefill_batch(
+                &mut self.execution.prefill_workspace,
+                &mut rows,
+                &mut self.execution.sequence_cache,
+            )?;
+            group.timings.branch_inference += started.elapsed();
+            drop(rows);
+            drop(sequences);
+            for (index, chunk) in selected {
+                group.active_branches[index].suffix_position += chunk;
+            }
+            return Ok(None);
+        }
+
+        let ready = group
+            .active_branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.suffix_position + 1 == branch.branch.suffix_tokens.len())
+            .take(self.config.decision_branch_capacity)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if !ready.is_empty() {
+            let sequence_ids = ready
+                .iter()
+                .map(|index| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let workspace = self
+                .execution
+                .decode_workspaces
+                .iter_mut()
+                .find(|workspace| workspace.capacity() >= ready.len())
+                .expect("decode capacity classes cover decision waves");
+            let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
+            let started = Instant::now();
+            let logits = {
+                let mut rows = Vec::with_capacity(ready.len());
+                for (index, sequence) in ready.iter().zip(sequences.entries_mut()) {
+                    let branch = &group.active_branches[*index];
+                    rows.push(Qwen36DecodeRow {
+                        token_id: branch.branch.suffix_tokens[branch.suffix_position],
+                        sequence: &mut sequence.sequence,
+                    });
+                }
+                let decoded = self.execution.model.decode_batch_for_decision(
+                    workspace,
+                    &mut rows,
+                    &mut self.execution.sequence_cache,
+                )?;
+                self.execution
+                    .decision_readout
+                    .as_mut()
+                    .expect("decision requests require a prepared label head")
+                    .selected_logits(self.execution.model, &decoded)?
+            };
+            group.timings.branch_inference += started.elapsed();
+            let label_count = self
+                .execution
+                .decision_readout
+                .as_ref()
+                .expect("decision requests require a prepared label head")
+                .token_ids()
+                .len();
+            drop(sequences);
+            for (row, index) in ready.iter().copied().enumerate() {
+                let branch = &group.active_branches[index].branch;
+                let row_logits = &logits[row * label_count..(row + 1) * label_count];
+                group.logits.push(DecisionBranchLogits {
+                    question_id: branch.question_id.clone(),
+                    logits: row_logits[..branch.label_token_ids.len()].to_vec(),
+                });
+            }
+            for index in ready.into_iter().rev() {
+                let branch = group.active_branches.swap_remove(index);
+                let released = self.release_decision_sequence(branch.sequence_id)?;
+                group.released_sequence_device_bytes = group
+                    .released_sequence_device_bytes
+                    .saturating_add(released.max(branch.sequence_device_bytes));
+            }
+            return Ok(None);
+        }
+
+        if group.next_branch != group.request.branches.len() || !group.active_branches.is_empty() {
+            return Ok(None);
+        }
+        self.release_decision_prefix(group)?;
+        if let Some(parent) = group.parent_sequence_id.take() {
+            let released = self.release_decision_sequence(parent)?;
+            group.released_sequence_device_bytes = group
+                .released_sequence_device_bytes
+                .saturating_add(released.max(group.parent_sequence_device_bytes));
+        }
+        let answers = answers_from_logits(&group.request, &group.logits, 1.0).map_err(|error| {
+            Error::Format {
+                label: "Qwen3.6 decision answers",
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Some(DecisionCompletion {
+            answers,
+            usage: DecisionUsage {
+                input_tokens: group.request.logical_input_tokens(),
+                output_tokens: group.request.branches.len(),
+            },
+            timings: group.timings,
+            released_sequence_device_bytes: group.released_sequence_device_bytes,
+        }))
+    }
+
+    fn admit_aligned_decision_branch(
+        &mut self,
+        prefix: PrefixMatch,
+        max_tokens: usize,
+    ) -> Result<Option<Qwen36Sequence>> {
+        let mut state = self.execution.model.new_sequence_state(max_tokens)?;
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let outcome = self
+            .execution
+            .sequence_cache
+            .admit(
+                Some(prefix),
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream: &self.execution.cache_stream,
+                    page_table: &mut page_table,
+                },
+                |snapshot, position| {
+                    let snapshot = snapshot.ok_or_else(|| Error::Format {
+                        label: "Qwen3.6 aligned decision fork",
+                        detail: "retained prefix has no recurrent snapshot".to_string(),
+                    })?;
+                    self.execution
+                        .model
+                        .restore_sequence_snapshot(snapshot, &mut state)?;
+                    if state.position() != position {
+                        return Err(Error::Format {
+                            label: "Qwen3.6 aligned decision fork",
+                            detail: format!(
+                                "snapshot restored position {} instead of {position}",
+                                state.position()
+                            ),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(sequence_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Ok(None);
+        };
+        Ok(Some(Qwen36Sequence::from_admission(
+            cache_id, page_table, state,
+        )))
+    }
+
+    fn release_decision_prefix(&mut self, group: &mut Qwen36DecisionGroup) -> Result<()> {
+        let Some(entry) = group.aligned_prefix_entry.take() else {
+            return Ok(());
+        };
+        let parent_id = group
+            .parent_sequence_id
+            .expect("retained decision prefix has a live parent");
+        let mut sequences = self.execution.sequences.lease_many(&[parent_id])?;
+        let parent = &mut sequences.entry_mut(0).sequence;
+        self.execution
+            .sequence_cache
+            .evict_prefix(
+                entry,
+                &mut Sm12xCacheContext {
+                    stream: &self.execution.cache_stream,
+                    page_table: &mut parent.page_table,
+                },
+            )
+            .map_err(sequence_cache_error)
+    }
+
+    fn release_decision_sequence(&mut self, id: Qwen36SequenceId) -> Result<usize> {
+        let sequence = self.execution.sequences.release(id)?;
+        let bytes = sequence.device_bytes;
+        sequence.sequence.finish(
+            &mut self.execution.sequence_cache,
+            &self.execution.cache_stream,
+        )?;
+        Ok(bytes)
+    }
+
+    fn release_decision_group(&mut self, group: &mut Qwen36DecisionGroup) -> Result<()> {
+        let mut first_error = None;
+        for branch in group.active_branches.drain(..) {
+            match self.release_decision_sequence(branch.sequence_id) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(branch.sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Err(error) = self.release_decision_prefix(group) {
+            first_error.get_or_insert(error);
+        }
+        if let Some(parent) = group.parent_sequence_id.take() {
+            match self.release_decision_sequence(parent) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(group.parent_sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Cancels waiting or active work between model submissions.
     pub fn cancel_request(&mut self, id: Qwen36RequestId) -> Qwen36CancelOutcome {
+        if let Some(mut group) = self.decisions.remove(&id) {
+            self.decision_queue.retain(|queued| *queued != id);
+            if let Err(error) = self.release_decision_group(&mut group) {
+                warn!(request = id.get(), %error, "failed to release part of cancelled decision group");
+            }
+            return Qwen36CancelOutcome::Cancelled(Qwen36CancelledRequest {
+                id,
+                prompt_tokens: group.request.prefix_tokens,
+                generated_tokens: Vec::new(),
+                released_sequence_device_bytes: group.released_sequence_device_bytes,
+            });
+        }
         let Some(request) = self.requests.get(&id) else {
             return Qwen36CancelOutcome::NotFound;
         };
@@ -1551,6 +2193,28 @@ impl<'model> Qwen36Scheduler<'model> {
         self.config
     }
 
+    /// Prepares the fixed 64-row decision head for every decode capacity class.
+    pub fn prepare_decision_readout(&mut self, token_ids: &[u32]) -> Result<()> {
+        if self.execution.decision_readout.is_some() {
+            return Err(Error::Format {
+                label: "Qwen3.6 decision readout",
+                detail: "decision readout is already prepared".to_string(),
+            });
+        }
+        let capacities = self
+            .execution
+            .decode_workspaces
+            .iter()
+            .map(Qwen36DecodeBatchWorkspace::capacity)
+            .collect::<Vec<_>>();
+        self.execution.decision_readout = Some(
+            self.execution
+                .model
+                .new_decision_readout(token_ids, &capacities)?,
+        );
+        Ok(())
+    }
+
     /// Returns the maximum rows in one decode batch.
     pub fn capacity(&self) -> usize {
         self.config.decode_capacity
@@ -1579,6 +2243,11 @@ impl<'model> Qwen36Scheduler<'model> {
                 .mtp_hidden_scratch
                 .as_ref()
                 .map_or(0, DeviceBuffer::device_bytes)
+            + self
+                .execution
+                .decision_readout
+                .as_ref()
+                .map_or(0, |readout| readout.device_bytes())
     }
 
     /// Returns exact logical ownership and reservation state for shared KV.
@@ -1593,12 +2262,17 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Returns the number of requests retained by the scheduler.
     pub fn request_count(&self) -> usize {
-        self.requests.len()
+        self.requests.len() + self.decisions.len()
     }
 
     /// Returns the number of CPU-only requests awaiting admission.
     pub fn waiting_count(&self) -> usize {
         self.waiting.len()
+            + self
+                .decisions
+                .values()
+                .filter(|group| group.parent_sequence_id.is_none())
+                .count()
     }
 
     /// Returns the number of admitted prefill and decode requests.
@@ -1876,6 +2550,7 @@ mod tests {
                 &model,
                 SchedulerConfig {
                     decode_capacity: 1,
+                    decision_branch_capacity: 1,
                     prefill_sequence_capacity: 1,
                     prefill_token_capacity: 16,
                     max_active_sequences: 1,
@@ -1936,6 +2611,7 @@ mod tests {
             &model,
             SchedulerConfig {
                 decode_capacity: 1,
+                decision_branch_capacity: 1,
                 prefill_sequence_capacity: 1,
                 prefill_token_capacity: eider_cuda::SM12X_KV_PAGE_TOKENS,
                 max_active_sequences: 1,
@@ -2055,6 +2731,7 @@ mod tests {
             &model,
             SchedulerConfig {
                 decode_capacity: 1,
+                decision_branch_capacity: 1,
                 prefill_sequence_capacity: 1,
                 prefill_token_capacity: 16,
                 max_active_sequences: 1,
@@ -2139,6 +2816,7 @@ mod tests {
             &model,
             SchedulerConfig {
                 decode_capacity: 1,
+                decision_branch_capacity: 1,
                 prefill_sequence_capacity: 1,
                 prefill_token_capacity: 384,
                 max_active_sequences: 1,
@@ -2181,6 +2859,7 @@ mod tests {
             &model,
             SchedulerConfig {
                 decode_capacity: 2,
+                decision_branch_capacity: 2,
                 prefill_sequence_capacity: 2,
                 prefill_token_capacity: 4,
                 max_active_sequences: 2,
@@ -2300,6 +2979,7 @@ mod tests {
             &model,
             SchedulerConfig {
                 decode_capacity: 2,
+                decision_branch_capacity: 2,
                 prefill_sequence_capacity: 2,
                 prefill_token_capacity: 128,
                 max_active_sequences: 2,

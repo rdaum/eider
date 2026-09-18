@@ -10,10 +10,12 @@ use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::ChatMessage;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::decision::{DecisionRequest, validated_decision_labels};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
-    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick, EngineVerificationProgress,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineCapabilities,
+    EngineDecisionAdmission, EngineDecisionFailed, EngineDecisionFinished, EngineDelta,
+    EngineError, EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId,
+    EngineResult, EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 #[cfg(test)]
@@ -75,9 +77,19 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     ) -> Result<Self> {
         let tool_grammar =
             QwenXmlGrammarFactory::new(template.tokenizer(), model.manifest().vocab)?;
+        let mut scheduler = Qwen36Scheduler::new_with_cache_config(model, scheduler, cache_config)?;
+        let label_ids = validated_decision_labels(template.tokenizer())
+            .map_err(|error| Error::Format {
+                label: "Qwen3.6 decision labels",
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        scheduler.prepare_decision_readout(&label_ids)?;
         Ok(Self {
             template,
-            scheduler: Qwen36Scheduler::new_with_cache_config(model, scheduler, cache_config)?,
+            scheduler,
             tool_grammar,
             requests: BTreeMap::new(),
         })
@@ -143,11 +155,9 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     ) -> Result<EngineTick> {
         let scheduled = self.scheduler.tick_with_lifecycle(on_lifecycle)?;
         for admission in &scheduled.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted chat request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
+            if let Some(request) = self.requests.get_mut(&admission.request_id) {
+                request.usage.cached_prompt_tokens = admission.cached_prompt_tokens;
+            }
         }
         let mut tick = EngineTick {
             prefilled: scheduled
@@ -165,6 +175,23 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                     request_id: EngineRequestId::new(progress.request_id.get()),
                     cycles: progress.cycles,
                     accepted_drafts: progress.accepted_drafts,
+                })
+                .collect(),
+            decisions_finished: scheduled
+                .decisions_finished
+                .into_iter()
+                .map(|finished| EngineDecisionFinished {
+                    request_id: EngineRequestId::new(finished.request_id.get()),
+                    completion: finished.completion,
+                })
+                .collect(),
+            decisions_failed: scheduled
+                .decisions_failed
+                .into_iter()
+                .map(|failed| EngineDecisionFailed {
+                    request_id: EngineRequestId::new(failed.request_id.get()),
+                    message: failed.message,
+                    released_sequence_device_bytes: failed.released_sequence_device_bytes,
                 })
                 .collect(),
             ..EngineTick::default()
@@ -306,6 +333,10 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
 }
 
 impl EngineService for Qwen36ChatService<'_, '_> {
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities { decisions: true }
+    }
+
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
         let admission = Qwen36ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
@@ -313,6 +344,20 @@ impl EngineService for Qwen36ChatService<'_, '_> {
             request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        let input_tokens = request.logical_input_tokens();
+        let branches = request.branches.len();
+        let id = self
+            .scheduler
+            .add_decision(request)
+            .map_err(EngineError::new)?;
+        Ok(EngineDecisionAdmission {
+            request_id: EngineRequestId::new(id.get()),
+            input_tokens,
+            branches,
         })
     }
     fn tick(
@@ -518,6 +563,7 @@ mod tests {
             &template,
             SchedulerConfig {
                 decode_capacity: 2,
+                decision_branch_capacity: 2,
                 prefill_sequence_capacity: 2,
                 prefill_token_capacity: 8,
                 max_active_sequences: 2,

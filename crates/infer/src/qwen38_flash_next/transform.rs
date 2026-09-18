@@ -527,6 +527,21 @@ impl Qwen38PleState {
             .copy_prefix_from_device_on_stream(snapshot, snapshot.len(), stream)
     }
 
+    pub(crate) fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        if self.append_pending
+            || source.append_pending
+            || self.channels != source.channels
+            || self.history != source.history
+        {
+            return Err(Error::Format {
+                label: "Qwen3.8 PLE live state fork",
+                detail: "source and destination convolution states are incompatible".to_string(),
+            });
+        }
+        self.conv
+            .copy_prefix_from_device_on_stream(&source.conv, source.conv.len(), stream)
+    }
+
     fn require(&self, weights: &Qwen38PleWeights) -> Result<()> {
         let expected_history = (weights.conv_kernel - 1) * weights.conv_dilation;
         if self.channels != weights.hidden * weights.hc_count || self.history != expected_history {

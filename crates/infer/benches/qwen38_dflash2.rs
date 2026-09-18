@@ -104,6 +104,7 @@ fn scheduler(
         model,
         SchedulerConfig {
             decode_capacity: 1,
+            decision_branch_capacity: 1,
             prefill_sequence_capacity: 1,
             prefill_token_capacity: 1_024,
             max_active_sequences: 1,
