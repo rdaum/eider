@@ -8329,6 +8329,62 @@ extern "C" cudaError_t infer_pack_value_heads_bf16_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_pack_tree_kv_bf16_kernel(
+    const float* key,
+    const float* value,
+    std::uint16_t* packed_key,
+    std::uint16_t* packed_value,
+    std::uint32_t prefix_tokens,
+    std::uint32_t suffix_tokens,
+    std::uint32_t suffix_row_offset,
+    std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t tokens = prefix_tokens + suffix_tokens;
+    const std::uint32_t total = tokens * heads * head_dim;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % heads;
+    const std::uint32_t token = index / (heads * head_dim);
+    const std::uint32_t source_token =
+        token < prefix_tokens ? token : suffix_row_offset + token - prefix_tokens;
+    const std::uint32_t source = (source_token * heads + head) * head_dim + dim;
+    const __nv_bfloat16 key_value = __float2bfloat16_rn(key[source]);
+    const __nv_bfloat16 value_value = __float2bfloat16_rn(value[source]);
+    packed_key[(head * tokens + token) * head_dim + dim] =
+        *reinterpret_cast<const std::uint16_t*>(&key_value);
+    packed_value[(head * head_dim + dim) * tokens + token] =
+        *reinterpret_cast<const std::uint16_t*>(&value_value);
+}
+
+extern "C" cudaError_t infer_pack_tree_kv_bf16_on_stream(
+    const float* key,
+    const float* value,
+    std::uint16_t* packed_key,
+    std::uint16_t* packed_value,
+    std::uint32_t prefix_tokens,
+    std::uint32_t suffix_tokens,
+    std::uint32_t suffix_row_offset,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (key == nullptr || value == nullptr || packed_key == nullptr ||
+        packed_value == nullptr || prefix_tokens == 0 || suffix_tokens == 0 ||
+        suffix_row_offset < prefix_tokens || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t tokens =
+        static_cast<std::uint64_t>(prefix_tokens) + suffix_tokens;
+    const std::uint64_t total = tokens * heads * head_dim;
+    if (tokens > 0xffffffffu || total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_pack_tree_kv_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        key, value, packed_key, packed_value, prefix_tokens, suffix_tokens,
+        suffix_row_offset, heads, head_dim);
+    return cudaGetLastError();
+}
+
 __global__ void infer_causal_window_softmax_f32_kernel(
     float* scores,
     std::uint32_t query_tokens,

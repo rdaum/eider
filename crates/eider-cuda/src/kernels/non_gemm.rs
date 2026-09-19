@@ -9270,6 +9270,79 @@ pub fn pack_value_heads_bf16_into_on_stream(
     }
 }
 
+/// Packs one shared prefix and one non-contiguous suffix as logical BF16 K/V rows.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_tree_kv_bf16_into_on_stream(
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    packed_key: DeviceOutput<'_, u16>,
+    packed_value: DeviceOutput<'_, u16>,
+    prefix_tokens: usize,
+    suffix_tokens: usize,
+    suffix_row_offset: usize,
+    heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let tokens = prefix_tokens
+        .checked_add(suffix_tokens)
+        .ok_or_else(|| Error::Shape {
+            label: "packed tree K/V tokens",
+            expected: "prefix + suffix without overflow".to_string(),
+            actual: format!("prefix={prefix_tokens} suffix={suffix_tokens}"),
+        })?;
+    let packed_len = checked_attention_product("packed tree K/V", &[tokens, heads, head_dim])?;
+    let input_len = suffix_row_offset
+        .checked_add(suffix_tokens)
+        .and_then(|rows| rows.checked_mul(heads))
+        .and_then(|values| values.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    if prefix_tokens == 0
+        || suffix_tokens == 0
+        || suffix_row_offset < prefix_tokens
+        || tokens > u32::MAX as usize
+        || suffix_row_offset > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || packed_len > u32::MAX as usize
+        || key.len() < input_len
+        || value.len() < input_len
+        || packed_key.len() < packed_len
+        || packed_value.len() < packed_len
+    {
+        return Err(Error::Shape {
+            label: "packed tree K/V",
+            expected: format!("prefix and suffix rows within input and {packed_len} output values"),
+            actual: format!(
+                "prefix={prefix_tokens} suffix={suffix_tokens} offset={suffix_row_offset} key={} value={} packed_key={} packed_value={}",
+                key.len(),
+                value.len(),
+                packed_key.len(),
+                packed_value.len()
+            ),
+        });
+    }
+    let mut packed_key = packed_key;
+    let mut packed_value = packed_value;
+    unsafe {
+        check_cuda(
+            "infer_pack_tree_kv_bf16_on_stream",
+            ffi::infer_pack_tree_kv_bf16_on_stream(
+                key.ptr,
+                value.ptr,
+                packed_key.buffer_mut().ptr,
+                packed_value.buffer_mut().ptr,
+                prefix_tokens as u32,
+                suffix_tokens as u32,
+                suffix_row_offset as u32,
+                heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies causal/windowed softmax to `[heads, queries, keys]` f32 score rows.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_window_softmax_f32_in_place_on_stream(

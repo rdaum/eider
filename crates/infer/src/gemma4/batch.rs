@@ -55,6 +55,7 @@ pub struct Gemma4DecisionReadout {
     token_ids: Vec<u32>,
     weight: DeviceBuffer<u16>,
     hidden: DeviceBuffer<f32>,
+    normalized: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     capacity: usize,
     hidden_size: usize,
@@ -68,7 +69,10 @@ impl Gemma4DecisionReadout {
 
     /// Returns exact device bytes owned by the compact head and its workspace.
     pub fn device_bytes(&self) -> usize {
-        self.weight.device_bytes() + self.hidden.device_bytes() + self.logits.device_bytes()
+        self.weight.device_bytes()
+            + self.hidden.device_bytes()
+            + self.normalized.device_bytes()
+            + self.logits.device_bytes()
     }
 
     /// Stages one final-normalized sequence row for a batched compact projection.
@@ -126,6 +130,63 @@ impl Gemma4DecisionReadout {
         }
         Ok(logits)
     }
+
+    fn selected_tree_logits(
+        &mut self,
+        model: &Gemma4Model,
+        source: &DeviceBuffer<f32>,
+        source_rows: &[usize],
+        stream: &CudaStream,
+    ) -> Result<Vec<f32>> {
+        if source_rows.is_empty() || source_rows.len() > self.capacity {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision tree readout rows",
+                expected: format!("1..={}", self.capacity),
+                actual: source_rows.len().to_string(),
+            });
+        }
+        for (destination, source_row) in source_rows.iter().copied().enumerate() {
+            let source_offset =
+                source_row
+                    .checked_mul(self.hidden_size)
+                    .ok_or_else(|| Error::Shape {
+                        label: "Gemma 4 decision tree readout offset",
+                        expected: "row * hidden size without overflow".to_string(),
+                        actual: format!("row={source_row} hidden={}", self.hidden_size),
+                    })?;
+            self.hidden.copy_range_from_device_on_stream(
+                destination * self.hidden_size,
+                source,
+                source_offset,
+                self.hidden_size,
+                stream,
+            )?;
+        }
+        model.final_norm.run_into(
+            source_rows.len(),
+            self.hidden_size,
+            &self.hidden,
+            &mut self.normalized,
+            stream,
+        )?;
+        bf16_linear_logits_f32_batch_into_on_stream(
+            &self.normalized,
+            &self.weight,
+            self.logits.output(),
+            source_rows.len(),
+            self.token_ids.len(),
+            self.hidden_size,
+            stream,
+        )?;
+        let mut logits = self
+            .logits
+            .copy_prefix_to_host(source_rows.len() * self.token_ids.len(), stream)?
+            .into_vec();
+        for logit in &mut logits {
+            *logit = model.softcap_logit(*logit);
+        }
+        Ok(logits)
+    }
 }
 
 struct Gemma4PrefillStateRow<'tokens, 'state> {
@@ -158,6 +219,13 @@ impl Gemma4BatchLinearWorkspace {
     }
 
     fn set_rows(&mut self, rows: usize) -> Result<()> {
+        if rows != self.rows {
+            self.plans.clear();
+        }
+        self.set_rows_preserving_plans(rows)
+    }
+
+    fn set_rows_preserving_plans(&mut self, rows: usize) -> Result<()> {
         if rows == 0 || rows > self.capacity {
             return Err(Error::Shape {
                 label: "Gemma 4 batch linear rows",
@@ -165,14 +233,15 @@ impl Gemma4BatchLinearWorkspace {
                 actual: rows.to_string(),
             });
         }
-        if rows != self.rows {
-            self.plans.clear();
-        }
         self.rows = rows;
         for activation in self.activations.values_mut() {
             activation.cols = rows;
         }
         Ok(())
+    }
+
+    fn retain_plans_for_rows(&mut self, rows: usize) {
+        self.plans.retain(|&(_, _, plan_rows), _| plan_rows == rows);
     }
 
     fn ensure_plan(&mut self, linear: &Gemma4Linear) -> Result<()> {
@@ -588,6 +657,7 @@ impl Gemma4Model {
             token_ids: token_ids.to_vec(),
             weight,
             hidden: DeviceBuffer::zeroed(capacity * self.config.hidden_size)?,
+            normalized: DeviceBuffer::zeroed(capacity * self.config.hidden_size)?,
             logits: DeviceBuffer::zeroed(capacity * token_ids.len())?,
             capacity,
             hidden_size: self.config.hidden_size,
@@ -657,6 +727,144 @@ impl Gemma4Model {
                 .collect::<Result<Vec<_>>>()?,
             linear,
         })
+    }
+
+    pub(crate) fn decision_tree_fits(
+        &self,
+        workspace: &Gemma4PrefillBatchWorkspace,
+        readout: &Gemma4DecisionReadout,
+        prefix: &[u32],
+        branches: &[&[u32]],
+    ) -> bool {
+        let Some(total_tokens) = branches.iter().try_fold(prefix.len(), |total, branch| {
+            total.checked_add(branch.len())
+        }) else {
+            return false;
+        };
+        !prefix.is_empty()
+            && !branches.is_empty()
+            && branches.iter().all(|branch| !branch.is_empty())
+            && total_tokens <= workspace.token_capacity
+            && branches
+                .iter()
+                .all(|branch| prefix.len() + branch.len() <= workspace.max_context_tokens)
+            && branches.len() <= readout.capacity
+            && workspace
+                .local_attention
+                .tensor_core
+                .tree_rows_fit(total_tokens)
+            && workspace
+                .global_attention
+                .tensor_core
+                .tree_rows_fit(total_tokens)
+    }
+
+    /// Runs one layer-major tree prefill for a shared prefix and isolated branches.
+    pub(crate) fn decision_tree_selected_logits(
+        &self,
+        workspace: &mut Gemma4PrefillBatchWorkspace,
+        readout: &mut Gemma4DecisionReadout,
+        prefix: &[u32],
+        branches: &[&[u32]],
+        stream: &CudaStream,
+    ) -> Result<Vec<f32>> {
+        if prefix.is_empty()
+            || branches.is_empty()
+            || branches.iter().any(|branch| branch.is_empty())
+        {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision tree",
+                expected: "a non-empty prefix and non-empty branches".to_string(),
+                actual: format!("prefix={} branches={}", prefix.len(), branches.len()),
+            });
+        }
+        let total_tokens = branches.iter().try_fold(prefix.len(), |total, branch| {
+            total.checked_add(branch.len()).ok_or_else(|| Error::Shape {
+                label: "Gemma 4 decision tree token count",
+                expected: "prefix + branches without overflow".to_string(),
+                actual: "overflow".to_string(),
+            })
+        })?;
+        let longest_branch = branches
+            .iter()
+            .map(|branch| prefix.len() + branch.len())
+            .max()
+            .expect("branches are not empty");
+        if total_tokens > workspace.token_capacity
+            || longest_branch > workspace.max_context_tokens
+            || branches.len() > readout.capacity
+        {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision tree capacity",
+                expected: format!(
+                    "tokens <= {}, logical branch <= {}, branches <= {}",
+                    workspace.token_capacity, workspace.max_context_tokens, readout.capacity
+                ),
+                actual: format!(
+                    "tokens={total_tokens} logical_branch={longest_branch} branches={}",
+                    branches.len()
+                ),
+            });
+        }
+        if prefix
+            .iter()
+            .chain(branches.iter().flat_map(|branch| branch.iter()))
+            .any(|token| *token as usize >= self.config.vocab_size)
+        {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision tree token",
+                expected: format!("token < {}", self.config.vocab_size),
+                actual: "out-of-range token".to_string(),
+            });
+        }
+
+        workspace.linear.set_rows(total_tokens)?;
+        workspace.linear.retain_plans_for_rows(total_tokens);
+        workspace.moe.set_rows(total_tokens)?;
+        workspace.host_token_ids.fill(0);
+        workspace.host_token_ids[..prefix.len()].copy_from_slice(prefix);
+        let mut lengths = Vec::with_capacity(branches.len() + 1);
+        lengths.push(prefix.len());
+        let mut tip_rows = Vec::with_capacity(branches.len());
+        let mut offset = prefix.len();
+        for tokens in branches {
+            let end = offset + tokens.len();
+            workspace.host_token_ids[offset..end].copy_from_slice(tokens);
+            lengths.push(tokens.len());
+            tip_rows.push(end - 1);
+            offset = end;
+        }
+        workspace
+            .token_ids
+            .copy_from_host(&workspace.host_token_ids)?;
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            &self.embedding,
+            &workspace.token_ids,
+            workspace.hidden.output(),
+            total_tokens,
+            stream,
+        )?;
+        scale_channel_f32_device_row_scalar_in_place_on_stream(
+            workspace.hidden.inout(),
+            &self.embedding_channel_scale,
+            &workspace.embedding_row_scale,
+            total_tokens,
+            self.config.hidden_size,
+            stream,
+        )?;
+        round_f32_to_bf16_prefix_in_place_on_stream(
+            workspace.hidden.inout(),
+            total_tokens * self.config.hidden_size,
+            stream,
+        )?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            run_layer_tree_prefill(layer, layer_index, workspace, &lengths, stream)?;
+            std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
+        }
+        workspace.linear.retain_plans_for_rows(total_tokens);
+        readout.selected_tree_logits(self, &workspace.hidden, &tip_rows, stream)
     }
 
     /// Advances one or more persistent sequence states by flattened prompt chunks.
@@ -939,6 +1147,130 @@ fn run_layer_prefill(
     run_layer_post_attention_prefill(layer, layer_index, workspace, stream)
 }
 
+fn run_layer_tree_prefill(
+    layer: &Gemma4DecoderLayer,
+    layer_index: usize,
+    workspace: &mut Gemma4PrefillBatchWorkspace,
+    lengths: &[usize],
+    stream: &CudaStream,
+) -> Result<()> {
+    run_layer_pre_attention_prefill(layer, workspace, stream)?;
+    run_attention_tree_prefill_body(&layer.attention, workspace, lengths, stream)?;
+    run_attention_tree_prefill_output(&layer.attention, workspace, lengths, stream)?;
+    run_layer_post_attention_prefill_body(layer, layer_index, workspace, stream)
+}
+
+fn run_attention_tree_prefill_body(
+    attention: &Gemma4Attention,
+    workspace: &mut Gemma4PrefillBatchWorkspace,
+    lengths: &[usize],
+    stream: &CudaStream,
+) -> Result<()> {
+    let attention_workspace = if attention.window.is_some() {
+        &mut workspace.local_attention
+    } else {
+        &mut workspace.global_attention
+    };
+    let mut offset = 0;
+    for (segment, &rows) in lengths.iter().enumerate() {
+        let logical_start = if segment == 0 { 0 } else { lengths[0] };
+        dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+            rows,
+            attention.q_heads,
+            attention.kv_heads,
+            attention.head_dim,
+            attention.rotary_dim,
+            &attention_workspace.q,
+            &attention.q_norm.weight,
+            attention_workspace.q_rope.output(),
+            attention.q_norm.eps,
+            &attention_workspace.k,
+            &attention.k_norm.weight,
+            attention_workspace.k_rope.output(),
+            attention.k_norm.eps,
+            offset,
+            logical_start,
+            attention.rope_theta,
+            stream,
+        )?;
+        offset += rows;
+    }
+    attention_workspace.tensor_core.run_tree(
+        &attention_workspace.q_rope,
+        &attention_workspace.k_rope,
+        &attention_workspace.v_normed,
+        lengths,
+        attention.window,
+        &mut attention_workspace.attended,
+        stream,
+    )
+}
+
+fn run_attention_tree_prefill_output(
+    attention: &Gemma4Attention,
+    workspace: &mut Gemma4PrefillBatchWorkspace,
+    lengths: &[usize],
+    stream: &CudaStream,
+) -> Result<()> {
+    // cuBLASLt can select row-count-dependent FP4 reductions. Project each logical
+    // segment independently so a branch produces the same result whether or not
+    // sibling branches share the tree request.
+    let total_rows = lengths.iter().sum::<usize>();
+    let attention_width = attention.output.in_features;
+    let output_width = attention.output.out_features;
+    let output_input_scale = attention.output.cublaslt_weight().input_scale();
+    let attention_workspace = if attention.window.is_some() {
+        &mut workspace.local_attention
+    } else {
+        &mut workspace.global_attention
+    };
+    let result = (|| {
+        let mut offset = 0;
+        for &rows in lengths {
+            workspace.linear.set_rows_preserving_plans(rows)?;
+            workspace.linear.ensure_plan(&attention.output)?;
+            attention_workspace.q.copy_range_from_device_on_stream(
+                0,
+                &attention_workspace.attended,
+                offset * attention_width,
+                rows * attention_width,
+                stream,
+            )?;
+            quantize_nvfp4_col_major_f32_device_into_on_stream(
+                attention_width,
+                rows,
+                &attention_workspace.q,
+                workspace
+                    .linear
+                    .activations
+                    .get_mut(&attention_width)
+                    .expect("attention output activation exists"),
+                output_input_scale,
+                stream,
+            )?;
+            workspace.linear.run_quantized(
+                &attention.output,
+                output_input_scale,
+                &mut workspace.residual,
+                stream,
+            )?;
+            attention_workspace
+                .output
+                .copy_range_from_device_on_stream(
+                    offset * output_width,
+                    &workspace.residual,
+                    0,
+                    rows * output_width,
+                    stream,
+                )?;
+            offset += rows;
+        }
+        Ok(())
+    })();
+    workspace.linear.set_rows_preserving_plans(total_rows)?;
+    result
+}
+
 fn run_layer_pre_attention_prefill(
     layer: &Gemma4DecoderLayer,
     workspace: &mut Gemma4PrefillBatchWorkspace,
@@ -991,8 +1323,6 @@ fn run_layer_post_attention_prefill(
     workspace: &mut Gemma4PrefillBatchWorkspace,
     stream: &CudaStream,
 ) -> Result<()> {
-    let active_rows = workspace.linear.rows;
-    let hidden = layer.attention.q.in_features;
     let attention_workspace = if layer.attention.window.is_some() {
         &mut workspace.local_attention
     } else {
@@ -1004,6 +1334,22 @@ fn run_layer_post_attention_prefill(
         &mut workspace.linear,
         stream,
     )?;
+    run_layer_post_attention_prefill_body(layer, layer_index, workspace, stream)
+}
+
+fn run_layer_post_attention_prefill_body(
+    layer: &Gemma4DecoderLayer,
+    layer_index: usize,
+    workspace: &mut Gemma4PrefillBatchWorkspace,
+    stream: &CudaStream,
+) -> Result<()> {
+    let active_rows = workspace.linear.rows;
+    let hidden = layer.attention.q.in_features;
+    let attention_workspace = if layer.attention.window.is_some() {
+        &mut workspace.local_attention
+    } else {
+        &mut workspace.global_attention
+    };
     workspace.linear.ensure_plan(&layer.dense.gate)?;
     workspace.linear.ensure_plan(&layer.dense.up)?;
     let dense_input_scale = layer.dense.gate.cublaslt_weight().input_scale();
@@ -1421,6 +1767,11 @@ fn run_moe_prefill(
 mod tests {
     use super::*;
     use eider_cuda::SM12X_KV_PAGE_TOKENS;
+    use eider_runtime::chat::CheckpointChatTemplate;
+    use eider_runtime::decision::{
+        DecisionPromptCompiler, DecisionPromptQuestion, DecisionPromptRequest,
+    };
+    use serde_json::json;
 
     fn local_model_dir() -> std::path::PathBuf {
         std::env::var_os("EIDER_GEMMA4_MODEL_DIR")
@@ -1661,6 +2012,301 @@ mod tests {
             &unaligned_reference_repeat,
             &unaligned_reference,
         );
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_decision_tree_matches_isolated_branches() {
+        let model = Gemma4Model::load(local_model_dir()).expect("load Gemma 4");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let prefix = vec![2, 17, 23, 31];
+        let branch_tokens = [vec![3, 4, 5], vec![6, 7], vec![8, 9, 10, 11]];
+        let branch_slices = branch_tokens.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let total_tokens = prefix.len() + branch_tokens.iter().map(Vec::len).sum::<usize>();
+        let max_tokens = prefix.len() + branch_tokens.iter().map(Vec::len).max().unwrap();
+        let mut cache =
+            crate::gemma4::new_gemma4_sequence_cache(&model, branch_tokens.len() + 1, max_tokens)
+                .expect("sequence cache");
+        let mut workspace = model
+            .new_prefill_batch_workspace(branch_tokens.len(), total_tokens, max_tokens)
+            .expect("prefill workspace");
+        let label_ids = (0..64).collect::<Vec<_>>();
+        let mut readout = model
+            .new_decision_readout(&label_ids, branch_tokens.len())
+            .expect("decision readout");
+
+        let mut parent = Gemma4Sequence::admit_decision(&model, &mut cache, prefix.len(), &stream)
+            .expect("parent");
+        model
+            .prefill_batch(
+                &mut workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &prefix,
+                    sequence: &mut parent,
+                    output: Gemma4PrefillOutput::None,
+                }],
+                &stream,
+                &mut cache,
+            )
+            .expect("parent prefill");
+        stream.synchronize().expect("parent prefill completion");
+        let mut branches = branch_tokens
+            .iter()
+            .map(|tokens| {
+                Gemma4Sequence::branch_decision(
+                    &model,
+                    &parent,
+                    &mut cache,
+                    prefix.len() + tokens.len(),
+                    &stream,
+                )
+                .expect("branch")
+                .expect("branch capacity")
+            })
+            .collect::<Vec<_>>();
+        stream.synchronize().expect("branch completion");
+        let mut rows = branch_tokens
+            .iter()
+            .zip(&mut branches)
+            .map(|(tokens, sequence)| Gemma4PrefillRow {
+                token_ids: tokens,
+                sequence,
+                output: Gemma4PrefillOutput::FinalHidden,
+            })
+            .collect::<Vec<_>>();
+        model
+            .prefill_batch(&mut workspace, &mut rows, &stream, &mut cache)
+            .expect("branch prefill");
+        drop(rows);
+        for (row, branch) in branches.iter().enumerate() {
+            readout
+                .stage_sequence(row, branch, &stream)
+                .expect("stage branch");
+        }
+        let isolated = readout
+            .selected_logits(&model, branch_tokens.len(), &stream)
+            .expect("isolated logits");
+        let tree = model
+            .decision_tree_selected_logits(
+                &mut workspace,
+                &mut readout,
+                &prefix,
+                &branch_slices,
+                &stream,
+            )
+            .expect("tree logits");
+        let mut individual_tree = Vec::with_capacity(tree.len());
+        for branch in &branch_tokens {
+            let logits = model
+                .decision_tree_selected_logits(
+                    &mut workspace,
+                    &mut readout,
+                    &prefix,
+                    &[branch.as_slice()],
+                    &stream,
+                )
+                .expect("individual tree logits");
+            individual_tree.extend(logits);
+        }
+
+        let label_count = label_ids.len();
+        for branch in 0..branch_tokens.len() {
+            let isolated = &isolated[branch * label_count..(branch + 1) * label_count];
+            let tree = &tree[branch * label_count..(branch + 1) * label_count];
+            let individual = &individual_tree[branch * label_count..(branch + 1) * label_count];
+            let isolated_top = isolated
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0;
+            let tree_top = tree
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0;
+            let individual_top = individual
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0;
+            let cache_error = isolated
+                .iter()
+                .zip(tree)
+                .map(|(isolated, tree)| (isolated - tree).abs())
+                .fold(0.0f32, f32::max);
+            let packing_error = individual
+                .iter()
+                .zip(tree)
+                .map(|(individual, tree)| (individual - tree).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "branch={branch} cache_top={isolated_top} tree_top={tree_top} individual_top={individual_top} cache_error={cache_error} packing_error={packing_error}"
+            );
+            assert_eq!(
+                tree_top, individual_top,
+                "branch={branch} packing_error={packing_error}"
+            );
+        }
+
+        parent.finish(&mut cache, &stream).expect("finish parent");
+        for branch in branches {
+            branch.finish(&mut cache, &stream).expect("finish branch");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_decision_tree_real_prompt_matches_individual_branches() {
+        let model_dir = local_model_dir();
+        let compiler = DecisionPromptCompiler::new(
+            CheckpointChatTemplate::from_model_dir(&model_dir).expect("load chat template"),
+        )
+        .expect("decision compiler");
+        let long_review = [
+            "The passes are expensive after parking. The waterpark and lazy river are pleasant on a hot day, but traffic is terrible.",
+            "The family pool is crowded, children reserve unused chairs, and staff do not resolve conflicts.",
+            "The drinks are expensive, weak, and too sugary. An adults-only area would make the visit much more relaxing.",
+            "Weekends are too busy, weekdays are not much better, and I am looking for another pool this summer.",
+        ]
+        .repeat(12)
+        .join(" ");
+        let request = compiler
+            .prepare(DecisionPromptRequest {
+                state: json!({
+                    "movie_review": "weighty and ponderous but every bit as filling as the treat of the title.",
+                    "news_article": "California adopted rules intended to reduce dairy-farm air pollution.",
+                    "business_review": long_review,
+                }),
+                questions: vec![
+                    (
+                        "positive_sentiment".to_string(),
+                        DecisionPromptQuestion::Noul {
+                            instructions: json!("Does movie_review express positive sentiment?"),
+                            true_description: "The review is positive.".to_string(),
+                            false_description: "The review is negative.".to_string(),
+                        },
+                    ),
+                    (
+                        "news_topic".to_string(),
+                        DecisionPromptQuestion::Choice {
+                            instructions: json!("Which topic best describes news_article?"),
+                            options: vec![
+                                (
+                                    "world".to_string(),
+                                    Some("World politics and international events.".to_string()),
+                                ),
+                                (
+                                    "sports".to_string(),
+                                    Some("Sports teams, athletes, and competitions.".to_string()),
+                                ),
+                                (
+                                    "business".to_string(),
+                                    Some(
+                                        "Companies, markets, finance, and the economy.".to_string(),
+                                    ),
+                                ),
+                                (
+                                    "science_and_technology".to_string(),
+                                    Some("Science, computing, and technology.".to_string()),
+                                ),
+                            ],
+                        },
+                    ),
+                    (
+                        "star_rating".to_string(),
+                        DecisionPromptQuestion::Score {
+                            instructions: json!(
+                                "What star rating did the writer give business_review?"
+                            ),
+                            levels: [
+                                "One star.",
+                                "Two stars.",
+                                "Three stars.",
+                                "Four stars.",
+                                "Five stars.",
+                            ]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        },
+                    ),
+                ],
+            })
+            .expect("compile decision request");
+        let model = Gemma4Model::load(&model_dir).expect("load Gemma 4");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let branches = request
+            .branches
+            .iter()
+            .map(|branch| branch.suffix_tokens.as_slice())
+            .collect::<Vec<_>>();
+        let total_tokens = request.prefix_tokens.len()
+            + request
+                .branches
+                .iter()
+                .map(|branch| branch.suffix_tokens.len())
+                .sum::<usize>();
+        let max_tokens = request.longest_branch_tokens();
+        assert!(
+            request.prefix_tokens.len() > 512,
+            "regression prompt must exercise a long shared prefix"
+        );
+        let mut workspace = model
+            .new_prefill_batch_workspace(branches.len(), total_tokens, max_tokens)
+            .expect("prefill workspace");
+        let mut readout = model
+            .new_decision_readout(&request.label_token_ids, branches.len())
+            .expect("decision readout");
+        let packed_logits = model
+            .decision_tree_selected_logits(
+                &mut workspace,
+                &mut readout,
+                &request.prefix_tokens,
+                &branches,
+                &stream,
+            )
+            .expect("packed decision tree");
+        let labels = request.label_token_ids.len();
+        for (branch_index, branch) in branches.iter().enumerate() {
+            let individual_logits = model
+                .decision_tree_selected_logits(
+                    &mut workspace,
+                    &mut readout,
+                    &request.prefix_tokens,
+                    &[*branch],
+                    &stream,
+                )
+                .expect("individual decision tree");
+            let packed = &packed_logits[branch_index * labels..(branch_index + 1) * labels];
+            let packed_top = packed
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0;
+            let individual_top = individual_logits
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0;
+            let logit_error = packed
+                .iter()
+                .zip(&individual_logits)
+                .map(|(packed, individual)| (packed - individual).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                packed_top, individual_top,
+                "branch={branch_index} logit_error={logit_error}"
+            );
+            assert!(
+                logit_error <= 1.0e-4,
+                "branch={branch_index} logit_error={logit_error}"
+            );
+        }
     }
 
     #[test]

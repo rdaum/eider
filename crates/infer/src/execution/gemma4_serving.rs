@@ -214,10 +214,23 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     }
 
     fn add_decision(&mut self, request: DecisionRequest) -> Result<Gemma4RequestId> {
-        if self.config.max_active_sequences < 2 {
+        let branch_tokens = request
+            .branches
+            .iter()
+            .map(|branch| branch.suffix_tokens.as_slice())
+            .collect::<Vec<_>>();
+        if self.config.max_active_sequences < 2
+            && !self.model.decision_tree_fits(
+                &self.prefill_workspace,
+                &self.decision_readout,
+                &request.prefix_tokens,
+                &branch_tokens,
+            )
+        {
             return Err(Error::Shape {
                 label: "Gemma 4 decision capacity",
-                expected: "at least two active sequences for a parent and branch".to_string(),
+                expected: "a request that fits tree prefill or at least two active sequences for the cache fallback"
+                    .to_string(),
                 actual: self.config.max_active_sequences.to_string(),
             });
         }
@@ -501,6 +514,65 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         ),
     ) -> Result<Option<DecisionCompletion>> {
         if group.parent_sequence_id.is_none() {
+            let branch_tokens = group
+                .request
+                .branches
+                .iter()
+                .map(|branch| branch.suffix_tokens.as_slice())
+                .collect::<Vec<_>>();
+            if self.model.decision_tree_fits(
+                &self.prefill_workspace,
+                &self.decision_readout,
+                &group.request.prefix_tokens,
+                &branch_tokens,
+            ) {
+                on_lifecycle(RequestLifecycleEvent::Admitted(Gemma4AdmissionProgress {
+                    request_id: group.id,
+                    sequence_device_bytes: 0,
+                    cached_prompt_tokens: 0,
+                    allocation_duration: Duration::ZERO,
+                    checkpoint_copy_duration: Duration::ZERO,
+                    admitted_after_tick_start: Duration::ZERO,
+                }));
+                let started = Instant::now();
+                let logits = self.model.decision_tree_selected_logits(
+                    &mut self.prefill_workspace,
+                    &mut self.decision_readout,
+                    &group.request.prefix_tokens,
+                    &branch_tokens,
+                    &self.stream,
+                )?;
+                group.timings.branch_inference += started.elapsed();
+                let label_count = self.decision_readout.token_ids().len();
+                for (row, branch) in group.request.branches.iter().enumerate() {
+                    let row_logits = &logits[row * label_count..(row + 1) * label_count];
+                    group.logits.push(DecisionBranchLogits {
+                        question_id: branch.question_id.clone(),
+                        logits: row_logits[..branch.label_token_ids.len()].to_vec(),
+                    });
+                }
+                let branch_logits = std::mem::take(&mut group.logits);
+                let answers =
+                    answers_from_logits(&group.request, &branch_logits, 1.0).map_err(|error| {
+                        Error::Format {
+                            label: "Gemma 4 decision tree answers",
+                            detail: error.to_string(),
+                        }
+                    })?;
+                return Ok(Some(DecisionCompletion {
+                    answers,
+                    branch_logits,
+                    usage: DecisionUsage {
+                        input_tokens: group.request.logical_input_tokens(),
+                        output_tokens: group.request.branches.len(),
+                    },
+                    timings: group.timings,
+                    released_sequence_device_bytes: 0,
+                }));
+            }
+        }
+
+        if group.parent_sequence_id.is_none() {
             if self.sequences.len() >= self.config.max_active_sequences {
                 return Ok(None);
             }
@@ -723,14 +795,17 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 .released_sequence_device_bytes
                 .saturating_add(released.max(group.parent_sequence_device_bytes));
         }
-        let answers = answers_from_logits(&group.request, &group.logits, 1.0).map_err(|error| {
-            Error::Format {
-                label: "Gemma 4 decision answers",
-                detail: error.to_string(),
-            }
-        })?;
+        let branch_logits = std::mem::take(&mut group.logits);
+        let answers =
+            answers_from_logits(&group.request, &branch_logits, 1.0).map_err(|error| {
+                Error::Format {
+                    label: "Gemma 4 decision answers",
+                    detail: error.to_string(),
+                }
+            })?;
         Ok(Some(DecisionCompletion {
             answers,
+            branch_logits,
             usage: DecisionUsage {
                 input_tokens: group.request.logical_input_tokens(),
                 output_tokens: group.request.branches.len(),

@@ -2805,6 +2805,18 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_pack_tree_kv_bf16_on_stream(
+        key: *const f32,
+        value: *const f32,
+        packed_key: *mut u16,
+        packed_value: *mut u16,
+        prefix_tokens: u32,
+        suffix_tokens: u32,
+        suffix_row_offset: u32,
+        heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_causal_window_softmax_f32_on_stream(
         scores: *mut f32,
         query_tokens: u32,

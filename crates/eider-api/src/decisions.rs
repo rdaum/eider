@@ -2,8 +2,8 @@
 
 use crate::protocol::ApiError;
 use eider_runtime::decision::{
-    DecisionAnswer, DecisionCompletion, DecisionPromptQuestion, DecisionPromptRequest,
-    MAX_DECISION_ANSWERS, MAX_DECISION_QUESTIONS,
+    DecisionAnswer, DecisionBranchLogits, DecisionCompletion, DecisionPromptQuestion,
+    DecisionPromptRequest, MAX_DECISION_ANSWERS, MAX_DECISION_QUESTIONS,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,9 @@ pub struct DecisionApiRequest {
     pub model: String,
     pub state: Value,
     pub questions: IndexMap<String, DecisionQuestion>,
+    /// Includes raw selected logits for evaluation and calibration tooling.
+    #[serde(default)]
+    pub include_raw_logits: bool,
 }
 
 /// One typed decision question.
@@ -162,8 +165,26 @@ fn validate_content(param: &str, value: &Value) -> Result<(), ApiError> {
 #[derive(Clone, Debug, Serialize)]
 pub struct DecisionApiResponse {
     pub model: String,
+    pub calibration: DecisionApiCalibration,
     pub answers: IndexMap<String, DecisionApiAnswer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_logits: Option<IndexMap<String, IndexMap<String, f32>>>,
     pub usage: DecisionApiUsage,
+}
+
+/// Calibration provenance for this response.
+#[derive(Clone, Debug, Serialize)]
+pub struct DecisionApiCalibration {
+    pub status: DecisionCalibrationStatus,
+    pub profile: Option<String>,
+}
+
+/// Whether the returned distributions use a validated calibration profile.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionCalibrationStatus {
+    Calibrated,
+    Uncalibrated,
 }
 
 /// One typed decision answer.
@@ -176,13 +197,13 @@ pub enum DecisionApiAnswer {
     Choice {
         choice: String,
         probabilities: IndexMap<String, f32>,
-        confidence: f32,
+        concentration: f32,
     },
     Score {
         score: f32,
         legend: IndexMap<String, String>,
         probabilities: IndexMap<String, f32>,
-        confidence: f32,
+        concentration: f32,
     },
 }
 
@@ -197,6 +218,7 @@ pub struct DecisionApiUsage {
 #[derive(Clone, Debug, Deserialize)]
 pub struct DecisionCalibration {
     schema: String,
+    profile: String,
     validated_dataset: bool,
     model: String,
     prompt_format: String,
@@ -233,7 +255,7 @@ impl DecisionCalibration {
     }
 
     fn validate(&self, expected_model: &str) -> Result<(), ApiError> {
-        if self.schema != "eider-decision-calibration-v1" {
+        if self.schema != "eider-decision-calibration-v2" {
             return Err(ApiError::invalid(
                 "decision_calibration",
                 format!("unsupported calibration schema {:?}", self.schema),
@@ -260,7 +282,8 @@ impl DecisionCalibration {
                 format!("unsupported prompt format {:?}", self.prompt_format),
             ));
         }
-        if self.deployment.requested_model.is_empty()
+        if self.profile.trim().is_empty()
+            || self.deployment.requested_model.is_empty()
             || self.dataset.is_empty()
             || self.dataset_version.is_empty()
             || self.dataset_sha256.len() != 64
@@ -305,6 +328,11 @@ impl DecisionCalibration {
             .expect("validated calibration contains all question types")
             .temperature
     }
+
+    /// Returns the dataset profile recorded by this artifact.
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
 }
 
 impl DecisionApiResponse {
@@ -313,72 +341,104 @@ impl DecisionApiResponse {
         model: String,
         completion: DecisionCompletion,
         calibration: Option<&DecisionCalibration>,
+        include_raw_logits: bool,
     ) -> Result<Self, ApiError> {
+        let DecisionCompletion {
+            answers: completed_answers,
+            branch_logits,
+            usage,
+            ..
+        } = completion;
+        let mut logits_by_id = BTreeMap::new();
+        for DecisionBranchLogits {
+            question_id,
+            logits,
+        } in branch_logits
+        {
+            if logits_by_id.insert(question_id.clone(), logits).is_some() {
+                return Err(ApiError::server(format!(
+                    "decision engine returned duplicate logits for question ID {question_id:?}"
+                )));
+            }
+        }
         let mut answers = IndexMap::new();
-        for (id, answer) in completion.answers {
+        let mut response_logits = include_raw_logits.then(IndexMap::new);
+        for (id, answer) in completed_answers {
+            let logits = logits_by_id.remove(&id).ok_or_else(|| {
+                ApiError::server(format!(
+                    "decision engine returned no raw logits for question ID {id:?}"
+                ))
+            })?;
             let answer = match answer {
                 DecisionAnswer::Noul { probability } => {
-                    let noul = calibration.map_or(probability, |calibration| {
-                        calibrate_probabilities(
-                            &[probability, 1.0 - probability],
-                            calibration.temperature("noul"),
-                        )[0]
-                    });
+                    let keys = ["true".to_string(), "false".to_string()];
+                    record_raw_logits(&mut response_logits, &id, &keys, &logits)?;
+                    let noul = match calibration {
+                        Some(calibration) => {
+                            calibrated_probabilities(&logits, calibration.temperature("noul"))?[0]
+                        }
+                        None => probability,
+                    };
                     DecisionApiAnswer::Noul { noul }
                 }
                 DecisionAnswer::Choice {
                     choice,
                     probabilities,
-                    confidence,
+                    concentration,
                 } => {
-                    let (choice, probabilities, confidence) = match calibration {
+                    let keys = probabilities
+                        .iter()
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    record_raw_logits(&mut response_logits, &id, &keys, &logits)?;
+                    let (choice, probabilities, concentration) = match calibration {
                         Some(calibration) => {
-                            let keys = probabilities
-                                .iter()
-                                .map(|(key, _)| key.clone())
-                                .collect::<Vec<_>>();
-                            let values = probabilities
-                                .iter()
-                                .map(|(_, value)| *value)
-                                .collect::<Vec<_>>();
-                            let values =
-                                calibrate_probabilities(&values, calibration.temperature("choice"));
+                            let values = calibrated_probabilities(
+                                &logits,
+                                calibration.temperature("choice"),
+                            )?;
                             let selected = argmax(&values);
                             (
                                 keys[selected].clone(),
-                                keys.into_iter().zip(values.iter().copied()).collect(),
-                                concentration(&values),
+                                keys.into_iter()
+                                    .zip(values.iter().copied())
+                                    .collect::<Vec<_>>(),
+                                normalized_concentration(&values),
                             )
                         }
-                        None => (choice, probabilities, confidence),
+                        None => (choice, probabilities, concentration),
                     };
                     DecisionApiAnswer::Choice {
                         choice,
                         probabilities: probabilities.into_iter().collect(),
-                        confidence,
+                        concentration,
                     }
                 }
                 DecisionAnswer::Score {
                     score,
                     legend,
                     probabilities,
-                    confidence,
+                    concentration,
                 } => {
-                    let (score, probabilities, confidence) = match calibration {
+                    let keys = (0..probabilities.len())
+                        .map(|index| index.to_string())
+                        .collect::<Vec<_>>();
+                    record_raw_logits(&mut response_logits, &id, &keys, &logits)?;
+                    let (score, probabilities, concentration) = match calibration {
                         Some(calibration) => {
-                            let values = calibrate_probabilities(
-                                &probabilities,
+                            let values = calibrated_probabilities(
+                                &logits,
                                 calibration.temperature("score"),
-                            );
+                            )?;
                             let score = values
                                 .iter()
                                 .enumerate()
                                 .map(|(index, probability)| index as f32 * probability)
                                 .sum();
-                            let confidence = concentration(&values);
-                            (score, values, confidence)
+                            let concentration = normalized_concentration(&values);
+                            (score, values, concentration)
                         }
-                        None => (score, probabilities, confidence),
+                        None => (score, probabilities, concentration),
                     };
                     DecisionApiAnswer::Score {
                         score,
@@ -392,7 +452,7 @@ impl DecisionApiResponse {
                             .enumerate()
                             .map(|(index, probability)| (index.to_string(), probability))
                             .collect(),
-                        confidence,
+                        concentration,
                     }
                 }
             };
@@ -402,21 +462,65 @@ impl DecisionApiResponse {
                 )));
             }
         }
+        if !logits_by_id.is_empty() {
+            return Err(ApiError::server(
+                "decision engine returned raw logits without matching answers",
+            ));
+        }
         Ok(Self {
             model,
+            calibration: DecisionApiCalibration {
+                status: if calibration.is_some() {
+                    DecisionCalibrationStatus::Calibrated
+                } else {
+                    DecisionCalibrationStatus::Uncalibrated
+                },
+                profile: calibration.map(|calibration| calibration.profile().to_string()),
+            },
             answers,
+            raw_logits: response_logits,
             usage: DecisionApiUsage {
-                input_tokens: completion.usage.input_tokens,
-                output_tokens: completion.usage.output_tokens,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
             },
         })
     }
 }
 
-fn calibrate_probabilities(probabilities: &[f32], temperature: f32) -> Vec<f32> {
-    let scaled = probabilities
+fn record_raw_logits(
+    output: &mut Option<IndexMap<String, IndexMap<String, f32>>>,
+    question_id: &str,
+    keys: &[String],
+    logits: &[f32],
+) -> Result<(), ApiError> {
+    if keys.len() != logits.len() || logits.iter().any(|value| !value.is_finite()) {
+        return Err(ApiError::server(format!(
+            "decision engine returned invalid raw logits for question ID {question_id:?}"
+        )));
+    }
+    let Some(output) = output else {
+        return Ok(());
+    };
+    output.insert(
+        question_id.to_string(),
+        keys.iter().cloned().zip(logits.iter().copied()).collect(),
+    );
+    Ok(())
+}
+
+fn calibrated_probabilities(logits: &[f32], temperature: f32) -> Result<Vec<f32>, ApiError> {
+    if logits.len() < 2
+        || logits.iter().any(|value| !value.is_finite())
+        || !temperature.is_finite()
+        || temperature <= 0.0
+    {
+        return Err(ApiError::server(
+            "decision calibration received invalid raw logits or temperature",
+        ));
+    }
+    let scaled = logits
         .iter()
-        .map(|value| value.max(1e-12).ln() / temperature)
+        .map(|value| value / temperature)
         .collect::<Vec<_>>();
     let maximum = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut weights = scaled
@@ -424,10 +528,15 @@ fn calibrate_probabilities(probabilities: &[f32], temperature: f32) -> Vec<f32> 
         .map(|value| (value - maximum).exp())
         .collect::<Vec<_>>();
     let total = weights.iter().sum::<f32>();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(ApiError::server(
+            "decision calibration could not normalise raw logits",
+        ));
+    }
     for weight in &mut weights {
         *weight /= total;
     }
-    weights
+    Ok(weights)
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -438,7 +547,7 @@ fn argmax(values: &[f32]) -> usize {
         .map_or(0, |(index, _)| index)
 }
 
-fn concentration(probabilities: &[f32]) -> f32 {
+fn normalized_concentration(probabilities: &[f32]) -> f32 {
     let entropy = probabilities
         .iter()
         .filter(|value| **value > 0.0)
@@ -593,9 +702,13 @@ mod tests {
                         score: 0.25,
                         legend: vec!["low".to_string(), "high".to_string()],
                         probabilities: vec![0.75, 0.25],
-                        confidence: 0.2,
+                        concentration: 0.2,
                     },
                 )],
+                branch_logits: vec![DecisionBranchLogits {
+                    question_id: "score".to_string(),
+                    logits: vec![0.75_f32.ln(), 0.25_f32.ln()],
+                }],
                 usage: DecisionUsage {
                     input_tokens: 20,
                     output_tokens: 1,
@@ -604,17 +717,22 @@ mod tests {
                 released_sequence_device_bytes: 0,
             },
             None,
+            false,
         )
         .expect("valid completion");
         let value = serde_json::to_value(response).expect("serializable response");
         assert_eq!(value["answers"]["score"]["probabilities"]["1"], 0.25);
         assert_eq!(value["answers"]["score"]["legend"]["0"], "low");
+        assert_eq!(value["calibration"]["status"], "uncalibrated");
+        assert!(value["calibration"]["profile"].is_null());
+        assert!(value.get("raw_logits").is_none());
     }
 
     #[test]
-    fn validated_calibration_changes_probabilities_and_preserves_usage() {
+    fn validated_calibration_uses_raw_logits_and_preserves_usage() {
         let artifact = json!({
-            "schema": "eider-decision-calibration-v1",
+            "schema": "eider-decision-calibration-v2",
+            "profile": "pilot@1:000000000000",
             "validated_dataset": true,
             "model": "decision-1",
             "prompt_format": "eider-decision-v1",
@@ -643,14 +761,14 @@ mod tests {
                 answers: vec![
                     (
                         "binary".to_string(),
-                        DecisionAnswer::Noul { probability: 0.8 },
+                        DecisionAnswer::Noul { probability: 1.0 },
                     ),
                     (
                         "choice".to_string(),
                         DecisionAnswer::Choice {
                             choice: "a".to_string(),
-                            probabilities: vec![("a".to_string(), 0.8), ("b".to_string(), 0.2)],
-                            confidence: 0.5,
+                            probabilities: vec![("a".to_string(), 1.0), ("b".to_string(), 0.0)],
+                            concentration: 0.5,
                         },
                     ),
                     (
@@ -662,10 +780,24 @@ mod tests {
                                 "middle".to_string(),
                                 "high".to_string(),
                             ],
-                            probabilities: vec![0.8, 0.1, 0.1],
-                            confidence: 0.5,
+                            probabilities: vec![1.0, 0.0, 0.0],
+                            concentration: 0.5,
                         },
                     ),
+                ],
+                branch_logits: vec![
+                    DecisionBranchLogits {
+                        question_id: "binary".to_string(),
+                        logits: vec![0.8_f32.ln(), 0.2_f32.ln()],
+                    },
+                    DecisionBranchLogits {
+                        question_id: "choice".to_string(),
+                        logits: vec![0.8_f32.ln(), 0.2_f32.ln()],
+                    },
+                    DecisionBranchLogits {
+                        question_id: "score".to_string(),
+                        logits: vec![0.8_f32.ln(), 0.1_f32.ln(), 0.1_f32.ln()],
+                    },
                 ],
                 usage: DecisionUsage {
                     input_tokens: 9,
@@ -675,6 +807,7 @@ mod tests {
                 released_sequence_device_bytes: 0,
             },
             Some(&calibration),
+            true,
         )
         .expect("calibrated response");
         let value = serde_json::to_value(response).expect("response serializes");
@@ -695,6 +828,12 @@ mod tests {
                 < 1e-6
         );
         assert!(value["answers"]["score"]["score"].as_f64().unwrap() > 0.4);
+        assert_eq!(value["calibration"]["status"], "calibrated");
+        assert_eq!(value["calibration"]["profile"], "pilot@1:000000000000");
+        assert!(
+            (value["raw_logits"]["choice"]["a"].as_f64().unwrap() - f64::from(0.8_f32.ln())).abs()
+                < 1e-6
+        );
         assert_eq!(value["usage"]["input_tokens"], 9);
         assert_eq!(value["usage"]["output_tokens"], 2);
     }
@@ -702,7 +841,8 @@ mod tests {
     #[test]
     fn calibration_rejects_a_different_model() {
         let artifact = json!({
-            "schema": "eider-decision-calibration-v1",
+            "schema": "eider-decision-calibration-v2",
+            "profile": "pilot@1:000000000000",
             "validated_dataset": true,
             "model": "decision-other",
             "prompt_format": "eider-decision-v1",
@@ -721,5 +861,29 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&artifact).expect("artifact serializes");
         assert!(DecisionCalibration::from_json(&bytes, "decision-1").is_err());
+    }
+
+    #[test]
+    fn response_rejects_missing_raw_logits() {
+        let error = DecisionApiResponse::from_completion(
+            "decision-1".to_string(),
+            DecisionCompletion {
+                answers: vec![(
+                    "binary".to_string(),
+                    DecisionAnswer::Noul { probability: 0.8 },
+                )],
+                branch_logits: Vec::new(),
+                usage: DecisionUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                timings: Default::default(),
+                released_sequence_device_bytes: 0,
+            },
+            None,
+            false,
+        )
+        .expect_err("missing raw logits must fail");
+        assert!(error.message.contains("no raw logits"));
     }
 }

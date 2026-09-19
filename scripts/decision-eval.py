@@ -185,18 +185,31 @@ def probabilities(question: dict[str, Any], answer: dict[str, Any]) -> dict[str,
     return {key: value / total for key, value in result.items()}
 
 
+def selected_logits(question: dict[str, Any], supplied: Any) -> dict[str, float]:
+    keys = option_keys(question)
+    if not isinstance(supplied, dict) or set(supplied) != set(keys):
+        raise ValueError("response omitted raw selected logits")
+    result = {key: float(supplied[key]) for key in keys}
+    if any(not math.isfinite(value) for value in result.values()):
+        raise ValueError(f"invalid raw logits: {result!r}")
+    return result
+
+
 def prediction_record(
     target: Target,
     response_model: str,
     example: dict[str, Any],
     question_id: str,
     answer: dict[str, Any],
+    raw_logits: Any,
     mode: str,
     latency_ms: float,
     usage: Any,
 ) -> dict[str, Any]:
     question = example["questions"][question_id]
-    probs = probabilities(question, answer)
+    reported_probs = probabilities(question, answer)
+    logits = selected_logits(question, raw_logits)
+    probs = temperature_probabilities(logits, 1.0)
     predicted = max(probs, key=probs.__getitem__)
     expected = normalise_expected(example["expected"][question_id])
     return {
@@ -213,7 +226,9 @@ def prediction_record(
         "predicted": predicted,
         "correct": predicted == expected,
         "probabilities": probs,
-        "concentration": answer.get("confidence"),
+        "reported_probabilities": reported_probs,
+        "logits": logits,
+        "concentration": answer.get("concentration"),
         "latency_ms": latency_ms,
         "usage": usage,
     }
@@ -222,7 +237,12 @@ def prediction_record(
 def decision_payload(
     target: Target, state: Any, questions: dict[str, Any]
 ) -> dict[str, Any]:
-    return {"model": target.model, "state": state, "questions": questions}
+    return {
+        "model": target.model,
+        "state": state,
+        "questions": questions,
+        "include_raw_logits": True,
+    }
 
 
 def permute_choice(question: dict[str, Any], seed: int) -> dict[str, Any]:
@@ -269,6 +289,7 @@ def evaluate_target(
                 example,
                 question_id,
                 answer,
+                response.get("raw_logits", {}).get(question_id),
                 "multi",
                 latency_ms,
                 response.get("usage"),
@@ -289,6 +310,7 @@ def evaluate_target(
                 example,
                 question_id,
                 response["answers"][question_id],
+                response.get("raw_logits", {}).get(question_id),
                 "single",
                 single_latency,
                 response.get("usage"),
@@ -303,6 +325,12 @@ def evaluate_target(
                     "max_probability_delta": max_probability_delta(
                         single["probabilities"], multi[question_id]["probabilities"]
                     ),
+                    "multi_predicted": multi[question_id]["predicted"],
+                    "single_predicted": single["predicted"],
+                    "multi_probabilities": multi[question_id]["probabilities"],
+                    "single_probabilities": single["probabilities"],
+                    "multi_logits": multi[question_id]["logits"],
+                    "single_logits": single["logits"],
                     "multi_usage": multi[question_id]["usage"],
                     "single_usage": single["usage"],
                 }
@@ -324,6 +352,7 @@ def evaluate_target(
                         example,
                         question_id,
                         response["answers"][question_id],
+                        response.get("raw_logits", {}).get(question_id),
                         "permutation",
                         permutation_latency,
                         response.get("usage"),
@@ -356,6 +385,7 @@ def evaluate_target(
                     example,
                     question_id,
                     answer,
+                    response.get("raw_logits", {}).get(question_id),
                     "injection",
                     variant_latency,
                     response.get("usage"),
@@ -513,10 +543,8 @@ def target_comparisons(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return comparisons
 
 
-def temperature_probabilities(probs: dict[str, float], temperature: float) -> dict[str, float]:
-    scaled = {
-        key: math.log(max(value, EPSILON)) / temperature for key, value in probs.items()
-    }
+def temperature_probabilities(logits: dict[str, float], temperature: float) -> dict[str, float]:
+    scaled = {key: value / temperature for key, value in logits.items()}
     maximum = max(scaled.values())
     weights = {key: math.exp(value - maximum) for key, value in scaled.items()}
     total = sum(weights.values())
@@ -527,7 +555,7 @@ def calibration_objective(
     records: list[dict[str, Any]], temperature: float, ordinal: bool
 ) -> float:
     adjusted = [
-        {**record, "probabilities": temperature_probabilities(record["probabilities"], temperature)}
+        {**record, "probabilities": temperature_probabilities(record["logits"], temperature)}
         for record in records
     ]
     losses = [record_losses(record) for record in adjusted]
@@ -571,7 +599,9 @@ def fit_calibration(
     for question_type in ("noul", "choice", "score"):
         selected = [record for record in calibration if record["question_type"] == question_type]
         if not selected:
-            continue
+            raise ValueError(
+                f"calibration split has no {question_type!r} questions"
+            )
         ordinal = question_type == "score"
         temperature, objective = fit_temperature(selected, ordinal)
         maps[question_type] = {
@@ -589,12 +619,13 @@ def fit_calibration(
             {
                 **record,
                 "probabilities": temperature_probabilities(
-                    record["probabilities"], fitted["temperature"]
+                    record["logits"], fitted["temperature"]
                 ),
             }
         )
     return {
-        "schema": "eider-decision-calibration-v1",
+        "schema": "eider-decision-calibration-v2",
+        "profile": f"{dataset['name']}@{dataset['version']}:{dataset_hash[:12]}",
         "validated_dataset": True,
         "model": model_revision,
         "target": target.name,
@@ -620,6 +651,7 @@ def self_test() -> None:
         {
             "question_type": "choice",
             "probabilities": {"a": 0.8, "b": 0.2},
+            "logits": {"a": math.log(0.8), "b": math.log(0.2)},
             "expected": "a",
             "predicted": "a",
             "correct": True,
@@ -631,6 +663,7 @@ def self_test() -> None:
         {
             "question_type": "choice",
             "probabilities": {"a": 0.7, "b": 0.3},
+            "logits": {"a": math.log(0.7), "b": math.log(0.3)},
             "expected": "b",
             "predicted": "a",
             "correct": False,
@@ -647,7 +680,7 @@ def self_test() -> None:
     temperature, objective = fit_temperature(records, False)
     assert 0.05 <= temperature <= 20.0
     assert math.isfinite(objective)
-    assert temperature_probabilities({"a": 0.5, "b": 0.5}, 2.0) == {
+    assert temperature_probabilities({"a": 0.0, "b": 0.0}, 2.0) == {
         "a": 0.5,
         "b": 0.5,
     }

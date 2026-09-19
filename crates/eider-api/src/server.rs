@@ -349,6 +349,7 @@ async fn decisions(
             ),
         )));
     }
+    let include_raw_logits = request.include_raw_logits;
     let prompt_started = Instant::now();
     let prompt = request
         .into_prompt_request()
@@ -431,6 +432,7 @@ async fn decisions(
         state.config.decision_model,
         completion,
         state.config.decision_calibration.as_ref(),
+        include_raw_logits,
     )
     .map_err(ApiFailure::server)?;
     let server_timing = format!(
