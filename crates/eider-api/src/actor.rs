@@ -1395,6 +1395,7 @@ mod tests {
                     request_id: EngineRequestId::new(7),
                     completion: DecisionCompletion {
                         answers: Vec::new(),
+                        branch_logits: Vec::new(),
                         usage: DecisionUsage {
                             input_tokens: 2,
                             output_tokens: 0,

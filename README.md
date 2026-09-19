@@ -14,74 +14,6 @@ Eider has three priorities:
 - It provides a practical platform for experiments and for learning how
   inference systems work.
 
-## Native decisions
-
-`POST /v1/decisions` answers typed questions without generating a prose
-response. Gemma 4, Qwen3.6, and Qwen3.8 Flash Next use native model paths for
-this endpoint.
-
-Gemma 4 evaluates the shared state once. It then forks one KV-only child
-sequence for each question and batches the question suffixes. A compact
-64-row head reads the answer logits from the tied BF16 embedding. It does not
-allocate or evaluate the full vocabulary head for each branch.
-
-Start the Gemma 4 NVFP4 checkpoint:
-
-```sh
-scripts/run-eider-gemma4.sh
-```
-
-If the checkpoint is not cached, permit network access for the first start:
-
-```sh
-EIDER_OFFLINE=0 scripts/run-eider-gemma4.sh
-```
-
-Send a decision request from a second terminal:
-
-```sh
-curl -fsS http://127.0.0.1:8080/v1/decisions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "decision-latest",
-    "state": "Help! My payouts have been failing for three days.",
-    "questions": {
-      "is_urgent": {
-        "type": "noul",
-        "instructions": "Does this message convey urgency?",
-        "criteria": {
-          "true": "Explicitly time-sensitive",
-          "false": "No urgency expressed"
-        }
-      },
-      "department": {
-        "type": "choice",
-        "instructions": "Which team should handle this?",
-        "criteria": {
-          "billing": "Payments, invoicing, refunds",
-          "technical": "Bugs, outages, integrations",
-          "sales": "Pricing, upgrades, new accounts"
-        }
-      },
-      "frustration": {
-        "type": "score",
-        "instructions": "How frustrated is the customer?",
-        "criteria": ["Calm", "Frustrated", "Very angry"]
-      }
-    }
-  }' | jq
-```
-
-A `noul` answer is the probability of `true`. A `choice` answer includes the
-selected option and all option probabilities. A `score` answer is the expected
-ordinal index for its legend. The `confidence` value measures probability
-concentration, not answer correctness.
-
-Decision usage is logical API usage. Input usage includes the shared state and
-all question suffixes. Output usage contains one answer token for each
-question. Use `--decision-calibration FILE` to load a validated calibration
-artifact for the exact served model.
-
 ## Qwen3.8 Flash Next
 
 Eider served [Qwen3.8 Flash
@@ -209,6 +141,105 @@ scripts/run-pi-eider-qwen38.sh
 The launcher enables two DFlash2 drafts and the native 262,144-token context
 window. It uses one active sequence to keep the full-attention cache within the
 Spark memory budget.
+
+## Low latency "decisions" API
+
+`POST /v1/decisions` answers typed questions without generating a prose
+response. Gemma 4, Qwen3.6, and Qwen3.8 Flash Next use native model paths for
+this endpoint.
+
+Gemma 4 is the fastest model to use for this. It evaluates the shared
+state once. It then forks one KV-only child sequence for each question
+and batches the question suffixes. Then a compact 64-row head reads
+the answer logits from the tied BF16 embedding. It does not allocate
+or evaluate the full vocabulary head for each branch, so can move
+quickly.
+
+Start the Gemma 4 NVFP4 checkpoint:
+
+```sh
+scripts/run-eider-gemma4.sh
+```
+
+If the checkpoint is not cached, permit network access for the first start:
+
+```sh
+EIDER_OFFLINE=0 scripts/run-eider-gemma4.sh
+```
+
+Send a decision request from a second terminal:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "decision-latest",
+    "state": "Help! My payouts have been failing for three days.",
+    "questions": {
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does this message convey urgency?",
+        "criteria": {
+          "true": "Explicitly time-sensitive",
+          "false": "No urgency expressed"
+        }
+      },
+      "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "billing": "Payments, invoicing, refunds",
+          "technical": "Bugs, outages, integrations",
+          "sales": "Pricing, upgrades, new accounts"
+        }
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated is the customer?",
+        "criteria": ["Calm", "Frustrated", "Very angry"]
+      }
+    }
+  }' | jq
+```
+
+A `noul` answer is the probability of `true`. A `choice` answer includes the
+selected option and all option probabilities. A `score` answer is the expected
+ordinal index for its legend. The `concentration` value measures distribution
+shape, not answer correctness.
+
+Decision usage is logical API usage. Input usage includes the shared state and
+all question suffixes. Output usage contains one answer token for each
+question. Every response reports `calibrated` or `uncalibrated` and the active
+profile. Use `--decision-calibration FILE` to load a validated calibration
+artifact for the exact served model. Add `--require-decision-calibration` when
+an uncalibrated deployment must fail during startup. Set `include_raw_logits`
+only for evaluation and calibration tooling.
+
+Build and fit a local calibration profile while an uncalibrated Eider server
+is running:
+
+```sh
+python3 scripts/build-decision-eval-dataset.py \
+    --output target/decision-pilot.json
+python3 scripts/decision-eval.py \
+    --dataset target/decision-pilot.json \
+    --target local=http://127.0.0.1:8080/v1/decisions \
+    --model local=decision-latest \
+    --output target/decision-evaluation.json \
+    --fit-calibration target/eider-calibration.json \
+    --calibration-target local
+```
+
+Restart the server with the generated artifact:
+
+```sh
+scripts/run-eider --offline \
+    --decision-calibration target/eider-calibration.json \
+    --require-decision-calibration
+```
+
+A calibration profile applies only to its reviewed task and dataset
+distribution. It does not prove that arbitrary questions are correct.
 
 ### Current performance
 

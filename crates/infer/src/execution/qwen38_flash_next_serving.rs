@@ -691,14 +691,17 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 .released_sequence_device_bytes
                 .saturating_add(released.max(group.parent_sequence_device_bytes));
         }
-        let answers = answers_from_logits(&group.request, &group.logits, 1.0).map_err(|error| {
-            Error::Format {
-                label: "Qwen3.8 Flash Next decision answers",
-                detail: error.to_string(),
-            }
-        })?;
+        let branch_logits = std::mem::take(&mut group.logits);
+        let answers =
+            answers_from_logits(&group.request, &branch_logits, 1.0).map_err(|error| {
+                Error::Format {
+                    label: "Qwen3.8 Flash Next decision answers",
+                    detail: error.to_string(),
+                }
+            })?;
         Ok(Some(DecisionCompletion {
             answers,
+            branch_logits,
             usage: DecisionUsage {
                 input_tokens: group.request.logical_input_tokens(),
                 output_tokens: group.request.branches.len(),

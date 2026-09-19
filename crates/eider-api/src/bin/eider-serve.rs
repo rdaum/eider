@@ -172,6 +172,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     decision_calibration: Option<PathBuf>,
 
+    /// Refuse to start without a valid decision calibration artifact.
+    #[arg(long)]
+    require_decision_calibration: bool,
+
     /// Maximum simultaneous prefill rows.
     #[arg(long, default_value_t = 8)]
     prefill_sequence_capacity: usize,
@@ -299,6 +303,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!("Eider");
     let args = Args::parse();
+    if args.require_decision_calibration && args.decision_calibration.is_none() {
+        return Err("--require-decision-calibration needs --decision-calibration FILE".into());
+    }
     let mut resolved = match (args.model.as_deref(), args.model_dir) {
         (Some(id), None) => resolve_catalogue_model(id, args.offline).await?,
         (None, Some(path)) => resolve_local_model(path)?,
@@ -402,6 +409,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_dir = %resolved.checkpoint_dir.display(),
         artifact_dir = %resolved.artifact_dir.display(),
         decision_calibrated = config.decision_calibration.is_some(),
+        decision_calibration_profile = ?config
+            .decision_calibration
+            .as_ref()
+            .map(DecisionCalibration::profile),
         listen = %config.listen,
         "serving model"
     );

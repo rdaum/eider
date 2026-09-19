@@ -172,14 +172,14 @@ pub enum DecisionAnswer {
     Choice {
         choice: String,
         probabilities: Vec<(String, f32)>,
-        confidence: f32,
+        concentration: f32,
     },
     /// Expected zero-based rubric position and the complete distribution.
     Score {
         score: f32,
         legend: Vec<String>,
         probabilities: Vec<f32>,
-        confidence: f32,
+        concentration: f32,
     },
 }
 
@@ -194,6 +194,8 @@ pub struct DecisionUsage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionCompletion {
     pub answers: Vec<(String, DecisionAnswer)>,
+    /// Raw selected logits retained for calibration and evaluation.
+    pub branch_logits: Vec<DecisionBranchLogits>,
     pub usage: DecisionUsage,
     pub timings: DecisionTimings,
     pub released_sequence_device_bytes: usize,
@@ -409,7 +411,7 @@ pub fn answers_from_logits(
                         .cloned()
                         .zip(probabilities.iter().copied())
                         .collect(),
-                    confidence: normalized_concentration(&probabilities),
+                    concentration: normalized_concentration(&probabilities),
                 }
             }
             DecisionPromptQuestion::Score { levels, .. } => DecisionAnswer::Score {
@@ -420,7 +422,7 @@ pub fn answers_from_logits(
                     .sum(),
                 legend: levels.clone(),
                 probabilities: probabilities.clone(),
-                confidence: normalized_concentration(&probabilities),
+                concentration: normalized_concentration(&probabilities),
             },
         };
         answers.push((branch.question_id.clone(), answer));
@@ -854,7 +856,7 @@ mod tests {
         let DecisionAnswer::Score {
             score,
             probabilities,
-            confidence,
+            concentration,
             ..
         } = &answers[0].1
         else {
@@ -862,7 +864,7 @@ mod tests {
         };
         assert!((*score - 1.0).abs() < 1e-6);
         assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!((0.0..=1.0).contains(confidence));
+        assert!((0.0..=1.0).contains(concentration));
     }
 
     #[test]
