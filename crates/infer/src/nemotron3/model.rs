@@ -3052,6 +3052,25 @@ pub(crate) struct Nemotron3DecodeState {
 }
 
 impl Nemotron3DecodeState {
+    /// Maximum snapshot size, including full companion and MTP context storage.
+    pub(crate) fn snapshot_capacity_bytes(&self) -> usize {
+        self.final_hidden.device_bytes()
+            + self.logits.device_bytes()
+            + self
+                .layers
+                .iter()
+                .map(|layer| match layer {
+                    Nemotron3LayerState::Mamba { state, .. } => state.device_bytes(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+            + self
+                .lilicorr
+                .as_ref()
+                .map_or(0, LiLiCorrSequence::device_bytes)
+            + self.mtp.as_ref().map_or(0, Nemotron3MtpState::device_bytes)
+    }
+
     /// Returns the number of tokens already processed by the backbone.
     pub fn len(&self) -> usize {
         self.tokens

@@ -30,15 +30,15 @@ add_default --retained-prefix-gib 1
 speculative_drafts=0
 for arg in "${server_args[@]}"; do
   if [[ "$arg" == --lilicorr-dir || "$arg" == --lilicorr-dir=* ]]; then
-    speculative_drafts=7
+    speculative_drafts=3
     break
   fi
 done
-if [[ "${EIDER_LILICORR:-0}" == 1 || -n "${LILICORR_DIR:-}" ]]; then
+if [[ "${EIDER_LILICORR:-1}" == 1 ]]; then
   lilicorr_revision="7c7221aeb4cb3139307aa457f7dce11a8fb6ceb2"
   lilicorr_dir="${LILICORR_DIR:-$hf_cache/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/$lilicorr_revision}"
   add_default --lilicorr-dir "$lilicorr_dir"
-  speculative_drafts=7
+  speculative_drafts=3
 fi
 add_default --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-$speculative_drafts}"
 add_default --nemotron-bf16-storage bf16

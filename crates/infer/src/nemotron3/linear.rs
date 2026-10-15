@@ -118,25 +118,26 @@ impl Nemotron3Linear {
         gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
+        if batch_rows >= 2
+            && let Self::Fp8(linear) = self
+            && let Some(input_scale) = linear.input_scale
+            && linear.channel_weight_scale.is_none()
+            && linear.rows.is_multiple_of(16)
+            && linear.cols.is_multiple_of(16)
+        {
+            return gemm.run_calibrated_fp8_on_stream(
+                input,
+                &linear.weight,
+                output.output(),
+                batch_rows,
+                linear.rows,
+                linear.cols,
+                linear.weight_scale,
+                input_scale,
+                stream,
+            );
+        }
         if batch_rows >= 8 {
-            if let Self::Fp8(linear) = self
-                && let Some(input_scale) = linear.input_scale
-                && linear.channel_weight_scale.is_none()
-                && linear.rows.is_multiple_of(16)
-                && linear.cols.is_multiple_of(16)
-            {
-                return gemm.run_calibrated_fp8_on_stream(
-                    input,
-                    &linear.weight,
-                    output.output(),
-                    batch_rows,
-                    linear.rows,
-                    linear.cols,
-                    linear.weight_scale,
-                    input_scale,
-                    stream,
-                );
-            }
             return match self {
                 Self::Bf16(linear) => gemm.run_on_stream(
                     input,
@@ -236,12 +237,25 @@ impl Nemotron3Linear {
         rows: usize,
         weights: impl Iterator<Item = &'a Self>,
     ) -> Result<F32DenseGemm> {
-        if rows < 8 {
+        if rows < 2 {
             return F32DenseGemm::new(1, 1, 0);
         }
         let mut features = 1;
         let mut elements = 0;
         for weight in weights {
+            if rows < 8 {
+                let Self::Fp8(w) = weight else {
+                    continue;
+                };
+                if w.input_scale.is_none()
+                    || w.channel_weight_scale.is_some()
+                    || !w.rows.is_multiple_of(16)
+                    || !w.cols.is_multiple_of(16)
+                {
+                    continue;
+                }
+            }
+
             let (out, cols, quantized) = match weight {
                 Self::Bf16(w) => (w.rows, w.cols, false),
                 Self::Fp8(w) => (

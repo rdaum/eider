@@ -1,8 +1,9 @@
 # Nemotron 3.5 VL LiLiCorr
 
 Eider loads the released companion and supports one to seven proposals per
-cycle. LiLiCorr is opt-in. The target and companion use the same prefix cache
-and preserve Mamba state through partial acceptance.
+cycle. The Nemotron 3.5 launcher enables LiLiCorr by default. The target and
+companion use the same prefix cache and preserve Mamba state through partial
+acceptance.
 
 ## Checkpoint contract
 
@@ -60,14 +61,16 @@ Download the companion into the normal Hugging Face cache:
 ```sh
 hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr \
   --revision 7c7221aeb4cb3139307aa457f7dce11a8fb6ceb2
-EIDER_LILICORR=1 scripts/run-eider-nemotron35.sh
+scripts/run-eider-nemotron35.sh
 ```
 
-The launcher resolves that pinned snapshot and enables seven proposals. Set
-`LILICORR_DIR` to select a different local snapshot path. Explicit server arguments
-still take precedence. `EIDER_SPECULATIVE_DRAFTS=0` disables proposals; values one
-through seven select the proposal length. The direct server option is
-`--lilicorr-dir DIR`. It defaults to seven proposals unless overridden.
+The launcher resolves that pinned snapshot and enables three proposals by default.
+Set `EIDER_LILICORR=0` to run without the companion.
+Set `LILICORR_DIR` to select a different local snapshot path.
+Explicit server arguments still take precedence.
+`EIDER_SPECULATIVE_DRAFTS=0` disables proposals. Values one through seven select
+the proposal length. The direct server option is
+`--lilicorr-dir DIR`. It defaults to three proposals unless overridden.
 
 `crates/infer/src/nemotron3/lilicorr/` validates all 178 consumed tensors and
 implements the backbone, correlator, and sequential candidate walk. Target
@@ -98,6 +101,16 @@ window. Eight FP32 Mamba snapshot slots add 1.25 GiB per full verification
 workspace. Prefix snapshots retain only the populated draft window. Companion
 weights, projection scratch, and a shortened verification workspace add further
 memory; these costs are separate from the target weights.
+
+Target verification groups routes by expert and shares each decoded weight across
+up to four tokens. The kernel stages 1,024 input values at a time and preserves
+the previous FP32 dot-product order. Sorting and projection run on the model
+stream and participate in verification graphs.
+
+FP8 dense projections now use checkpoint activation scales for batches of two
+through seven rows, matching the existing path for larger batches. Small NVFP4
+shared projections retain their weight-reusing matvec path. Calibrated FP8 can
+change token choices relative to the previous small-batch activation path.
 
 Nemotron prepares the checkpoint's NVFP4 dense weights once for batched
 projections. The shared experts add about 3.3 GiB of prepared BF16 weights.
@@ -146,14 +159,24 @@ companion, without an HTTP adapter.
 | Initial seven LiLiCorr proposals | 22.57 s | 605 ms | 14.34 tok/s | 2.71 |
 | Updated target only | 19.01 s | 530 ms | 15.12 tok/s | — |
 | Updated seven LiLiCorr proposals | 19.23 s | 554 ms | 18.10 tok/s | 2.71 |
+| Expert reuse, seven proposals | 19.76 s | 550 ms | 20.97 tok/s | 2.71 |
+| Expert reuse and calibrated short batches, three proposals | 19.85 s | 549 ms | 21.52 tok/s | 1.74 |
 
-The updated run uses batched W4A16, split-context attention, and prepared target
+The first update uses batched W4A16, split-context attention, and prepared target
 dense weights. Cached request time fell from 9.46 seconds to 7.57 seconds.
 Decode improved 26% over the initial seven-proposal path and 20% over the paired
 target-only run. Both versions accepted 92 drafts across 34 cycles.
+With expert reuse and calibrated short batches, three proposals completed the
+cached request in 6.45 seconds. They accepted 80 drafts across 46 cycles.
+Seven proposals took 6.61 seconds and retained 92 accepted drafts across 34 cycles.
+Three proposals improved decode by 19% over the previous default and reduced
+cached request time by 15%. These single-workload results select the current default.
+
 Prefix replay, seeded sampling, and cancellation passed. These throughput figures
 use greedy decoding; they do not establish the same gain for stochastic requests.
-LiLiCorr remains opt-in; the launcher selects seven proposals.
+The launcher enables LiLiCorr with three proposals by default.
+The direct server selects three proposals when supplied with `--lilicorr-dir`.
+Set `EIDER_SPECULATIVE_DRAFTS=7` to use the full proposal length.
 
 The focused `lilicorr_kernels` benchmark checks dense outputs against the prior
 per-row kernel and attention against the serial implementation. It covers partial
@@ -167,11 +190,24 @@ cargo bench -p eider-cuda --bench lilicorr_kernels
 cargo bench -p eider-cuda --bench nemotron35_dense -- 'prepared 8 rows'
 ```
 
-The `nemotron35_experts` micromeasure also covers verification sizes of two,
-four, and eight rows. At eight rows and 22 routes per row, median up/down times
-were 1.55/1.50 ms for SIMT and 3.13/2.66 ms for the sorted prefill tensor path.
-The comparison includes sorting and checks all outputs against SIMT first.
-The runtime therefore retains SIMT for these small verification batches.
+The `nemotron35_experts` micromeasure covers verification sizes of two, four,
+and eight rows. It compares every output against the previous SIMT kernel,
+including repeated experts and partial groups. The new kernel matches bit for bit.
+
+At eight rows with four routes sharing each expert, up/down times fell from
+1.067/0.884 ms to 0.731/0.554 ms, including sorting. With distinct experts, up
+was unchanged and down cost about 4% more. Routing overlap therefore determines
+the benefit.
+
+The four-row Mamba input projection fell from 1.345 ms to 0.415 ms with calibrated
+FP8. Its benchmark checks against a reference with the same activation quantization.
+The shared NVFP4 projection remained faster on its small-batch matvec path:
+0.120 ms versus 0.164 ms with prepared dense GEMM weights.
+
+```sh
+cargo bench -p eider-cuda --bench nemotron35_experts -- verification
+cargo bench -p eider-cuda --bench nemotron35_dense -- Verification
+```
 
 The model card reports coding acceptance lengths of 5.65 at temperature zero and
 5.29 at temperature one with seven speculative tokens. These are reference

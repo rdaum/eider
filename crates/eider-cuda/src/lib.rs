@@ -167,7 +167,7 @@ pub use kernels::non_gemm::{
     nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream,
     nvfp4_w4a16_matvec_block_per_row_f32_into_on_stream,
     nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
+    nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream, nvfp4_w4a16_reuse_matvec_into_on_stream,
     nvfp4_w4a16_top1_configured_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream, pack_token_heads_bf16_into_on_stream,
     pack_tree_kv_bf16_into_on_stream, pack_value_heads_bf16_into_on_stream,

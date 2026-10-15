@@ -349,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let speculative_drafts = args
         .speculative_drafts
         .unwrap_or(if args.lilicorr_dir.is_some() {
-            7
+            3
         } else {
             resolved.default_speculative_drafts
         });

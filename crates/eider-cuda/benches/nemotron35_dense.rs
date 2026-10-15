@@ -203,7 +203,7 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dens
             F32DenseGemm::prepare_nvfp4_weights(&case.fp4, &case.scales, &case.stream).unwrap(),
         );
         for format in 0..4 {
-            for rows in [1, 7, 17, ROWS].into_iter().filter(|&n| n <= ROWS) {
+            for rows in [1, 2, 3, 7, 17, ROWS].into_iter().filter(|&n| n <= ROWS) {
                 case.run(format, 0, rows);
                 let reference = case.output.copy_to_host(&case.stream).unwrap().to_vec();
                 for mode in [1, 2] {
@@ -308,6 +308,21 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Dense<18560, 4096, 4>>("Verification Mamba input 4 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("per-row FP8 weights", sample::<18560, 4096, 1, 0, 4>);
+                g.bench_sample("calibrated FP8", sample::<18560, 4096, 1, 3, 4>);
+            });
+            runner.group::<Dense<5376, 4096, 4>>("Verification shared up 4 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("per-row NVFP4 weights", sample::<5376, 4096, 3, 0, 4>);
+                g.bench_sample("prepared NVFP4 weights", sample::<5376, 4096, 3, 4, 4>);
+            });
+            runner.group::<Dense<512, 4096, 4>>("Verification router 4 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("per-row BF16 weights", sample::<512, 4096, 0, 0, 4>);
+                g.bench_sample("BF16 GEMM", sample::<512, 4096, 0, 2, 4>);
+            });
             runner.group::<Dense<5376, 4096, 8>>("Shared up prepared 8 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("including expansion", sample::<5376, 4096, 3, 2, 8>);

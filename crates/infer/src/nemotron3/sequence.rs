@@ -142,7 +142,10 @@ pub(crate) fn new_nemotron3_sequence_cache_with_budget(
         storage,
     )?;
     let page_bytes = probe.page_bytes();
-    let private_bytes = model.sequence_state(max_context_tokens)?.device_bytes();
+    let (private_bytes, snapshot_capacity) = {
+        let state = model.sequence_state(max_context_tokens)?;
+        (state.device_bytes(), state.snapshot_capacity_bytes())
+    };
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
     let fixed_bytes = private_bytes
         .checked_add(table_bytes)
@@ -177,7 +180,7 @@ pub(crate) fn new_nemotron3_sequence_cache_with_budget(
             expected: "active and prefix budgets without overflow".to_string(),
             actual: format!("active={eager_bytes} prefix={prefix_bytes}"),
         })?;
-    let snapshot_bytes = prefix_bytes / 4;
+    let snapshot_bytes = prefix_snapshot_reserve(prefix_bytes, snapshot_capacity);
     let extra_pages = prefix_bytes.saturating_sub(snapshot_bytes) / page_bytes;
     let page_slots = eager_pages.saturating_add(extra_pages);
     if page_slots == 0 {
@@ -207,6 +210,12 @@ pub(crate) fn new_nemotron3_sequence_cache_with_budget(
         backend,
     )
     .map_err(nemotron3_cache_error)
+}
+
+fn prefix_snapshot_reserve(prefix_bytes: usize, snapshot_capacity: usize) -> usize {
+    // Retain at least one full recurrent/draft snapshot when the budget permits.
+    // The remainder still funds KV pages within the same total prefix budget.
+    (prefix_bytes / 4).max(snapshot_capacity).min(prefix_bytes)
 }
 
 pub(crate) fn nemotron3_cache_error(error: CacheError<Error>) -> Error {
@@ -681,6 +690,36 @@ impl PageBackend for Nemotron3PageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_reserve_fits_lilicorr_with_the_launcher_budget() {
+        let manifest = super::super::Nemotron3Manifest::from_config_str(include_str!(
+            "fixtures/super-3.5-vl-config.json"
+        ))
+        .unwrap();
+        let draft: super::super::lilicorr::LiLiCorrConfig =
+            serde_json::from_str(include_str!("lilicorr/fixtures/config.json")).unwrap();
+        let target_bytes = manifest.mamba_state_bytes()
+            + (manifest.hidden_size + manifest.vocab_size) * size_of::<f32>();
+        let draft_bytes = (draft.hidden_size
+            + 2 * draft.num_hidden_layers
+                * draft.sliding_window
+                * draft.num_key_value_heads
+                * draft.head_dim)
+            * size_of::<f32>();
+        let prefix_bytes = 1024 * 1024 * 1024;
+        let snapshot_bytes = target_bytes + draft_bytes;
+        assert!(snapshot_bytes > prefix_bytes / 4);
+        let reserved = prefix_snapshot_reserve(prefix_bytes, snapshot_bytes);
+        assert!(reserved >= snapshot_bytes);
+        assert!(prefix_bytes - reserved >= 512 * 1024 * 1024);
+        assert_eq!(
+            prefix_snapshot_reserve(prefix_bytes, target_bytes),
+            prefix_bytes / 4
+        );
+        assert_eq!(prefix_snapshot_reserve(0, snapshot_bytes), 0);
+        assert_eq!(prefix_snapshot_reserve(1024, snapshot_bytes), 1024);
+    }
 
     fn admitted(outcome: AdmissionOutcome) -> SequenceId {
         match outcome {

@@ -12016,6 +12016,63 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
     )
 }
 
+/// Computes sorted NVFP4 expert matvecs, reusing weights across up to four routes.
+/// Preserves the unsorted path's FP32 dot-product order. Each input and output
+/// address must cover the declared feature count. Supports up to 65,535 routes
+/// and K of at most 3072.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_reuse_matvec_into_on_stream(
+    routes: &MoeSortedRoutes,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    scales: &DeviceBuffer<DeviceAddress<u8>>,
+    globals: &DeviceBuffer<f32>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let experts = weights.len();
+    if routes.active_routes() > 65535
+        || experts == 0
+        || experts != routes.experts
+        || scales.len() != experts
+        || globals.len() != experts
+        || inputs.len() < routes.active_routes()
+        || outputs.len() < routes.active_routes()
+        || out_features == 0
+        || out_features > u32::MAX as usize - 15
+        || in_features == 0
+        || in_features > 3072
+        || !in_features.is_multiple_of(16)
+    {
+        return Err(Error::Format {
+            label: "NVFP4 expert weight reuse",
+            detail: "expected matching route and expert tables, positive dimensions and K divisible by 16 and at most 3072".into(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nvfp4_w4a16_reuse_matvec_f32_on_stream",
+            ffi::infer_nvfp4_w4a16_reuse_matvec_f32_on_stream(
+                routes.sorted_routes.ptr,
+                routes.sorted_experts.ptr,
+                routes.expert_offsets.ptr,
+                inputs.ptr.cast(),
+                weights.ptr.cast(),
+                scales.ptr.cast(),
+                globals.ptr,
+                outputs.ptr.cast(),
+                routes.active_routes() as u32,
+                experts as u32,
+                out_features as u32,
+                in_features as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues an active prefix of device-routed W4A16 matvecs using typed input,
 /// expert, and output address tables.
 #[allow(clippy::too_many_arguments)]
@@ -23769,7 +23826,7 @@ mod tests {
         const ROUTES: usize = 2;
         const EXPERTS: usize = 4;
         const OUT: usize = 37;
-        const INPUT: usize = 128;
+        const INPUT: usize = 1040;
         let inputs = (0..BATCH * INPUT)
             .map(|index| (((index * 11) % 29) as f32 - 14.0) * 0.03125)
             .collect::<Vec<_>>();
@@ -23848,6 +23905,27 @@ mod tests {
             &stream,
         )
         .expect("grouped inputs");
+        let reference = actual_outputs
+            .iter()
+            .map(|output| output.copy_to_host(&stream).unwrap().to_vec())
+            .collect::<Vec<_>>();
+        let mut sorted = MoeSortedRoutes::new(BATCH * ROUTES, EXPERTS).unwrap();
+        sorted.sort_on_stream(&indices_device, &stream).unwrap();
+        nvfp4_w4a16_reuse_matvec_into_on_stream(
+            &sorted,
+            &input_table,
+            &packed_table,
+            &scale_table,
+            &scale_2,
+            &actual_table,
+            OUT,
+            INPUT,
+            &stream,
+        )
+        .unwrap();
+        for (output, expected) in actual_outputs.iter().zip(&reference) {
+            assert_eq!(&*output.copy_to_host(&stream).unwrap(), expected.as_slice());
+        }
 
         for (row, input_row) in input_rows.iter().enumerate() {
             let begin = row * ROUTES;

@@ -2,6 +2,7 @@ use eider_cuda::{
     CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, MoeSortedRoutes,
     lfm2_expert_gemm_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
+    nvfp4_w4a16_reuse_matvec_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -17,6 +18,7 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
     stop: CudaEvent,
     routes: MoeSortedRoutes,
     indices: DeviceBuffer<u32>,
+    repeated_indices: DeviceBuffer<u32>,
     _weights: Vec<DeviceBuffer<u8>>,
     _scales: Vec<DeviceBuffer<u8>>,
     _input: DeviceBuffer<f32>,
@@ -30,10 +32,28 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
 
 impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, ROUTES> {
     fn enqueue(&mut self, mode: usize) {
-        if mode == 2 {
-            self.routes
-                .sort_on_stream(&self.indices, &self.stream)
-                .unwrap();
+        let indices = if mode >= 4 {
+            &self.repeated_indices
+        } else {
+            &self.indices
+        };
+        let mode = mode % 4;
+        if mode == 3 {
+            self.routes.sort_on_stream(indices, &self.stream).unwrap();
+            nvfp4_w4a16_reuse_matvec_into_on_stream(
+                &self.routes,
+                &self.inputs,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                &self.outputs,
+                OUT,
+                IN,
+                &self.stream,
+            )
+            .unwrap();
+        } else if mode == 2 {
+            self.routes.sort_on_stream(indices, &self.stream).unwrap();
             lfm2_expert_gemm_pipelined_into_on_stream(
                 &self.routes,
                 &self.inputs,
@@ -48,7 +68,7 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, RO
             .unwrap();
         } else if mode == 1 {
             self.routes
-                .sort_on_stream(&self.indices, &self.stream)
+                .sort_on_stream(indices, &self.stream)
                 .expect("sort");
             lfm2_expert_gemm_into_on_stream(
                 &self.routes,
@@ -64,7 +84,7 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, RO
             .expect("tensor");
         } else {
             nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
-                &self.indices,
+                indices,
                 &self.inputs,
                 &self.weights,
                 &self.scales,
@@ -130,6 +150,12 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
             stop: CudaEvent::new().expect("stop"),
             routes: MoeSortedRoutes::new(ROUTES, EXPERTS).expect("routes"),
             indices,
+            repeated_indices: DeviceBuffer::from_host(
+                &(0..ROUTES)
+                    .map(|i| ((i / 4 * 17) % EXPERTS) as u32)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
             weights: DeviceBuffer::from_host(
                 &weights
                     .iter()
@@ -180,6 +206,13 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
                 .copy_to_host(&context.stream)
                 .expect("reference")
                 .to_vec();
+            context.enqueue(3);
+            let reused = context.output.copy_to_host(&context.stream).unwrap();
+            assert_eq!(
+                &reused[..routes * OUT],
+                &reference[..routes * OUT],
+                "reused arithmetic"
+            );
             context.enqueue(1);
             let actual = context
                 .output
@@ -263,6 +296,15 @@ fn main() {
                         let group = group.measurement_domain(MeasurementDomain::Gpu);
                         group.bench_sample("SIMT", sample::<2688, 1024, 0, $routes>);
                         group.bench_sample(
+                            "weight reuse including sort",
+                            sample::<2688, 1024, 3, $routes>,
+                        );
+                        group.bench_sample("SIMT shared experts", sample::<2688, 1024, 4, $routes>);
+                        group.bench_sample(
+                            "weight reuse shared experts",
+                            sample::<2688, 1024, 7, $routes>,
+                        );
+                        group.bench_sample(
                             "tensor including sort",
                             sample::<2688, 1024, 2, $routes>,
                         );
@@ -270,6 +312,15 @@ fn main() {
                     runner.group::<Experts<1024, 2688, $routes>>($down, |group| {
                         let group = group.measurement_domain(MeasurementDomain::Gpu);
                         group.bench_sample("SIMT", sample::<1024, 2688, 0, $routes>);
+                        group.bench_sample(
+                            "weight reuse including sort",
+                            sample::<1024, 2688, 3, $routes>,
+                        );
+                        group.bench_sample("SIMT shared experts", sample::<1024, 2688, 4, $routes>);
+                        group.bench_sample(
+                            "weight reuse shared experts",
+                            sample::<1024, 2688, 7, $routes>,
+                        );
                         group.bench_sample(
                             "tensor including sort",
                             sample::<1024, 2688, 2, $routes>,

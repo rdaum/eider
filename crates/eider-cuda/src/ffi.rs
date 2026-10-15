@@ -3313,6 +3313,21 @@ unsafe extern "C" {
         in_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_nvfp4_w4a16_reuse_matvec_f32_on_stream(
+        sorted_routes: *const u32,
+        sorted_experts: *const u32,
+        offsets: *const u32,
+        inputs: *const *const f32,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        globals: *const f32,
+        outputs: *const *mut f32,
+        routes: u32,
+        experts: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
         indices: *const u32,
         input_table: *const *const f32,

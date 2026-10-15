@@ -1096,13 +1096,14 @@ mod tests {
             ..SchedulerConfig::default()
         };
         let mut model = Nemotron3Model::load(&root).unwrap();
-        let mut baseline = Nemotron3ChatService::new_with_cache_config(
-            &model,
-            &template,
-            scheduler,
-            SequenceCacheConfig::default(),
-        )
-        .unwrap();
+        // Match the launcher: the generic 2 GiB default masked undersized
+        // snapshot reserves when LiLiCorr's sliding context was included.
+        let cache_config = SequenceCacheConfig {
+            max_retained_bytes: 1024 * 1024 * 1024,
+        };
+        let mut baseline =
+            Nemotron3ChatService::new_with_cache_config(&model, &template, scheduler, cache_config)
+                .unwrap();
         let (_, serial_cold) = run_checkpoint_request(&mut baseline, request.clone());
         let (_, serial_cached) = run_checkpoint_request(&mut baseline, request.clone());
         drop(baseline);
@@ -1119,7 +1120,7 @@ mod tests {
                 speculative_drafts,
                 ..scheduler
             },
-            SequenceCacheConfig::default(),
+            cache_config,
         )
         .unwrap();
         let (cold_output, cold) = run_checkpoint_request(&mut service, request.clone());

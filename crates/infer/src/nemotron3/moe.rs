@@ -13,7 +13,8 @@ use eider_cuda::{
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream, relu_squared_f32_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
+    nvfp4_w4a16_reuse_matvec_into_on_stream, relu_squared_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt};
@@ -576,7 +577,12 @@ impl Nemotron3ExpertSlab {
         }
         if let Some(routes) = &mut workspace.sorted_routes {
             routes.sort_on_stream(indices, stream)?;
-            lfm2_expert_gemm_pipelined_into_on_stream(
+            let project = if rows < 16 && self.latent <= 3072 && self.intermediate <= 3072 {
+                nvfp4_w4a16_reuse_matvec_into_on_stream
+            } else {
+                lfm2_expert_gemm_pipelined_into_on_stream
+            };
+            project(
                 routes,
                 &workspace.up_input_table,
                 &self.up_packed_table,
@@ -592,7 +598,7 @@ impl Nemotron3ExpertSlab {
                 workspace.routed_activated.output(),
                 stream,
             )?;
-            lfm2_expert_gemm_pipelined_into_on_stream(
+            project(
                 routes,
                 &workspace.down_input_table,
                 &self.down_packed_table,
@@ -920,7 +926,7 @@ impl Nemotron3MoeRowsWorkspace {
                 .then(|| Nemotron3Nvfp4MoeWorkspace::new(moe, rows, latent))
                 .transpose()?,
             router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
-            sorted_routes: (rows >= 16)
+            sorted_routes: (rows >= 16 || (rows > 1 && latent <= 3072 && intermediate <= 3072))
                 .then(|| MoeSortedRoutes::new(routes, moe.routed_experts))
                 .transpose()?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,

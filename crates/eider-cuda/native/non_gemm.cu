@@ -13421,6 +13421,93 @@ extern "C" cudaError_t infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
     return cudaGetLastError();
 }
 
+// Four routes to the same expert share each decoded weight. Each route keeps
+// the original warp dot-product order, including FP32 activations and scaling.
+__global__ __launch_bounds__(512, 3) void infer_nvfp4_w4a16_reuse_matvec_f32_kernel(
+    const uint32_t* sorted_routes, const uint32_t* sorted_experts,
+    const uint32_t* offsets, const float* const* inputs,
+    const uint8_t* const* weights, const uint8_t* const* scales,
+    const float* globals, float* const* outputs, uint32_t experts,
+    uint32_t out_features, uint32_t in_features) {
+    constexpr unsigned kRoutes = 4, kWarps = 16;
+    const unsigned begin = blockIdx.y, expert = sorted_experts[begin];
+    if (expert >= experts || (begin - offsets[expert]) % kRoutes != 0) return;
+    const unsigned count = min(kRoutes, offsets[expert + 1] - begin);
+    // Bounded input staging keeps three 512-thread CTAs resident even for
+    // K=2688. Chunk boundaries preserve each lane's original dot-product order.
+    constexpr unsigned kChunk = 1024;
+    extern __shared__ float x[];
+    const unsigned row = blockIdx.x * kWarps + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    const uint8_t* w = weights[expert] + size_t(row) * (in_features / 2);
+    const uint8_t* s = scales[expert] + size_t(row) * (in_features / 16);
+    float acc[kRoutes] = {};
+    for (unsigned base = 0; base < in_features; base += kChunk) {
+        const unsigned width = min(kChunk, in_features - base);
+        #pragma unroll
+        for (unsigned j = 0; j < kRoutes; ++j) {
+            if (j < count) {
+                const float* source = inputs[sorted_routes[begin + j]] + base;
+                for (unsigned c = threadIdx.x; c < width; c += blockDim.x)
+                    x[j * kChunk + c] = source[c];
+            }
+        }
+        __syncthreads();
+        if (row < out_features) {
+            for (unsigned c = lane * 4; c < width; c += 128) {
+                const unsigned k = base + c;
+                const uint8_t p = w[k / 2], q = w[k / 2 + 1];
+                const float scale = infer_ue4m3_value(s[k / 16]);
+                const float w0 = infer_e2m1_value(p & 15) * scale;
+                const float w1 = infer_e2m1_value(p >> 4) * scale;
+                const float w2 = infer_e2m1_value(q & 15) * scale;
+                const float w3 = infer_e2m1_value(q >> 4) * scale;
+                #pragma unroll
+                for (unsigned j = 0; j < kRoutes; ++j) {
+                    if (j < count) {
+                        const float4 v = *reinterpret_cast<const float4*>(x + j * kChunk + c);
+                        acc[j] = __fmaf_rn(v.x, w0, acc[j]);
+                        acc[j] = __fmaf_rn(v.y, w1, acc[j]);
+                        acc[j] = __fmaf_rn(v.z, w2, acc[j]);
+                        acc[j] = __fmaf_rn(v.w, w3, acc[j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row >= out_features) return;
+    #pragma unroll
+    for (unsigned j = 0; j < kRoutes; ++j) {
+        if (j < count) {
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 16);
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 8);
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 4);
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 2);
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 1);
+            if (lane == 0) outputs[sorted_routes[begin + j]][row] = acc[j] * globals[expert];
+        }
+    }
+}
+
+extern "C" cudaError_t infer_nvfp4_w4a16_reuse_matvec_f32_on_stream(
+    const uint32_t* sorted_routes, const uint32_t* sorted_experts,
+    const uint32_t* offsets, const float* const* inputs,
+    const uint8_t* const* weights, const uint8_t* const* scales,
+    const float* globals, float* const* outputs, uint32_t routes,
+    uint32_t experts, uint32_t out_features, uint32_t in_features,
+    cudaStream_t stream) {
+    if (!sorted_routes || !sorted_experts || !offsets || !inputs || !weights ||
+        !scales || !globals || !outputs || !routes || !experts || !out_features ||
+        !in_features || in_features % 16 != 0 || in_features > 3072)
+        return cudaErrorInvalidValue;
+    infer_nvfp4_w4a16_reuse_matvec_f32_kernel<<<
+        dim3((out_features + 15) / 16, routes), 512, 4 * 1024 * sizeof(float), stream>>>(
+        sorted_routes, sorted_experts, offsets, inputs, weights, scales,
+        globals, outputs, experts, out_features, in_features);
+    return cudaGetLastError();
+}
+
 // ---------------------------------------------------------------------------
 // Experimental blockwise-Q2 matvec.
 //
