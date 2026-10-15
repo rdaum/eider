@@ -1,8 +1,8 @@
 //! Shared SM12x paged sequence storage.
 
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
-    Sm12xKvPagePool, Sm12xKvTailSnapshot,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Error, PinnedHostBuffer, Result,
+    SM12X_KV_PAGE_TOKENS, Sm12xKvPagePool, Sm12xKvTailSnapshot,
 };
 use seqcache::{
     BackendAppendCommit, BackendAppendPage, PageAllocation, PageBackend, RetireError, RetireOutcome,
@@ -31,6 +31,8 @@ impl Sm12xPage {
 pub struct Sm12xPageTable {
     host: PinnedHostBuffer<u32>,
     staging: PinnedHostBuffer<u32>,
+    host_upload: CudaEvent,
+    staging_upload: CudaEvent,
     device: DeviceBuffer<u32>,
     page_capacity: usize,
     position: usize,
@@ -54,6 +56,8 @@ impl Sm12xPageTable {
         Ok(Self {
             host,
             staging,
+            host_upload: CudaEvent::new_sync()?,
+            staging_upload: CudaEvent::new_sync()?,
             device: DeviceBuffer::zeroed(page_capacity)?,
             page_capacity,
             position: 0,
@@ -103,6 +107,9 @@ impl Sm12xPageTable {
                 actual: format!("pages={page_count} position={position}"),
             });
         }
+        // A later reservation can revisit this pinned buffer before its prior
+        // stream-ordered upload has completed.
+        self.staging_upload.synchronize()?;
         let staging = self.staging.as_mut_slice();
         let mut slots = slots.into_iter();
         for destination in &mut staging[..page_count] {
@@ -127,7 +134,9 @@ impl Sm12xPageTable {
         if changed {
             self.device
                 .copy_range_from_pinned_on_stream(0, &self.staging, stream)?;
+            self.staging_upload.record_on_stream(stream)?;
             std::mem::swap(&mut self.host, &mut self.staging);
+            std::mem::swap(&mut self.host_upload, &mut self.staging_upload);
         }
         self.position = position;
         Ok(())
@@ -152,6 +161,13 @@ impl Sm12xPageTable {
             position,
             stream,
         )
+    }
+}
+
+impl Drop for Sm12xPageTable {
+    fn drop(&mut self) {
+        let _ = self.host_upload.synchronize();
+        let _ = self.staging_upload.synchronize();
     }
 }
 

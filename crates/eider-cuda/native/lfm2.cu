@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
 
@@ -210,13 +211,14 @@ __device__ __forceinline__ void lfm2_mma(float* d, uint32_t a0, uint32_t a1,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template <bool Routed, unsigned Columns = 1>
+template <bool Routed, unsigned Columns = 1, unsigned DenseFormat = 0>
 __global__ void lfm2_gemm(
     const uint32_t* sorted_routes, const uint32_t* offsets,
     const float* const* inputs, const uint8_t* const* weights,
     const uint8_t* const* scales, const float* globals, float* const* outputs,
     unsigned experts, unsigned out_features, unsigned in_features,
-    const float* dense_input, const uint16_t* dense_weight, float* dense_output, unsigned rows) {
+    const float* dense_input, const uint16_t* dense_weight, float* dense_output, unsigned rows,
+    const float* dense_channels, float dense_scale, const uint8_t* dense_block_scales) {
     __shared__ unsigned expert, begin, end;
     if (threadIdx.x == 0) {
       if constexpr (!Routed) {
@@ -269,6 +271,26 @@ __global__ void lfm2_gemm(
             if (row1 < out_features) {
                 lfm2_weight_group(weight, scale, row1, k, in_features, lane, a1, a3);
             }
+        } else if constexpr (DenseFormat == 1) {
+            if (row0 < out_features) {
+                const auto* w = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(dense_weight)
+                    + static_cast<size_t>(row0) * in_features + k + pair);
+                const float2 lo = __half22float2(__nv_cvt_fp8x2_to_halfraw2(w[0], __NV_E4M3));
+                const float2 hi = __half22float2(__nv_cvt_fp8x2_to_halfraw2(w[4], __NV_E4M3));
+                a0 = lfm2_pair(lo.x, lo.y); a2 = lfm2_pair(hi.x, hi.y);
+            }
+            if (row1 < out_features) {
+                const auto* w = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(dense_weight)
+                    + static_cast<size_t>(row1) * in_features + k + pair);
+                const float2 lo = __half22float2(__nv_cvt_fp8x2_to_halfraw2(w[0], __NV_E4M3));
+                const float2 hi = __half22float2(__nv_cvt_fp8x2_to_halfraw2(w[4], __NV_E4M3));
+                a1 = lfm2_pair(lo.x, lo.y); a3 = lfm2_pair(hi.x, hi.y);
+            }
+        } else if constexpr (DenseFormat == 2) {
+            if (row0 < out_features) lfm2_weight_group(reinterpret_cast<const uint8_t*>(dense_weight),
+                dense_block_scales, row0, k, in_features, lane, a0, a2);
+            if (row1 < out_features) lfm2_weight_group(reinterpret_cast<const uint8_t*>(dense_weight),
+                dense_block_scales, row1, k, in_features, lane, a1, a3);
         } else {
             if (row0 < out_features) {
                 const auto* w = reinterpret_cast<const uint32_t*>(dense_weight
@@ -303,7 +325,7 @@ __global__ void lfm2_gemm(
         }
       }
     }
-    const float global = Routed ? globals[expert] : 1.0f;
+    const float global = Routed ? globals[expert] : dense_scale;
     #pragma unroll
     for (unsigned n = 0; n < Columns; ++n) {
     #pragma unroll
@@ -312,7 +334,8 @@ __global__ void lfm2_gemm(
         const unsigned row = i < 2 ? row0 : row1;
         if (route_index < end && row < out_features) {
             const float high = (hi[n][0][i] + hi[n][1][i]) + (hi[n][2][i] + hi[n][3][i]);
-            const float result = (high + (mid[n][i] + low[n][i])) * global;
+            const float scale = !Routed && dense_channels ? dense_channels[row] : global;
+            const float result = (high + (mid[n][i] + low[n][i])) * scale;
             if constexpr (Routed) outputs[sorted_routes[route_index]][row] = result;
             else dense_output[static_cast<size_t>(route_index) * out_features + row] = result;
         }
@@ -332,7 +355,7 @@ extern "C" cudaError_t infer_lfm2_expert_gemm_on_stream(
         || in_features % 16 != 0) return cudaErrorInvalidValue;
     const dim3 grid((out_features + 63) / 64, (routes + 15) / 16 + experts - 1);
     lfm2_gemm<true, 2><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
-        weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0);
+        weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0, nullptr, 1.0f, nullptr);
     return cudaGetLastError();
 }
 
@@ -473,7 +496,7 @@ extern "C" cudaError_t infer_lfm2_expert_gemm_pipelined_on_stream(
             weights, scales, globals, outputs, experts, out_features, in_features);
     } else {
         lfm2_gemm<true, 2><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
-            weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0);
+            weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0, nullptr, 1.0f, nullptr);
     }
     return cudaGetLastError();
 }
@@ -485,7 +508,7 @@ extern "C" cudaError_t infer_lfm2_dense_gemm_on_stream(
         || in_features % 16 != 0) return cudaErrorInvalidValue;
     lfm2_gemm<false><<<dim3((out_features + 63) / 64, (rows + 7) / 8), 128, 0, stream>>>(
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, out_features,
-        in_features, input, weight, output, rows);
+        in_features, input, weight, output, rows, nullptr, 1.0f, nullptr);
     return cudaGetLastError();
 }
 
@@ -656,5 +679,30 @@ extern "C" cudaError_t infer_lfm2_prefill_attention_on_stream(
     unsigned tokens, unsigned start_position, unsigned q_heads, unsigned kv_heads, cudaStream_t stream) {
     lfm2_prefill_attention_tiled<<<dim3((tokens + 63) / 64, q_heads), 256, 0, stream>>>(
         query, key, value, output, tokens, start_position, q_heads, kv_heads);
+    return cudaGetLastError();
+}
+
+// FP8 and NVFP4 stay compressed in device memory. Tensor-core operands decode
+// exactly to BF16; three BF16 components preserve the F32 activation mantissa.
+extern "C" cudaError_t infer_quantized_dense_gemm_f32_on_stream(
+    const float* input, const uint8_t* weight, const uint8_t* block_scales,
+    const float* channel_scales, float global_scale, float* output,
+    unsigned rows, unsigned out_features, unsigned in_features, unsigned format,
+    cudaStream_t stream) {
+    if (!input || !weight || !output || rows == 0 || out_features == 0 || in_features == 0
+        || in_features % 16 != 0 || format < 1 || format > 2 || (format == 2 && !block_scales))
+        return cudaErrorInvalidValue;
+    const dim3 grid((out_features + 63) / 64, (rows + 7) / 8);
+    if (format == 1) {
+        lfm2_gemm<false, 1, 1><<<grid, 128, 0, stream>>>(nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, 1, out_features, in_features,
+            input, reinterpret_cast<const uint16_t*>(weight), output, rows,
+            channel_scales, global_scale, nullptr);
+    } else {
+        lfm2_gemm<false, 1, 2><<<grid, 128, 0, stream>>>(nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, 1, out_features, in_features,
+            input, reinterpret_cast<const uint16_t*>(weight), output, rows,
+            nullptr, global_scale, block_scales);
+    }
     return cudaGetLastError();
 }

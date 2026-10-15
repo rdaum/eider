@@ -6,7 +6,8 @@ use super::{
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, MoeSortedRoutes, Result,
+    add_f32_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
@@ -459,33 +460,64 @@ impl Nemotron3ExpertSlab {
         stream: &CudaStream,
     ) -> Result<()> {
         let indices = workspace.router.indices();
-        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
-            indices,
-            &workspace.up_input_table,
-            &self.up_packed_table,
-            &self.up_scale_table,
-            &self.up_scale_2,
-            &workspace.up_output_table,
-            self.intermediate,
-            self.latent,
-            stream,
-        )?;
-        relu_squared_f32_into_on_stream(
-            &workspace.routed_up,
-            workspace.routed_activated.output(),
-            stream,
-        )?;
-        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
-            indices,
-            &workspace.down_input_table,
-            &self.down_packed_table,
-            &self.down_scale_table,
-            &self.down_scale_2,
-            &workspace.down_output_table,
-            self.latent,
-            self.intermediate,
-            stream,
-        )?;
+        if let Some(routes) = &mut workspace.sorted_routes {
+            routes.sort_on_stream(indices, stream)?;
+            lfm2_expert_gemm_pipelined_into_on_stream(
+                routes,
+                &workspace.up_input_table,
+                &self.up_packed_table,
+                &self.up_scale_table,
+                &self.up_scale_2,
+                &workspace.up_output_table,
+                self.intermediate,
+                self.latent,
+                stream,
+            )?;
+            relu_squared_f32_into_on_stream(
+                &workspace.routed_up,
+                workspace.routed_activated.output(),
+                stream,
+            )?;
+            lfm2_expert_gemm_pipelined_into_on_stream(
+                routes,
+                &workspace.down_input_table,
+                &self.down_packed_table,
+                &self.down_scale_table,
+                &self.down_scale_2,
+                &workspace.down_output_table,
+                self.latent,
+                self.intermediate,
+                stream,
+            )?;
+        } else {
+            nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
+                indices,
+                &workspace.up_input_table,
+                &self.up_packed_table,
+                &self.up_scale_table,
+                &self.up_scale_2,
+                &workspace.up_output_table,
+                self.intermediate,
+                self.latent,
+                stream,
+            )?;
+            relu_squared_f32_into_on_stream(
+                &workspace.routed_up,
+                workspace.routed_activated.output(),
+                stream,
+            )?;
+            nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
+                indices,
+                &workspace.down_input_table,
+                &self.down_packed_table,
+                &self.down_scale_table,
+                &self.down_scale_2,
+                &workspace.down_output_table,
+                self.latent,
+                self.intermediate,
+                stream,
+            )?;
+        }
         moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
             indices,
             workspace.router.weights(),
@@ -596,6 +628,7 @@ pub struct Nemotron3MoeWorkspace {
 /// Reusable scratch and pointer-table storage for flattened MoE rows.
 pub struct Nemotron3MoeRowsWorkspace {
     router: Nemotron3RouterRowsWorkspace,
+    sorted_routes: Option<MoeSortedRoutes>,
     normed: DeviceBuffer<f32>,
     latent: DeviceBuffer<f32>,
     routed_up: DeviceBuffer<f32>,
@@ -647,6 +680,9 @@ impl Nemotron3MoeRowsWorkspace {
         let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
             router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
+            sorted_routes: (rows >= 16)
+                .then(|| MoeSortedRoutes::new(routes, moe.routed_experts))
+                .transpose()?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
             latent: latent_buffer,
             routed_up,
@@ -715,6 +751,10 @@ impl Nemotron3MoeRowsWorkspace {
 
     pub(super) fn device_bytes(&self) -> usize {
         self.router.device_bytes()
+            + self
+                .sorted_routes
+                .as_ref()
+                .map_or(0, MoeSortedRoutes::device_bytes)
             + self.normed.device_bytes()
             + self.latent.device_bytes()
             + self.routed_up.device_bytes()

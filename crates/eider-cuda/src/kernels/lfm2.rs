@@ -6,6 +6,19 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn infer_quantized_dense_gemm_f32_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        block_scales: *const u8,
+        channel_scales: *const f32,
+        global_scale: f32,
+        output: *mut f32,
+        rows: u32,
+        out_features: u32,
+        in_features: u32,
+        format: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_lfm2_split_bf16_on_stream(
         input: *const f32,
         parts: *mut u16,
@@ -20,6 +33,66 @@ unsafe extern "C" {
         stride: u32,
         stream: *mut c_void,
     ) -> i32;
+}
+
+/// Projects F32 rows through compressed FP8 or NVFP4 weights using BF16 tensor
+/// cores. NVFP4 supplies K16 block scales; FP8 supplies optional channel scales.
+/// Three BF16 components retain the F32 input mantissa without requantization.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_dense_gemm_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    block_scales: Option<&DeviceBuffer<u8>>,
+    channel_scales: Option<&DeviceBuffer<f32>>,
+    global_scale: f32,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let elements = out_features.checked_mul(in_features);
+    let divisor = if block_scales.is_some() { 2 } else { 1 };
+    if rows == 0
+        || rows > 65535 * 8
+        || out_features == 0
+        || out_features > u32::MAX as usize - 63
+        || in_features == 0
+        || in_features > u32::MAX as usize
+        || !in_features.is_multiple_of(16)
+        || elements.is_none_or(|n| n / divisor != weight.len())
+        || block_scales.is_some_and(|s| elements.is_none_or(|n| n / 16 != s.len()))
+        || channel_scales.is_some_and(|s| s.len() != out_features || block_scales.is_some())
+        || rows
+            .checked_mul(in_features)
+            .is_none_or(|n| n > input.len())
+        || rows
+            .checked_mul(out_features)
+            .is_none_or(|n| n > output.len())
+    {
+        return Err(Error::Format {
+            label: "quantized F32 dense GEMM",
+            detail: "expected matching FP8 or NVFP4 buffers and positive dimensions with K divisible by 16".into(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_quantized_dense_gemm_f32_on_stream",
+            infer_quantized_dense_gemm_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                block_scales.map_or(std::ptr::null(), |s| s.ptr),
+                channel_scales.map_or(std::ptr::null(), |s| s.ptr),
+                global_scale,
+                output.buffer_mut().ptr,
+                rows as u32,
+                out_features as u32,
+                in_features as u32,
+                if block_scales.is_some() { 2 } else { 1 },
+                stream.as_raw(),
+            ),
+        )
+    }
 }
 
 /// Reusable dense projections with three BF16 components per F32 activation.

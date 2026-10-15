@@ -4,8 +4,9 @@ use eider_cuda::{
     CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
-    fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    fp8_linear_f32_into_on_stream, lfm2_dense_gemm_into_on_stream,
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream, quantized_dense_gemm_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
@@ -116,6 +117,43 @@ impl Nemotron3Linear {
         batch_rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        if batch_rows >= 8 {
+            return match self {
+                Self::Bf16(linear) => lfm2_dense_gemm_into_on_stream(
+                    input,
+                    &linear.weight,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+                Self::Fp8(linear) => quantized_dense_gemm_f32_into_on_stream(
+                    input,
+                    &linear.weight,
+                    None,
+                    linear.channel_weight_scale.as_ref(),
+                    linear.weight_scale,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+                Self::Nvfp4(linear) => quantized_dense_gemm_f32_into_on_stream(
+                    input,
+                    &linear.packed_weight,
+                    Some(&linear.weight_scale),
+                    None,
+                    linear.weight_scale_2,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+            };
+        }
         match self {
             Self::Bf16(linear) => bf16_linear_logits_f32_batch_into_on_stream(
                 input,

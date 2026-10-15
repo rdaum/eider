@@ -180,6 +180,114 @@ fn fp32_mamba_storage_is_budgeted_in_live_state_and_verification() {
 }
 
 #[test]
+fn prefill_retains_last_logits_and_recurrent_state_for_ragged_sequences() {
+    let fixture = Fixture::new(true, 4);
+    let mut config = omni_config("llm_config");
+    config["llm_config"]["mamba_ssm_cache_dtype"] = json!("float32");
+    fs::write(fixture.root.join("config.json"), config.to_string()).unwrap();
+    let model = Nemotron3Model::load(&fixture.root).unwrap();
+    let mut cache = super::new_nemotron3_sequence_cache(&model, 4, 32).unwrap();
+    let mut sequences = (0..4)
+        .map(|_| super::Nemotron3Sequence::admit(&model, &mut cache, 32).unwrap())
+        .collect::<Vec<_>>();
+    let chunks: [&[u32]; 2] = [&[1, 2, 3], &[4, 5, 6, 7, 8]];
+    let mut all = model.block_workspace(2, 8).unwrap();
+    let mut prefill = model.prefill_workspace(2, 8).unwrap();
+    let (reference, candidate) = sequences.split_at_mut(2);
+    model
+        .forward_block(
+            &mut reference.iter_mut().collect::<Vec<_>>(),
+            &chunks,
+            &mut all,
+            &mut cache,
+        )
+        .unwrap();
+    model
+        .forward_block(
+            &mut candidate.iter_mut().collect::<Vec<_>>(),
+            &chunks,
+            &mut prefill,
+            &mut cache,
+        )
+        .unwrap();
+    assert!(prefill.logits().is_empty());
+    assert_eq!(all.device_bytes() - prefill.device_bytes(), 8 * 128 * 4);
+    for (reference, candidate) in reference.iter_mut().zip(candidate) {
+        for next in [None, Some(9)] {
+            if let Some(token) = next {
+                model.forward_one(reference, &mut cache, token).unwrap();
+                model.forward_one(candidate, &mut cache, token).unwrap();
+            }
+            assert_eq!(reference.position(), candidate.position());
+            let expected = model.logits_to_host(reference).unwrap();
+            let actual = model.logits_to_host(candidate).unwrap();
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 1e-4 + b.abs() * 1e-5,
+                    "{a} vs {b}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prefill_workspace_can_be_reused_across_chunks_and_released_sequences() {
+    let fixture = Fixture::new(true, 4);
+    let model = Nemotron3Model::load(&fixture.root).unwrap();
+    let mut cache = super::new_nemotron3_sequence_cache(&model, 1, 1024).unwrap();
+    let mut workspace = model.prefill_workspace(1, 128).unwrap();
+    for chunks in [2, 2, 4] {
+        let mut sequence = super::Nemotron3Sequence::admit(&model, &mut cache, 1024).unwrap();
+        for _ in 0..chunks {
+            model
+                .forward_block(
+                    &mut [&mut sequence],
+                    &[&[1; 128]],
+                    &mut workspace,
+                    &mut cache,
+                )
+                .unwrap();
+        }
+        model.forward_one(&mut sequence, &mut cache, 2).unwrap();
+        assert!(
+            model
+                .logits_to_host(&sequence)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        sequence.finish(&model, &mut cache).unwrap();
+    }
+}
+
+#[test]
+fn decode_graph_replay_matches_eager_rows_across_a_page_boundary() {
+    let fixture = Fixture::new(true, 4);
+    let model = Nemotron3Model::load(&fixture.root).unwrap();
+    let mut cache = super::new_nemotron3_sequence_cache(&model, 2, 144).unwrap();
+    let mut eager = super::Nemotron3Sequence::admit(&model, &mut cache, 144).unwrap();
+    let mut graphed = super::Nemotron3Sequence::admit(&model, &mut cache, 144).unwrap();
+    let mut workspace = model.block_workspace(1, 1).unwrap();
+    for position in 0..132 {
+        let token = (position * 17 % 128) as u32;
+        model
+            .forward_block(&mut [&mut eager], &[&[token]], &mut workspace, &mut cache)
+            .unwrap();
+        model.forward_one(&mut graphed, &mut cache, token).unwrap();
+        let expected = model.logits_to_host(&eager).unwrap();
+        let actual = model.logits_to_host(&graphed).unwrap();
+        for (&a, &b) in actual.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && (a - b).abs() < 1e-4 + b.abs() * 1e-5,
+                "position={position}: {a} vs {b}"
+            );
+        }
+    }
+    assert_eq!(eager.position(), graphed.position());
+}
+
+#[test]
 fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
     let fixture = Fixture::new(true, 4);
     let manifest = Nemotron3Manifest::from_model_dir(&fixture.root).unwrap();

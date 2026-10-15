@@ -11,12 +11,13 @@ use super::{
 };
 use crate::execution::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace,
-    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
-    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
-    select_mamba_ssm_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, PinnedHostBuffer,
+    Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
+    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
+    select_bf16_state_snapshot_into_on_stream, select_mamba_ssm_state_snapshot_into_on_stream,
+    speculative_accept_argmax_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use std::path::Path;
@@ -157,6 +158,7 @@ impl Nemotron3Model {
             });
         }
         Ok(Nemotron3DecodeState {
+            decode_graphs: (0..=self.layers.len()).map(|_| None).collect(),
             hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             layers,
             rollback_mamba,
@@ -575,6 +577,16 @@ impl Nemotron3Model {
         Nemotron3BlockWorkspace::new(self, sequence_count, rows)
     }
 
+    /// Allocates prompt scratch without vocabulary logits for intermediate rows.
+    /// Final hidden states remain available for MTP cache preparation.
+    pub fn prefill_workspace(
+        &self,
+        sequence_count: usize,
+        rows: usize,
+    ) -> Result<Nemotron3BlockWorkspace> {
+        Nemotron3BlockWorkspace::new_impl(self, sequence_count, rows, None, true)
+    }
+
     /// Allocates an exact-shape workspace for transactional speculative
     /// verification. Each active sequence contributes `draft_count` rows.
     pub fn speculative_workspace(
@@ -859,10 +871,29 @@ impl Nemotron3Model {
             })?);
             tokens.extend_from_slice(chunk);
         }
-        workspace.tokens.copy_from_host(&tokens)?;
-        workspace.sequence_offsets.copy_from_host(&offsets)?;
-        workspace.sequence_lengths.copy_from_host(&lengths)?;
-        workspace.start_positions.copy_from_host(&starts)?;
+        if workspace.upload_pending {
+            workspace.upload_done.synchronize()?;
+        }
+        workspace.host_tokens.copy_from_slice(&tokens)?;
+        workspace.host_offsets.copy_from_slice(&offsets)?;
+        workspace.host_lengths.copy_from_slice(&lengths)?;
+        workspace.host_starts.copy_from_slice(&starts)?;
+        workspace.tokens.copy_range_from_pinned_on_stream(
+            0,
+            &workspace.host_tokens,
+            &self.stream,
+        )?;
+        workspace
+            .sequence_offsets
+            .copy_range_from_pinned_on_stream(0, &workspace.host_offsets, &self.stream)?;
+        workspace
+            .sequence_lengths
+            .copy_range_from_pinned_on_stream(0, &workspace.host_lengths, &self.stream)?;
+        workspace.start_positions.copy_range_from_pinned_on_stream(
+            0,
+            &workspace.host_starts,
+            &self.stream,
+        )?;
 
         self.enqueue_prepared_block(
             states,
@@ -911,14 +942,29 @@ impl Nemotron3Model {
                 Nemotron3Layer::Moe(_) => {}
             }
         }
-        workspace.conv_state_table.copy_from_host(&conv_ptrs)?;
-        workspace.ssm_state_table.copy_from_host(&ssm_ptrs)?;
-        workspace.page_table_table.copy_from_host(
+        if !conv_ptrs.is_empty() {
+            workspace.host_conv.copy_from_slice(&conv_ptrs)?;
+            workspace.host_ssm.copy_from_slice(&ssm_ptrs)?;
+            workspace
+                .conv_state_table
+                .copy_range_from_pinned_on_stream(0, &workspace.host_conv, &self.stream)?;
+            workspace.ssm_state_table.copy_range_from_pinned_on_stream(
+                0,
+                &workspace.host_ssm,
+                &self.stream,
+            )?;
+        }
+        workspace.host_pages.copy_from_slice(
             &page_tables
                 .iter()
                 .map(|table| table.cuda_address())
                 .collect::<Vec<_>>(),
         )?;
+        workspace
+            .page_table_table
+            .copy_range_from_pinned_on_stream(0, &workspace.host_pages, &self.stream)?;
+        workspace.upload_done.record_on_stream(&self.stream)?;
+        workspace.upload_pending = true;
 
         copy_bf16_rows_to_f32_indexed_into_on_stream(
             self.manifest.vocab_size,
@@ -957,23 +1003,17 @@ impl Nemotron3Model {
             self.manifest.norm_epsilon,
             &self.stream,
         )?;
-        self.lm_head.run_rows(
-            &workspace.final_hidden,
-            &mut workspace.logits,
-            rows,
-            &self.stream,
-        )?;
+        if !workspace.last_logits_only {
+            self.lm_head.run_rows(
+                &workspace.final_hidden,
+                &mut workspace.logits,
+                rows,
+                &self.stream,
+            )?;
+        }
         if commit_all {
             for (sequence, state) in states.iter_mut().enumerate() {
                 let last_row = offsets[sequence] as usize + lengths[sequence] as usize - 1;
-                copy_row_f32_into_on_stream(
-                    rows,
-                    self.manifest.vocab_size,
-                    last_row,
-                    &workspace.logits,
-                    state.logits.output(),
-                    &self.stream,
-                )?;
                 copy_row_f32_into_on_stream(
                     rows,
                     self.manifest.hidden_size,
@@ -982,6 +1022,19 @@ impl Nemotron3Model {
                     state.final_hidden.output(),
                     &self.stream,
                 )?;
+                if workspace.last_logits_only {
+                    self.lm_head
+                        .run(&state.final_hidden, &mut state.logits, &self.stream)?;
+                } else {
+                    copy_row_f32_into_on_stream(
+                        rows,
+                        self.manifest.vocab_size,
+                        last_row,
+                        &workspace.logits,
+                        state.logits.output(),
+                        &self.stream,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1150,9 +1203,23 @@ impl Nemotron3Model {
             workspace.rows,
             &self.stream,
         )?;
-        workspace.sequence_offsets.copy_from_host(&offsets)?;
-        workspace.sequence_lengths.copy_from_host(&lengths)?;
-        workspace.start_positions.copy_from_host(&starts)?;
+        if workspace.upload_pending {
+            workspace.upload_done.synchronize()?;
+        }
+        workspace.host_offsets.copy_from_slice(&offsets)?;
+        workspace.host_lengths.copy_from_slice(&lengths)?;
+        workspace.host_starts.copy_from_slice(&starts)?;
+        workspace
+            .sequence_offsets
+            .copy_range_from_pinned_on_stream(0, &workspace.host_offsets, &self.stream)?;
+        workspace
+            .sequence_lengths
+            .copy_range_from_pinned_on_stream(0, &workspace.host_lengths, &self.stream)?;
+        workspace.start_positions.copy_range_from_pinned_on_stream(
+            0,
+            &workspace.host_starts,
+            &self.stream,
+        )?;
         let mut reservations = Vec::with_capacity(sequence_count);
         for (index, sequence) in sequences.iter_mut().enumerate() {
             match cache.reserve_append(
@@ -1803,7 +1870,55 @@ impl Nemotron3Model {
             state.hidden.output(),
             &self.stream,
         )?;
-        for layer in 0..self.layers.len() {
+        let mut start = 0;
+        while start < self.layers.len() {
+            if matches!(self.layers[start], Nemotron3Layer::Attention(_)) {
+                self.enqueue_decode_layers(
+                    state,
+                    cache,
+                    reservation,
+                    page_table,
+                    start,
+                    start + 1,
+                )?;
+                start += 1;
+                continue;
+            }
+            let end = (start..self.layers.len())
+                .find(|&layer| matches!(self.layers[layer], Nemotron3Layer::Attention(_)))
+                .unwrap_or(self.layers.len());
+            if let Some(graph) = &state.decode_graphs[start] {
+                graph.launch(&self.stream)?;
+            } else {
+                let graph = self.stream.capture(|_| {
+                    self.enqueue_decode_layers(state, cache, reservation, page_table, start, end)
+                })?;
+                graph.launch(&self.stream)?;
+                state.decode_graphs[start] = Some(graph);
+            }
+            start = end;
+        }
+        let index = self.layers.len();
+        if let Some(graph) = &state.decode_graphs[index] {
+            return graph.launch(&self.stream);
+        }
+        let graph = self.stream.capture(|_| self.enqueue_decode_head(state))?;
+        graph.launch(&self.stream)?;
+        state.decode_graphs[index] = Some(graph);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_decode_layers(
+        &self,
+        state: &mut Nemotron3DecodeState,
+        cache: &mut Nemotron3SequenceCache,
+        reservation: &seqcache::AppendReservation,
+        page_table: &DeviceBuffer<u32>,
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
+        for layer in start..end {
             let (previous, current) = state.layers.split_at_mut(layer);
             let input = if layer == 0 {
                 &state.hidden
@@ -1847,6 +1962,10 @@ impl Nemotron3Model {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn enqueue_decode_head(&self, state: &mut Nemotron3DecodeState) -> Result<()> {
         let last = state
             .layers
             .last()
@@ -2083,6 +2202,15 @@ impl Nemotron3LayerRowsWorkspace {
 
 /// Exact-shape scratch, metadata, and pointer tables for block execution.
 pub struct Nemotron3BlockWorkspace {
+    host_tokens: PinnedHostBuffer<u32>,
+    host_offsets: PinnedHostBuffer<u32>,
+    host_lengths: PinnedHostBuffer<u32>,
+    host_starts: PinnedHostBuffer<u32>,
+    host_conv: PinnedHostBuffer<DeviceAddress<u16>>,
+    host_ssm: PinnedHostBuffer<DeviceAddress<u8>>,
+    host_pages: PinnedHostBuffer<DeviceAddress<u32>>,
+    upload_done: CudaEvent,
+    upload_pending: bool,
     tokens: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerRowsWorkspace>,
@@ -2105,11 +2233,20 @@ pub struct Nemotron3BlockWorkspace {
     vocab_size: usize,
     mamba_layers: usize,
     draft_count: Option<usize>,
+    last_logits_only: bool,
+}
+
+impl Drop for Nemotron3BlockWorkspace {
+    fn drop(&mut self) {
+        if self.upload_pending {
+            let _ = self.upload_done.synchronize();
+        }
+    }
 }
 
 impl Nemotron3BlockWorkspace {
     fn new(model: &Nemotron3Model, sequence_count: usize, rows: usize) -> Result<Self> {
-        Self::new_impl(model, sequence_count, rows, None)
+        Self::new_impl(model, sequence_count, rows, None, false)
     }
 
     fn new_transactional(
@@ -2122,6 +2259,7 @@ impl Nemotron3BlockWorkspace {
             sequence_count,
             sequence_count.saturating_mul(draft_count),
             Some(draft_count),
+            false,
         )
     }
 
@@ -2130,6 +2268,7 @@ impl Nemotron3BlockWorkspace {
         sequence_count: usize,
         rows: usize,
         draft_count: Option<usize>,
+        last_logits_only: bool,
     ) -> Result<Self> {
         if sequence_count == 0 || rows < sequence_count {
             return Err(Error::Shape {
@@ -2186,11 +2325,24 @@ impl Nemotron3BlockWorkspace {
             })
             .transpose()?;
         let workspace = Self {
+            host_tokens: PinnedHostBuffer::zeroed(rows)?,
+            host_offsets: PinnedHostBuffer::zeroed(sequence_count)?,
+            host_lengths: PinnedHostBuffer::zeroed(sequence_count)?,
+            host_starts: PinnedHostBuffer::zeroed(sequence_count)?,
+            host_conv: PinnedHostBuffer::zeroed((mamba_layers * sequence_count).max(1))?,
+            host_ssm: PinnedHostBuffer::zeroed((mamba_layers * sequence_count).max(1))?,
+            host_pages: PinnedHostBuffer::zeroed(sequence_count)?,
+            upload_done: CudaEvent::new_sync()?,
+            upload_pending: false,
             tokens: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
             layers,
             final_hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
-            logits: DeviceBuffer::zeroed(rows * model.manifest.vocab_size)?,
+            logits: DeviceBuffer::zeroed(if last_logits_only {
+                0
+            } else {
+                rows * model.manifest.vocab_size
+            })?,
             sequence_offsets: DeviceBuffer::zeroed(sequence_count)?,
             sequence_lengths: DeviceBuffer::zeroed(sequence_count)?,
             start_positions: DeviceBuffer::zeroed(sequence_count)?,
@@ -2219,6 +2371,7 @@ impl Nemotron3BlockWorkspace {
             vocab_size: model.manifest.vocab_size,
             mamba_layers,
             draft_count,
+            last_logits_only,
         };
         Ok(workspace)
     }
@@ -2251,7 +2404,8 @@ impl Nemotron3BlockWorkspace {
         })
     }
 
-    /// Returns all row logits in flattened sequence order.
+    /// Returns all row logits in flattened sequence order, or an empty buffer
+    /// for a prefill workspace. Prefill writes final logits to each sequence.
     pub fn logits(&self) -> &DeviceBuffer<f32> {
         &self.logits
     }
@@ -2396,6 +2550,8 @@ impl seqcache::RetainedSnapshot for Nemotron3SequenceSnapshot {
 
 /// Per-sequence state for complete-model decode.
 pub(crate) struct Nemotron3DecodeState {
+    // Graphs contain addresses owned by this sequence and the resident model.
+    decode_graphs: Vec<Option<CudaGraphExec>>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerState>,
     rollback_mamba: Vec<Option<Nemotron3MambaState>>,

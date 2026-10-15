@@ -130,6 +130,14 @@ name = "nemotron3_dense_linear"
 harness = false
 
 [[bench]]
+name = "nemotron35_experts"
+harness = false
+
+[[bench]]
+name = "nemotron35_dense"
+harness = false
+
+[[bench]]
 name = "ngram_embedding"
 harness = false
 

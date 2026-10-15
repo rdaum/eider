@@ -97,7 +97,7 @@ impl Nemotron3PrefillWorkspace {
             .then(|| model.mtp_workspace(mtp_sequence_count, mtp_rows))
             .transpose()?;
         Ok(Self {
-            target: model.block_workspace(sequence_count, rows)?,
+            target: model.prefill_workspace(sequence_count, rows)?,
             previous_hidden: DeviceBuffer::zeroed(sequence_count * hidden)?,
             mtp,
             mtp_hidden: (mtp_rows != 0)
@@ -132,6 +132,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
+        validate_mtp_drafts(config.speculative_drafts)?;
         let sequence_cache = new_nemotron3_sequence_cache_with_budget(
             model,
             config.max_active_sequences,
@@ -149,8 +150,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             sequences: Nemotron3SequencePool::new(),
             sequence_cache,
             retain_prefixes,
-            mtp_token_workspace: model
-                .has_mtp()
+            mtp_token_workspace: (model.has_mtp() && config.speculative_drafts != 0)
                 .then(|| model.mtp_workspace(1, 1))
                 .transpose()?,
             prefill_workspaces: BTreeMap::new(),
@@ -271,7 +271,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 .generation
                 .max_new_tokens
                 .saturating_sub(request.generated_tokens);
-            if self.model.has_mtp()
+            if self.mtp_token_workspace.is_some()
                 && request.sampler.config().uses_fast_argmax()
                 && request.last_token.is_some()
                 && remaining >= 4
@@ -458,10 +458,12 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .sum::<usize>();
         let mtp_rows = selected
             .iter()
+            .filter(|_| self.mtp_token_workspace.is_some())
             .map(|(_, start, chunk)| chunk.len().saturating_sub(usize::from(*start == 0)))
             .sum::<usize>();
         let mtp_sequence_count = selected
             .iter()
+            .filter(|_| self.mtp_token_workspace.is_some())
             .filter(|(_, start, chunk)| chunk.len() > usize::from(*start == 0))
             .count();
         let key = (sequence_count, rows, mtp_sequence_count, mtp_rows);
@@ -508,8 +510,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         let result = (|| -> Result<()> {
             let mut sequences = self.sequences.lease_many(&sequence_ids)?;
             let mut states = sequences.sequences_mut().collect::<Vec<_>>();
-            self.model
-                .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
+            if workspace.mtp.is_some() {
+                self.model
+                    .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
+            }
             self.model.forward_block(
                 &mut states,
                 &chunks,
@@ -782,6 +786,17 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     }
 }
 
+fn validate_mtp_drafts(drafts: usize) -> Result<()> {
+    if matches!(drafts, 0 | 3) {
+        return Ok(());
+    }
+    Err(eider_cuda::Error::Shape {
+        label: "Nemotron 3 speculative drafts",
+        expected: "0 (disabled) or 3 MTP drafts".to_string(),
+        actual: drafts.to_string(),
+    })
+}
+
 fn prefill_rows_before_retained_prefix(
     available: usize,
     prompt_position: usize,
@@ -912,6 +927,15 @@ impl ResponseFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_requires_the_supported_draft_count() {
+        assert!(validate_mtp_drafts(0).is_ok());
+        assert!(validate_mtp_drafts(3).is_ok());
+        for drafts in [1, 2, 4, usize::MAX] {
+            assert!(validate_mtp_drafts(drafts).is_err());
+        }
+    }
 
     #[test]
     fn short_prompts_are_not_blocked_by_an_absent_retained_prefix() {
