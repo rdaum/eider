@@ -312,6 +312,7 @@ second column.
 
 | Catalogue ID | API model | Runtime path |
 | --- | --- | --- |
+| [`lfm2.5-24b-a2b-nvfp4`](docs/lfm2.md) | `eider-lfm2.5-24b-a2b` | NVFP4 experts, gated short convolution, GQA, and LFM tool calls |
 | [`qwen3.8-flash-next`](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4) | `eider-qwen3.8-flash-next` | 125B/6B-active MoE, native QSA and GDN, NVMe-paged BF16 n-gram table, 262K text context |
 | [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE and compact FP4 KV |

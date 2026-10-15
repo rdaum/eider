@@ -71,6 +71,7 @@ fn main() {
     let ternary_g64_object = format!("{out_dir}/ternary_g64.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let ngram_object = format!("{out_dir}/ngram.o");
+    let lfm2_object = format!("{out_dir}/lfm2.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let qwen38_object = format!("{out_dir}/qwen38.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
@@ -512,6 +513,7 @@ fn main() {
     }
 
     let mut archive_objects = vec![
+        lfm2_object.as_str(),
         oracle_object.as_str(),
         gpu_counters_object.as_str(),
         non_gemm_object.as_str(),
@@ -524,6 +526,21 @@ fn main() {
         cutlass_gemv_object.as_str(),
         cutlass_grouped_gemm_object.as_str(),
     ];
+    let lfm2_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/lfm2.cu",
+            "-o",
+            &lfm2_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for LFM2 kernels");
+    assert!(lfm2_status.success(), "nvcc failed to build LFM2 kernels");
     if !cuda_oxide {
         archive_objects.push(qwen36_gdn_object.as_str());
         archive_objects.push(qwen38_object.as_str());
@@ -555,6 +572,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/ternary_g64.cu");
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/ngram.cu");
+    println!("cargo:rerun-if-changed=native/lfm2.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/qwen38.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");

@@ -32,6 +32,9 @@ pub mod execution;
 /// BitNet b1.58 ternary text-model loading and inference.
 pub mod bitnet;
 
+/// Liquid LFM2 MoE model loading and inference.
+pub mod lfm2;
+
 /// Ternary Bonsai dense Qwen3 model loading and inference.
 pub mod bonsai;
 

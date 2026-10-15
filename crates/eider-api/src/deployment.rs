@@ -60,6 +60,20 @@ fn default_max_active_sequences(model_type: &str) -> usize {
 
 const CATALOGUE: &[ModelSpec] = &[
     ModelSpec {
+        id: "lfm2.5-24b-a2b-nvfp4",
+        repository: "infinity-ai-institute/LFM2.5-24B-A2B-NVFP4",
+        revision: "2d61270a276c320af204143d3d73e524f9ef44d2",
+        model_type: "lfm2_moe",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-lfm2.5-24b-a2b",
+            max_context_tokens: 32_768,
+            prefill_token_capacity: 256,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "bitnet-b1.58-2b-4t",
         repository: "microsoft/bitnet-b1.58-2B-4T",
         revision: "04c3b9ad9361b824064a1f25ea60a8be9599b127",
@@ -635,6 +649,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "bitnet"
+            | "lfm2_moe"
             | "bailing_hybrid"
             | "muse_glimmer"
             | "bonsai"
@@ -671,6 +686,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
+                "lfm2_moe" => 256,
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
                 "qwen3_8_flash_next" => 512,
@@ -893,6 +909,21 @@ mod tests {
         assert_eq!(model.repository, "microsoft/bitnet-b1.58-2B-4T");
         assert_eq!(model.revision, "04c3b9ad9361b824064a1f25ea60a8be9599b127");
         assert_eq!(model.defaults.max_context_tokens, 4_096);
+    }
+
+    #[test]
+    fn catalogue_pins_lfm25_nvfp4_and_local_resolution_accepts_it() {
+        let spec = catalogue_model("lfm2.5-24b-a2b-nvfp4").unwrap();
+        assert_eq!(
+            spec.repository,
+            "infinity-ai-institute/LFM2.5-24B-A2B-NVFP4"
+        );
+        assert_eq!(spec.revision, "2d61270a276c320af204143d3d73e524f9ef44d2");
+        assert_eq!(spec.model_type, "lfm2_moe");
+        assert_eq!(spec.artifact_kind, ArtifactKind::None);
+        let fixture = CheckpointFixture::new("lfm2_moe", true);
+        let resolved = resolve_local_model(fixture.path()).unwrap();
+        assert_eq!(resolved.defaults.prefill_token_capacity, 256);
     }
 
     #[test]

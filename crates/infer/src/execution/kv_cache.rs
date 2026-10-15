@@ -277,6 +277,69 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Appends the active rows of a reusable prefill workspace on `stream`.
+    pub(crate) fn append_prefix_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.kv_width();
+        if rows == 0 || rows > self.max_tokens - self.len {
+            return Err(Error::Format {
+                label: "KV prefill append",
+                detail: "invalid row count or capacity".into(),
+            });
+        }
+        self.key.copy_range_from_device_on_stream(
+            self.len * width,
+            key,
+            0,
+            rows * width,
+            stream,
+        )?;
+        self.value.copy_range_from_device_on_stream(
+            self.len * width,
+            value,
+            0,
+            rows * width,
+            stream,
+        )?;
+        self.len += rows;
+        Ok(())
+    }
+
+    /// Runs causal attention over the active prefix of a prefill workspace.
+    pub(crate) fn prefill_attention_into_on_stream(
+        &self,
+        query: &DeviceBuffer<f32>,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        start: usize,
+        q_heads: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if start.checked_add(rows).is_none_or(|end| end > self.len) {
+            return Err(Error::Format {
+                label: "KV prefill attention",
+                detail: "query exceeds valid cache".into(),
+            });
+        }
+        eider_cuda::prefill_gqa_attention_f32_into_on_stream(
+            query,
+            &self.key,
+            &self.value,
+            output,
+            rows,
+            start,
+            q_heads,
+            self.kv_heads,
+            self.head_dim,
+            stream,
+        )
+    }
+
     /// Enqueues K/V append using a device-resident destination row.
     ///
     /// This does not advance `len`; call [`LayerKvCache::advance_len`] after

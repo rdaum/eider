@@ -12,6 +12,11 @@ use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::processors::PostProcessorWrapper;
 use tokenizers::{DecodeStream, Tokenizer};
 
+mod lfm2;
+
+const LFM_TOOL_CALL_OPEN: &str = "<|tool_call_start|>";
+const LFM_TOOL_CALL_CLOSE: &str = "<|tool_call_end|>";
+
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const GEMMA_TOOL_CALL_OPEN: &str = "<|tool_call>";
@@ -65,6 +70,7 @@ enum OutputMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolCallProtocol {
+    Lfm2,
     Standard,
     Gemma,
     Dsml,
@@ -74,6 +80,7 @@ enum ToolCallProtocol {
 impl ToolCallProtocol {
     fn close(self) -> &'static str {
         match self {
+            Self::Lfm2 => LFM_TOOL_CALL_CLOSE,
             Self::Standard => TOOL_CALL_CLOSE,
             Self::Gemma => GEMMA_TOOL_CALL_CLOSE,
             Self::Dsml => DSML_TOOL_CALLS_CLOSE,
@@ -87,6 +94,7 @@ pub struct ChatOutputCodec<'tokenizer> {
     decode_stream: TokenizerDecodeStream<'tokenizer>,
     parser: ChatOutputParser,
     gemma_special_tokens: Option<GemmaSpecialTokens>,
+    lfm_special_tokens: Vec<(u32, &'static str)>,
     muse_special_tokens: Option<MuseSpecialTokens>,
     muse_header: Option<String>,
     finished: bool,
@@ -156,6 +164,19 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             .map(|_| "assistant".to_string());
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
+            lfm_special_tokens: if tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).is_some() {
+                [
+                    LFM_TOOL_CALL_OPEN,
+                    LFM_TOOL_CALL_CLOSE,
+                    "<think>",
+                    THINK_CLOSE,
+                ]
+                .into_iter()
+                .filter_map(|marker| tokenizer.token_to_id(marker).map(|id| (id, marker)))
+                .collect()
+            } else {
+                Vec::new()
+            },
             parser: ChatOutputParser::new(tools, starts_in_reasoning)?,
             gemma_special_tokens,
             muse_special_tokens,
@@ -171,6 +192,13 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
                 label: "chat output stream",
                 detail: "cannot push a token after finish".to_string(),
             });
+        }
+        if let Some((_, marker)) = self
+            .lfm_special_tokens
+            .iter()
+            .find(|(id, _)| *id == token_id)
+        {
+            return self.parser.push_text(marker);
         }
         if let Some(tokens) = &self.muse_special_tokens {
             if token_id == tokens.start {
@@ -532,6 +560,7 @@ impl ChatOutputParser {
             })
             .min_by_key(|(index, _)| *index);
         let protocol_open = [
+            (LFM_TOOL_CALL_OPEN, ToolCallProtocol::Lfm2),
             (TOOL_CALL_OPEN, ToolCallProtocol::Standard),
             (GEMMA_TOOL_CALL_OPEN, ToolCallProtocol::Gemma),
             (DSML_TOOL_CALLS_OPEN, ToolCallProtocol::Dsml),
@@ -593,6 +622,7 @@ impl ChatOutputParser {
         flush_safe_prefix_with_markers(
             &mut self.pending,
             [
+                LFM_TOOL_CALL_OPEN,
                 TOOL_CALL_OPEN,
                 GEMMA_TOOL_CALL_OPEN,
                 DSML_TOOL_CALLS_OPEN,
@@ -611,7 +641,12 @@ impl ChatOutputParser {
         self.tool_call.push_str(&self.pending);
         self.pending.clear();
         let close = self.tool_call_protocol.close();
-        let Some(index) = self.tool_call.find(close) else {
+        let close_index = if self.tool_call_protocol == ToolCallProtocol::Lfm2 {
+            lfm2::closing_offset(&self.tool_call, close)
+        } else {
+            self.tool_call.find(close)
+        };
+        let Some(index) = close_index else {
             return Ok(false);
         };
         let body = self.tool_call[..index].to_string();
@@ -619,6 +654,18 @@ impl ChatOutputParser {
         self.tool_call.clear();
         self.pending = remainder;
         let functions = match self.tool_call_protocol {
+            ToolCallProtocol::Lfm2 => {
+                let calls = lfm2::parse(&body)?;
+                for call in &calls {
+                    if !self.tool_parameters.contains_key(&call.name) {
+                        return Err(Error::Format {
+                            label: "LFM2 tool call",
+                            detail: format!("unknown function {:?}", call.name),
+                        });
+                    }
+                }
+                calls
+            }
             ToolCallProtocol::Standard => vec![parse_function_call(
                 &body,
                 &self.string_arguments,
@@ -1490,6 +1537,62 @@ mod tests {
                 }
             }),
         })]
+    }
+
+    #[test]
+    fn lfm2_tool_list_survives_every_chunk_boundary() {
+        let text = "reason</think><|tool_call_start|>[write_file(path='a,b', contents='hi\\n', executable=False), write_file(path='b', contents='bye')]<|tool_call_end|>";
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&tools(), true).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            let calls = events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatOutputEvent::ToolCall(c) => Some(c),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2, "split {split}");
+            assert_eq!(calls[0].function.arguments["contents"], json!("hi\n"));
+            assert_eq!(calls[0].function.arguments["executable"], json!(false));
+            assert_ne!(calls[0].id, calls[1].id);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ChatOutputEvent::Text(t) if t.contains("tool_call")))
+            );
+        }
+    }
+
+    #[test]
+    fn lfm2_codec_preserves_special_protocol_tokens() {
+        let mut tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        for marker in [
+            LFM_TOOL_CALL_OPEN,
+            LFM_TOOL_CALL_CLOSE,
+            "<think>",
+            THINK_CLOSE,
+        ] {
+            tokenizer.add_special_tokens(&[tokenizers::AddedToken::from(marker, true)]);
+        }
+        let mut codec = ChatOutputCodec::new(&tokenizer, &tools(), true).unwrap();
+        codec
+            .push_token(tokenizer.token_to_id(THINK_CLOSE).unwrap())
+            .unwrap();
+        assert!(!codec.is_reasoning());
+        codec
+            .push_token(tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).unwrap())
+            .unwrap();
+        codec
+            .parser
+            .push_text("[write_file(path='a', contents='text')]")
+            .unwrap();
+        let events = codec
+            .push_token(tokenizer.token_to_id(LFM_TOOL_CALL_CLOSE).unwrap())
+            .unwrap();
+        assert!(matches!(&events[..], [ChatOutputEvent::ToolCall(_)]));
     }
 
     fn protocol_text() -> &'static str {

@@ -8,6 +8,7 @@ use crate::execution::bonsai_serving::BonsaiChatService;
 use crate::execution::deepseek4_serving::Deepseek4ChatService;
 use crate::execution::gemma4_serving::Gemma4ChatService;
 use crate::execution::laguna_serving::LagunaChatService;
+use crate::execution::lfm2_serving::Lfm2ChatService;
 use crate::execution::ling3_serving::Ling3ChatService;
 use crate::execution::muse_glimmer_serving::MuseGlimmerChatService;
 use crate::execution::nemotron3_serving::Nemotron3ChatService;
@@ -16,6 +17,7 @@ use crate::execution::serving::Qwen36ChatService;
 use crate::execution::step37_serving::Step37ChatService;
 use crate::gemma4::Gemma4Model;
 use crate::laguna::LagunaModel;
+use crate::lfm2::Lfm2Model;
 use crate::ling3::Ling3Model;
 use crate::muse_glimmer::MuseGlimmerModel;
 use crate::nemotron3::Nemotron3Model;
@@ -34,6 +36,8 @@ use tracing::info;
 /// Supported checkpoint execution family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointArchitecture {
+    /// Liquid LFM2 MoE.
+    Lfm2Moe,
     /// BitNet b1.58.
     BitNet,
     /// Ling 3.
@@ -73,6 +77,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
         InferenceError::Deployment(format!("failed to parse {}: {error}", path.display()))
     })?;
     match config.model_type.as_str() {
+        "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
         "bailing_hybrid" => Ok(CheckpointArchitecture::Ling3),
         "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
@@ -137,6 +142,17 @@ pub fn with_loaded_engine<R>(
     };
     let defaults = GenerationConfig::from_model_dir(&model_dir)?;
     match architecture {
+        CheckpointArchitecture::Lfm2Moe => {
+            let model = Lfm2Model::load(&model_dir)?;
+            let scheduler = SchedulerConfig {
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().max_position_embeddings),
+                ..scheduler
+            };
+            let mut service = Lfm2ChatService::new(&model, &template, scheduler, sequence_cache)?;
+            Ok(run(&mut service, defaults))
+        }
         CheckpointArchitecture::BitNet => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;

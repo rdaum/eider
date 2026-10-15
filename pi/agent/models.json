@@ -12,6 +12,20 @@
       },
       "models": [
         {
+          "id": "eider-lfm2.5-24b-a2b",
+          "name": "LFM2.5 24B-A2B NVFP4",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-qwen3.6",
           "name": "Qwen3.6 35B-A3B NVFP4",
           "reasoning": false,
@@ -247,6 +261,20 @@
         "supportsDeveloperRole": false
       },
       "models": [
+        {
+          "id": "eider-lfm2.5-24b-a2b",
+          "name": "LFM2.5 24B-A2B NVFP4",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
         {
           "id": "eider-qwen3.6",
           "name": "Qwen3.6 35B-A3B NVFP4",

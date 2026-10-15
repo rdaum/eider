@@ -5449,6 +5449,78 @@ __global__ void infer_cached_gqa_attention_f32_kernel(const float* query,
     }
 }
 
+// Eight independent warp softmax reductions over disjoint KV rows. Head-64
+// attention uses two registers per lane and only one block barrier, after all
+// rows have been consumed. The final merge rescales each warp's partial sum.
+template <bool Indexed>
+__global__ void infer_gqa_attention_head64_f32_kernel(
+    const float* __restrict__ query,
+    const float* __restrict__ key_cache,
+    const float* __restrict__ value_cache,
+    float* __restrict__ output,
+    const std::uint32_t* indexed_length,
+    std::uint32_t start_position,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads) {
+    constexpr unsigned Warps = 8;
+    __shared__ float partial[Warps][64];
+    __shared__ float maxima[Warps];
+    __shared__ float sums[Warps];
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned token = blockIdx.x;
+    const unsigned head = blockIdx.y;
+    const unsigned length = Indexed ? *indexed_length : start_position + token + 1;
+    const unsigned kv_head = head / (q_heads / kv_heads);
+    const unsigned width = kv_heads * 64;
+    const std::size_t q_base = (static_cast<std::size_t>(token) * q_heads + head) * 64;
+    const float q0 = query[q_base + lane];
+    const float q1 = query[q_base + lane + 32];
+    float maximum = -INFINITY, sum = 0.0f, acc0 = 0.0f, acc1 = 0.0f;
+    for (unsigned row = warp; row < length; row += Warps) {
+        const std::size_t base = static_cast<std::size_t>(row) * width + kv_head * 64 + lane;
+        float dot0 = q0 * key_cache[base];
+        float dot1 = q1 * key_cache[base + 32];
+        #pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            dot0 += __shfl_xor_sync(0xffffffffu, dot0, delta);
+            dot1 += __shfl_xor_sync(0xffffffffu, dot1, delta);
+        }
+        const float score = (dot0 + dot1) * 0.125f;
+        const float next_max = fmaxf(maximum, score);
+        const float rescale = expf(maximum - next_max);
+        const float weight = expf(score - next_max);
+        sum = sum * rescale + weight;
+        acc0 = __fmaf_rn(weight, value_cache[base], acc0 * rescale);
+        acc1 = __fmaf_rn(weight, value_cache[base + 32], acc1 * rescale);
+        maximum = next_max;
+    }
+    partial[warp][lane] = acc0;
+    partial[warp][lane + 32] = acc1;
+    if (lane == 0) {
+        maxima[warp] = maximum;
+        sums[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float max_all = -INFINITY;
+        #pragma unroll
+        for (unsigned w = 0; w < Warps; ++w) max_all = fmaxf(max_all, maxima[w]);
+        float total = 0.0f, out0 = 0.0f, out1 = 0.0f;
+        #pragma unroll
+        for (unsigned w = 0; w < Warps; ++w) {
+            // Empty warps occur for short prompts. Avoid -inf - -inf.
+            const float factor = sums[w] > 0.0f ? expf(maxima[w] - max_all) : 0.0f;
+            total += sums[w] * factor;
+            out0 = __fmaf_rn(factor, partial[w][lane], out0);
+            out1 = __fmaf_rn(factor, partial[w][lane + 32], out1);
+        }
+        const float inv = total > 0.0f ? 1.0f / total : 0.0f;
+        output[q_base + lane] = out0 * inv;
+        output[q_base + lane + 32] = out1 * inv;
+    }
+}
+
 // Single-pass FlashAttention-style decode for the indexed-attention path.
 //
 // Reads K once and V once per row (instead of two K passes for max + softmax).
@@ -5698,7 +5770,10 @@ extern "C" cudaError_t infer_cached_gqa_attention_f32_on_stream(
         return cudaErrorInvalidValue;
     }
 
-    if (head_dim <= kThreads) {
+    if (head_dim == 64) {
+        infer_gqa_attention_head64_f32_kernel<false><<<dim3(1, q_heads), kThreads, 0, stream>>>(
+            query, key_cache, value_cache, output, nullptr, cache_len - 1, q_heads, kv_heads);
+    } else if (head_dim <= kThreads) {
         const std::size_t shmem = (head_dim + kThreads) * sizeof(float);
         infer_flash_decode_attention_f32_kernel<<<q_heads, kThreads, shmem, stream>>>(
             query, key_cache, value_cache, output, cache_len, q_heads, kv_heads, head_dim);
@@ -6174,10 +6249,10 @@ extern "C" cudaError_t infer_cached_gqa_attention_f32_indexed_on_stream(
         return cudaErrorInvalidValue;
     }
 
-    // Use the single-pass FlashAttention-style decode path when head_dim
-    // equals 128 (Qwen3). For other shapes fall back to the legacy
-    // two-pass kernel to preserve correctness on unusual head dims.
-    if (head_dim <= kThreads) {
+    if (head_dim == 64) {
+        infer_gqa_attention_head64_f32_kernel<true><<<dim3(1, q_heads), kThreads, 0, stream>>>(
+            query, key_cache, value_cache, output, cache_len, 0, q_heads, kv_heads);
+    } else if (head_dim <= kThreads) {
         const std::size_t shmem = (head_dim + kThreads) * sizeof(float);
         infer_flash_decode_attention_f32_indexed_kernel<<<
             q_heads, kThreads, shmem, stream>>>(
@@ -6679,6 +6754,11 @@ extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* qu
     }
 
     const dim3 blocks(tokens, q_heads);
+    if (head_dim == 64) {
+        infer_gqa_attention_head64_f32_kernel<false><<<blocks, kThreads, 0, stream>>>(
+            query, key_cache, value_cache, output, nullptr, start_position, q_heads, kv_heads);
+        return cudaGetLastError();
+    }
     infer_prefill_gqa_attention_f32_kernel<<<
         blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
         query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, head_dim);

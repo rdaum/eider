@@ -6912,7 +6912,7 @@ pub fn prefill_gqa_attention_f32_into_on_stream(
         kv_heads,
         head_dim,
     )?;
-    if output.len() != query_len {
+    if output.len() < query_len {
         return Err(Error::Shape {
             label: "prefill GQA output",
             expected: format!("{query_len} values"),
@@ -7290,7 +7290,7 @@ fn prefill_gqa_attention_len(
             expected: "(start_position + tokens) * kv_width without overflow".to_string(),
             actual: format!("start_position={start_position} tokens={tokens} kv_width={kv_width}"),
         })?;
-    if query.len() != query_len {
+    if query.len() < query_len {
         return Err(Error::Shape {
             label: "prefill GQA query",
             expected: format!("{query_len} values"),
@@ -19905,6 +19905,85 @@ mod tests {
                 error <= 2.0e-6,
                 "prefill GQA mismatch at {idx}: actual={actual} expected={expected} error={error}"
             );
+        }
+    }
+
+    #[serial]
+    #[test]
+    fn head64_attention_handles_causal_tails_and_indexed_graph_replay() {
+        const Q: usize = 8;
+        const KV: usize = 2;
+        const D: usize = 64;
+        const CAPACITY: usize = 5123;
+        let values = |len, factor| {
+            (0..len)
+                .map(|i| ((i * factor % 509) as f32 - 254.0) / 128.0)
+                .collect::<Vec<_>>()
+        };
+        let query = values(3 * Q * D, 17);
+        let key = values(CAPACITY * KV * D, 29);
+        let value = values(key.len(), 43);
+        let q = DeviceBuffer::from_host(&query).unwrap();
+        let k = DeviceBuffer::from_host(&key).unwrap();
+        let v = DeviceBuffer::from_host(&value).unwrap();
+        let decode_q = DeviceBuffer::from_host(&query[..Q * D]).unwrap();
+        let mut output = DeviceBuffer::zeroed(3 * Q * D + 1).unwrap();
+        let mut decode_output = DeviceBuffer::zeroed(Q * D).unwrap();
+        let mut length = DeviceBuffer::from_host(&[1u32]).unwrap();
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let graph = stream
+            .capture(|_| {
+                cached_gqa_attention_f32_indexed_into_on_stream(
+                    &decode_q,
+                    &k,
+                    &v,
+                    decode_output.output(),
+                    &length,
+                    CAPACITY,
+                    Q,
+                    KV,
+                    D,
+                    &stream,
+                )
+            })
+            .unwrap();
+        for prefix in [0, 1, 6, 7, 8, 255, 5120] {
+            prefill_gqa_attention_f32_into_on_stream(
+                &q,
+                &k,
+                &v,
+                output.output(),
+                3,
+                prefix,
+                Q,
+                KV,
+                D,
+                &stream,
+            )
+            .unwrap();
+            let actual = output.copy_to_host(&stream).unwrap();
+            for row in 0..3 {
+                let expected = cpu_cached_gqa_attention(
+                    &query[row * Q * D..(row + 1) * Q * D],
+                    &key,
+                    &value,
+                    prefix + row + 1,
+                    Q,
+                    KV,
+                    D,
+                );
+                for (a, b) in actual[row * Q * D..(row + 1) * Q * D].iter().zip(expected) {
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 2e-5,
+                        "prefix {prefix}: {a} vs {b}"
+                    );
+                }
+            }
+            assert_eq!(actual[3 * Q * D], 0.0, "output capacity tail");
+            length.copy_from_host(&[(prefix + 1) as u32]).unwrap();
+            graph.launch(&stream).unwrap();
+            let decoded = decode_output.copy_to_host(&stream).unwrap();
+            assert_eq!(&decoded[..], &actual[..Q * D]);
         }
     }
 

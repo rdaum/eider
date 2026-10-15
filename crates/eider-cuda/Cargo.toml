@@ -160,3 +160,11 @@ harness = false
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"
+
+[[bench]]
+name = "lfm2_attention"
+harness = false
+
+[[bench]]
+name = "lfm2_experts"
+harness = false
