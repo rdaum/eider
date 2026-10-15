@@ -26,6 +26,7 @@ pub use attention::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
     Nemotron3AttentionWorkspace,
 };
+pub use eider_cuda::MambaSsmDtype;
 pub(crate) use execution::{Nemotron3SequenceId, Nemotron3SequencePool};
 pub use linear::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
@@ -141,6 +142,8 @@ pub struct Nemotron3Manifest {
     pub mamba_state_size: usize,
     /// Mamba depthwise convolution width.
     pub mamba_conv_kernel: usize,
+    /// Precision of persistent Mamba selective state.
+    pub mamba_ssm_dtype: MambaSsmDtype,
     /// Mamba scan chunk size.
     pub mamba_chunk_size: usize,
     /// Routed-expert count in each MoE layer.
@@ -196,6 +199,8 @@ struct Nemotron3Config {
     conv_kernel: usize,
     #[serde(alias = "mamba_chunk_size")]
     chunk_size: usize,
+    #[serde(default)]
+    mamba_ssm_cache_dtype: Option<String>,
     n_routed_experts: usize,
     #[serde(default)]
     num_experts_per_tok: Option<usize>,
@@ -344,6 +349,16 @@ impl Nemotron3Manifest {
             config.norm_eps,
             "Nemotron 3 norm epsilon",
         )?;
+        let mamba_ssm_dtype = match config.mamba_ssm_cache_dtype.as_deref() {
+            None | Some("bfloat16") => MambaSsmDtype::Bf16,
+            Some("float32") => MambaSsmDtype::F32,
+            Some(dtype) => {
+                return Err(Error::Format {
+                    label: "Nemotron 3 Mamba SSM cache precision",
+                    detail: format!("expected bfloat16 or float32, got {dtype:?}"),
+                });
+            }
+        };
         let manifest = Self {
             text_prefix: if is_omni { "language_model." } else { "" },
             vocab_size: config.vocab_size,
@@ -361,6 +376,7 @@ impl Nemotron3Manifest {
             mamba_state_size: config.ssm_state_size,
             mamba_conv_kernel: config.conv_kernel,
             mamba_chunk_size: config.chunk_size,
+            mamba_ssm_dtype,
             routed_experts: config.n_routed_experts,
             experts_per_token: first_moe.experts_per_token,
             moe_intermediate_size: first_moe.intermediate_size,
@@ -455,8 +471,8 @@ impl Nemotron3Manifest {
         self.mamba_intermediate_size() + self.mamba_conv_channels() + self.mamba_heads
     }
 
-    /// Returns per-sequence recurrent-state bytes when stored as FP32.
-    pub fn mamba_state_bytes_fp32(&self) -> usize {
+    /// Returns per-sequence bytes for BF16 convolution and configured SSM state.
+    pub fn mamba_state_bytes(&self) -> usize {
         let layer_state = self.mamba_heads * self.mamba_head_dim * self.mamba_state_size;
         let convolution = self.mamba_conv_channels() * self.mamba_conv_kernel;
         let layers = self
@@ -464,7 +480,8 @@ impl Nemotron3Manifest {
             .iter()
             .filter(|&&kind| kind == Nemotron3LayerKind::Mamba)
             .count();
-        layers * (layer_state + convolution) * size_of::<f32>()
+        layers
+            * (layer_state * self.mamba_ssm_dtype.element_bytes() + convolution * size_of::<u16>())
     }
 
     /// Checks that the checkpoint index contains every tensor required by the backbone.

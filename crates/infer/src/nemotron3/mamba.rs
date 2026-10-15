@@ -181,6 +181,7 @@ impl Nemotron3MambaLayer {
             self.manifest.mamba_head_dim,
             self.manifest.mamba_groups,
             self.manifest.mamba_state_size,
+            self.manifest.mamba_ssm_dtype,
             1.0e-4,
             self.manifest.norm_epsilon,
             stream,
@@ -205,7 +206,7 @@ impl Nemotron3MambaLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
         conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
-        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u8>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
@@ -228,7 +229,7 @@ impl Nemotron3MambaLayer {
         )
     }
 
-    /// Runs flattened speculative rows and records BF16 recurrent-state slots
+    /// Runs flattened speculative rows and records convolution and selective-state slots
     /// for device-side commit or rollback.
     #[allow(clippy::too_many_arguments)]
     pub fn run_rows_transactional(
@@ -236,14 +237,14 @@ impl Nemotron3MambaLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
         conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
-        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u8>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
         sequence_count: usize,
         rows: usize,
         conv_snapshots: &mut DeviceBuffer<u16>,
-        ssm_snapshots: &mut DeviceBuffer<u16>,
+        ssm_snapshots: &mut DeviceBuffer<u8>,
         snapshot_slots: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -268,13 +269,13 @@ impl Nemotron3MambaLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
         conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
-        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u8>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
         sequence_count: usize,
         rows: usize,
-        mut snapshots: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>, usize)>,
+        mut snapshots: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u8>, usize)>,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -335,6 +336,7 @@ impl Nemotron3MambaLayer {
                 self.manifest.mamba_head_dim,
                 self.manifest.mamba_groups,
                 self.manifest.mamba_state_size,
+                self.manifest.mamba_ssm_dtype,
                 1.0e-4,
                 self.manifest.norm_epsilon,
                 stream,
@@ -374,6 +376,7 @@ impl Nemotron3MambaLayer {
                 self.manifest.mamba_head_dim,
                 self.manifest.mamba_groups,
                 self.manifest.mamba_state_size,
+                self.manifest.mamba_ssm_dtype,
                 1.0e-4,
                 self.manifest.norm_epsilon,
                 stream,
@@ -420,7 +423,9 @@ impl Nemotron3MambaLayer {
 /// One sequence's recurrent state for a Nemotron 3 Mamba layer.
 pub struct Nemotron3MambaState {
     conv: DeviceBuffer<u16>,
-    ssm: DeviceBuffer<u16>,
+    // Raw BF16 or FP32 bytes, as specified by the manifest. Checkpoints copy
+    // this storage without converting or rounding the recurrent state.
+    ssm: DeviceBuffer<u8>,
 }
 
 impl Nemotron3MambaState {
@@ -430,14 +435,18 @@ impl Nemotron3MambaState {
                 manifest.mamba_conv_channels() * manifest.mamba_conv_kernel,
             )?,
             ssm: DeviceBuffer::zeroed(
-                manifest.mamba_intermediate_size() * manifest.mamba_state_size,
+                manifest.mamba_intermediate_size()
+                    * manifest.mamba_state_size
+                    * manifest.mamba_ssm_dtype.element_bytes(),
             )?,
         })
     }
 
     fn require_manifest(&self, manifest: &Nemotron3Manifest) -> Result<()> {
         let conv = manifest.mamba_conv_channels() * manifest.mamba_conv_kernel;
-        let ssm = manifest.mamba_intermediate_size() * manifest.mamba_state_size;
+        let ssm = manifest.mamba_intermediate_size()
+            * manifest.mamba_state_size
+            * manifest.mamba_ssm_dtype.element_bytes();
         if self.conv.len() == conv && self.ssm.len() == ssm {
             return Ok(());
         }
@@ -479,7 +488,7 @@ impl Nemotron3MambaState {
         self.conv.cuda_address()
     }
 
-    pub(super) fn ssm_address(&self) -> DeviceAddress<u16> {
+    pub(super) fn ssm_address(&self) -> DeviceAddress<u8> {
         self.ssm.cuda_address()
     }
 }
@@ -603,11 +612,12 @@ mod tests {
         let stream = CudaStream::new_non_blocking().expect("stream");
         let mut state = Nemotron3MambaState {
             conv: DeviceBuffer::from_host(&[1_u16, 2]).expect("conv"),
-            ssm: DeviceBuffer::from_host(&[3_u16, 4]).expect("ssm"),
+            ssm: DeviceBuffer::from_host(&[1.0001_f32, -2.0003].map(f32::to_ne_bytes).concat())
+                .expect("ssm"),
         };
         let checkpoint = state.checkpoint_on_stream(&stream).expect("checkpoint");
         let mutated_conv = PinnedHostBuffer::from_slice(&[9_u16, 10]).expect("mutated conv");
-        let mutated_ssm = PinnedHostBuffer::from_slice(&[11_u16, 12]).expect("mutated ssm");
+        let mutated_ssm = PinnedHostBuffer::from_slice(&[0_u8; 8]).expect("mutated ssm");
         state
             .conv
             .copy_range_from_pinned_on_stream(0, &mutated_conv, &stream)
@@ -625,7 +635,7 @@ mod tests {
         );
         assert_eq!(
             &*state.ssm.copy_to_host(&stream).expect("ssm read"),
-            &[3_u16, 4]
+            &[1.0001_f32, -2.0003].map(f32::to_ne_bytes).concat()
         );
     }
 }

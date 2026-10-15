@@ -184,15 +184,16 @@ impl SafeTensorShard {
         Ok(bytes)
     }
 
-    /// Reads a scalar F32 tensor.
+    /// Reads one F32 value encoded with shape `[]` or `[1]`.
+    /// ModelOpt exports use both encodings for tensor-wide quantization scales.
     pub fn read_scalar_f32(&self, name: &str) -> Result<f32> {
         let info = self.require_tensor(name)?;
-        if info.dtype != "F32" || !info.is_scalar() || info.byte_len() != 4 {
+        if info.dtype != "F32" || !(info.is_scalar() || info.shape == [1]) || info.byte_len() != 4 {
             return Err(Error::Shape {
                 label: "safetensors scalar F32",
-                expected: "dtype=F32 shape=[] bytes=4".to_string(),
+                expected: "dtype=F32 shape=[] or [1] bytes=4".to_string(),
                 actual: format!(
-                    "dtype={} shape={:?} bytes={}",
+                    "{name}: dtype={} shape={:?} bytes={}",
                     info.dtype,
                     info.shape,
                     info.byte_len()
@@ -426,6 +427,50 @@ mod tests {
     use super::SafeTensorShard;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn scalar_f32_accepts_modelopt_singletons_and_rejects_other_encodings() {
+        let path = std::env::temp_dir().join(format!(
+            "eider-safetensors-scalars-{}.safetensors",
+            std::process::id(),
+        ));
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in [
+            ("scalar", "F32", vec![], 0.25_f32.to_le_bytes().to_vec()),
+            ("singleton", "F32", vec![1], 0.5_f32.to_le_bytes().to_vec()),
+            ("vector", "F32", vec![2], vec![0; 8]),
+            ("matrix", "F32", vec![1, 1], vec![0; 4]),
+            ("wrong_dtype", "BF16", vec![1], vec![0; 2]),
+            ("wrong_bytes", "F32", vec![1], vec![0; 8]),
+            ("empty", "F32", vec![0], vec![]),
+        ] {
+            header.insert(
+                name.to_string(),
+                json!({
+                    "dtype": dtype, "shape": shape,
+                    "data_offsets": [data.len(), data.len() + bytes.len()],
+                }),
+            );
+            data.extend(bytes);
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(data);
+        std::fs::write(&path, bytes).unwrap();
+        let shard = SafeTensorShard::open(&path).unwrap();
+        assert_eq!(shard.read_scalar_f32("scalar").unwrap(), 0.25);
+        assert_eq!(shard.read_scalar_f32("singleton").unwrap(), 0.5);
+        for name in ["vector", "matrix", "wrong_dtype", "wrong_bytes", "empty"] {
+            let error = shard.read_scalar_f32(name).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn filtered_copy_rewrites_offsets_without_materializing_the_shard() {

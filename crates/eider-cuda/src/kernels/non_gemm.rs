@@ -14405,8 +14405,29 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
     }
 }
 
+/// Storage precision for a Mamba selective state. Convolution state is separate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MambaSsmDtype {
+    /// BF16 recurrent state used by configurations without an explicit precision.
+    #[default]
+    Bf16,
+    /// FP32 recurrent state, without rounding between token updates.
+    F32,
+}
+
+impl MambaSsmDtype {
+    /// Returns the storage bytes per recurrent-state element.
+    pub fn element_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => size_of::<u16>(),
+            Self::F32 => size_of::<f32>(),
+        }
+    }
+}
+
 /// Advances one token of Nemotron 3 Mamba selective state and applies its
-/// gate-before-group-RMSNorm operation.
+/// gate-before-group-RMSNorm operation. `ssm_state` contains raw bytes in
+/// `state_dtype`; weights remain BF16.
 #[allow(clippy::too_many_arguments)]
 pub fn nemotron3_mamba_state_update_f32_into_on_stream(
     projected: &DeviceBuffer<f32>,
@@ -14415,12 +14436,13 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    mut ssm_state: DeviceInOut<'_, u16>,
+    mut ssm_state: DeviceInOut<'_, u8>,
     mut output: DeviceOutput<'_, f32>,
     heads: usize,
     head_dim: usize,
     groups: usize,
     state_size: usize,
+    state_dtype: MambaSsmDtype,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14444,6 +14466,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
             expected: "intermediate_size * state_size without overflow".to_string(),
             actual: format!("intermediate_size={intermediate_size} state_size={state_size}"),
         })?;
+    let state_bytes = state_len.saturating_mul(state_dtype.element_bytes());
     if heads == 0
         || head_dim == 0
         || groups == 0
@@ -14463,13 +14486,13 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
         || d_bf16.len() != heads
         || dt_bias_bf16.len() != heads
         || norm_weight_bf16.len() != intermediate_size
-        || ssm_state.len() != state_len
+        || ssm_state.len() != state_bytes
         || output.len() != intermediate_size
     {
         return Err(Error::Shape {
             label: "Nemotron 3 Mamba state buffers",
             expected: format!(
-                "projected={projection_size} conv={conv_channels} head params={heads} norm/output={intermediate_size} state={state_len}"
+                "projected={projection_size} conv={conv_channels} head params={heads} norm/output={intermediate_size} state_bytes={state_bytes}"
             ),
             actual: format!(
                 "projected={} conv={} a_log={} D={} dt_bias={} norm={} state={} output={}",
@@ -14500,6 +14523,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
                 head_dim as u32,
                 groups as u32,
                 state_size as u32,
+                i32::from(state_dtype == MambaSsmDtype::F32),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -14510,6 +14534,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
 
 /// Advances ragged, token-ordered selective-state chunks for multiple
 /// Nemotron 3 sequences and applies group RMS normalization to every row.
+/// State-table entries address raw bytes in `state_dtype`.
 #[allow(clippy::too_many_arguments)]
 pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     projected: &DeviceBuffer<f32>,
@@ -14518,7 +14543,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+    ssm_state_table: &DeviceBuffer<DeviceAddress<u8>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -14529,6 +14554,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     head_dim: usize,
     groups: usize,
     state_size: usize,
+    state_dtype: MambaSsmDtype,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14623,6 +14649,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 head_dim as u32,
                 groups as u32,
                 state_size as u32,
+                i32::from(state_dtype == MambaSsmDtype::F32),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -14632,7 +14659,8 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
 }
 
 /// Advances ragged Nemotron 3 selective-state chunks while recording the
-/// initial and per-row recurrent states as BF16 transaction snapshots.
+/// initial and per-row recurrent states in the configured storage precision.
+/// State and snapshot buffers contain raw BF16 or FP32 bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     projected: &DeviceBuffer<f32>,
@@ -14641,12 +14669,12 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+    ssm_state_table: &DeviceBuffer<DeviceAddress<u8>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
     mut output: DeviceOutput<'_, f32>,
-    mut state_snapshots_bf16: DeviceOutput<'_, u16>,
+    mut state_snapshots: DeviceOutput<'_, u8>,
     sequence_count: usize,
     total_tokens: usize,
     snapshot_slots: usize,
@@ -14654,6 +14682,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     head_dim: usize,
     groups: usize,
     state_size: usize,
+    state_dtype: MambaSsmDtype,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14667,7 +14696,8 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     let state_len = intermediate_size.saturating_mul(state_size);
     let snapshot_len = sequence_count
         .saturating_mul(snapshot_slots)
-        .saturating_mul(state_len);
+        .saturating_mul(state_len)
+        .saturating_mul(state_dtype.element_bytes());
     let state_table_end = state_table_offset.saturating_add(sequence_count);
     if sequence_count == 0
         || total_tokens == 0
@@ -14696,7 +14726,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
         || dt_bias_bf16.len() != heads
         || norm_weight_bf16.len() != intermediate_size
         || output.len() != total_tokens.saturating_mul(intermediate_size)
-        || state_snapshots_bf16.len() != snapshot_len
+        || state_snapshots.len() != snapshot_len
         || state_table_end > ssm_state_table.len()
         || sequence_offsets.len() < sequence_count
         || sequence_lengths.len() < sequence_count
@@ -14714,7 +14744,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 projected.len(),
                 conv_output.len(),
                 output.len(),
-                state_snapshots_bf16.len(),
+                state_snapshots.len(),
                 ssm_state_table.len(),
                 sequence_offsets.len(),
                 sequence_lengths.len(),
@@ -14739,7 +14769,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
-                state_snapshots_bf16.buffer_mut().ptr,
+                state_snapshots.buffer_mut().ptr,
                 sequence_count as u32,
                 total_tokens as u32,
                 snapshot_slots as u32,
@@ -14748,6 +14778,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 head_dim as u32,
                 groups as u32,
                 state_size as u32,
+                i32::from(state_dtype == MambaSsmDtype::F32),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -14809,6 +14840,69 @@ pub fn select_bf16_state_snapshot_into_on_stream(
                 sequence_count as u32,
                 snapshot_slots as u32,
                 state_size as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Restores one selective-state snapshot per sequence on the device.
+/// State and snapshot buffers contain raw bytes in `state_dtype`; `state_size`
+/// counts elements. Selecting `snapshot_slots` retains the current live state.
+pub fn select_mamba_ssm_state_snapshot_into_on_stream(
+    state_table: &DeviceBuffer<DeviceAddress<u8>>,
+    state_table_offset: usize,
+    snapshots: &DeviceBuffer<u8>,
+    selected_slots: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    snapshot_slots: usize,
+    state_size: usize,
+    state_dtype: MambaSsmDtype,
+    stream: &CudaStream,
+) -> Result<()> {
+    let state_table_end = state_table_offset.saturating_add(sequence_count);
+    let snapshot_len = sequence_count
+        .saturating_mul(snapshot_slots)
+        .saturating_mul(state_size)
+        .saturating_mul(state_dtype.element_bytes());
+    if sequence_count == 0
+        || snapshot_slots == 0
+        || state_size == 0
+        || sequence_count > u32::MAX as usize
+        || snapshot_slots > u32::MAX as usize
+        || state_size > u32::MAX as usize
+        || state_table_end > state_table.len()
+        || snapshots.len() != snapshot_len
+        || selected_slots.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "Mamba SSM recurrent-state snapshot selection buffers",
+            expected: format!(
+                "states/slots>={sequence_count} snapshots={snapshot_len} slots={snapshot_slots} state_size={state_size}"
+            ),
+            actual: format!(
+                "states={} selected={} snapshots={}",
+                state_table.len(),
+                selected_slots.len(),
+                snapshots.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_select_mamba_ssm_state_snapshot_on_stream",
+            ffi::infer_select_mamba_ssm_state_snapshot_on_stream(
+                state_table
+                    .address_at(state_table_offset)?
+                    .as_const_ptr()
+                    .cast_mut()
+                    .cast(),
+                snapshots.ptr,
+                selected_slots.ptr,
+                sequence_count as u32,
+                snapshot_slots as u32,
+                state_size as u32,
+                i32::from(state_dtype == MambaSsmDtype::F32),
                 stream.as_raw(),
             ),
         )
@@ -15697,7 +15791,13 @@ mod tests {
         let d_device = DeviceBuffer::from_host(&d).expect("D");
         let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
         let norm_weight_device = DeviceBuffer::from_host(&norm_weight).expect("norm weight");
-        let mut ssm_state_device = DeviceBuffer::from_host(&initial_ssm).expect("SSM state");
+        let mut ssm_state_device = DeviceBuffer::from_host(
+            &initial_ssm
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("SSM state");
         let mut output_device = DeviceBuffer::zeroed(INTERMEDIATE).expect("Mamba output");
         nemotron3_mamba_state_update_f32_into_on_stream(
             &projected_device,
@@ -15712,6 +15812,7 @@ mod tests {
             HEAD_DIM,
             GROUPS,
             STATE_SIZE,
+            MambaSsmDtype::Bf16,
             DT_FLOOR,
             EPS,
             &stream,
@@ -15733,6 +15834,7 @@ mod tests {
                 .iter()
                 .copied()
                 .map(f32_to_bf16)
+                .flat_map(u16::to_ne_bytes)
                 .collect::<Vec<_>>()
         );
     }
@@ -15881,6 +15983,7 @@ mod tests {
                             ((index * 11 % 37) as f32 - 18.0) * 0.003 + sequence as f32 * 0.009,
                         )
                     })
+                    .flat_map(u16::to_ne_bytes)
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -15918,6 +16021,7 @@ mod tests {
                     HEAD_DIM,
                     GROUPS,
                     STATE_SIZE,
+                    MambaSsmDtype::Bf16,
                     1.0e-4,
                     1.0e-5,
                     &stream,
@@ -15960,6 +16064,7 @@ mod tests {
             HEAD_DIM,
             GROUPS,
             STATE_SIZE,
+            MambaSsmDtype::Bf16,
             1.0e-4,
             1.0e-5,
             &stream,
@@ -15984,6 +16089,217 @@ mod tests {
                 "chunked SSM state {sequence}",
             );
         }
+    }
+
+    #[serial]
+    #[test]
+    fn nemotron3_mamba_state_precision_and_rollback_match_cpu_reference() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 16;
+        const GROUPS: usize = 2;
+        const STATE: usize = 40; // Includes a partial warp in the state dimension.
+        const INNER: usize = HEADS * HEAD_DIM;
+        const CONV: usize = INNER + 2 * GROUPS * STATE;
+        const PROJECTION: usize = INNER + CONV + HEADS;
+        const SLOTS: usize = 64;
+        const LENGTHS: [u32; 3] = [64, 31, 7];
+        const OFFSETS: [u32; 3] = [0, 64, 95];
+        const ROWS: usize = 102;
+        const STATE_LEN: usize = INNER * STATE;
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let mut projection = vec![0.5_f32; PROJECTION];
+        projection[INNER + CONV..].fill(-3.0);
+        let mut conv = vec![0.004_f32; CONV];
+        conv[..INNER].fill(0.3);
+        conv[INNER + GROUPS * STATE..].fill(0.01);
+        let projected = DeviceBuffer::from_host(&projection.repeat(ROWS)).unwrap();
+        let convolved = DeviceBuffer::from_host(&conv.repeat(ROWS)).unwrap();
+        let a_log = DeviceBuffer::from_host(&[f32_to_bf16(-8.0); HEADS]).unwrap();
+        let d = DeviceBuffer::from_host(&[f32_to_bf16(1.0); HEADS]).unwrap();
+        let dt_bias = DeviceBuffer::zeroed(HEADS).unwrap();
+        let norm = DeviceBuffer::from_host(&[f32_to_bf16(1.0); INNER]).unwrap();
+        let offsets = DeviceBuffer::from_host(&OFFSETS).unwrap();
+        let lengths = DeviceBuffer::from_host(&LENGTHS).unwrap();
+        let dt = (-3.0_f32).exp().ln_1p();
+        let decay = (-dt * (-8.0_f32).exp()).exp();
+        let mut fp32_final = 0.0;
+        let mut bf16_final = 0.0;
+        for dtype in [MambaSsmDtype::F32, MambaSsmDtype::Bf16] {
+            let encode = |values: &[f32]| -> Vec<u8> {
+                match dtype {
+                    MambaSsmDtype::F32 => values.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                    MambaSsmDtype::Bf16 => values
+                        .iter()
+                        .flat_map(|&x| f32_to_bf16(x).to_ne_bytes())
+                        .collect(),
+                }
+            };
+            let decode = |bytes: &[u8]| -> Vec<f32> {
+                match dtype {
+                    MambaSsmDtype::F32 => bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&x| f32::from_ne_bytes(x))
+                        .collect(),
+                    MambaSsmDtype::Bf16 => bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&x| bf16_to_f32(u16::from_ne_bytes(x)))
+                        .collect(),
+                }
+            };
+            let initial = vec![1.0; STATE_LEN];
+            let sentinel = DeviceBuffer::from_host(&encode(&vec![-7.0; STATE_LEN])).unwrap();
+            let states = (0..3)
+                .map(|_| DeviceBuffer::from_host(&encode(&initial)).unwrap())
+                .collect::<Vec<_>>();
+            let pointers = std::iter::once(sentinel.cuda_address())
+                .chain(states.iter().map(DeviceBuffer::cuda_address))
+                .collect::<Vec<_>>();
+            let table = DeviceBuffer::from_host(&pointers).unwrap();
+            let mut snapshots =
+                DeviceBuffer::zeroed(3 * SLOTS * STATE_LEN * dtype.element_bytes()).unwrap();
+            let mut output = DeviceBuffer::zeroed(ROWS * INNER).unwrap();
+            nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
+                &projected,
+                &convolved,
+                &a_log,
+                &d,
+                &dt_bias,
+                &norm,
+                &table,
+                1,
+                &offsets,
+                &lengths,
+                output.output(),
+                snapshots.output(),
+                3,
+                ROWS,
+                SLOTS,
+                HEADS,
+                HEAD_DIM,
+                GROUPS,
+                STATE,
+                dtype,
+                1.0e-4,
+                1.0e-5,
+                &stream,
+            )
+            .unwrap();
+            let mut reference = vec![1.0_f32];
+            for _ in 0..SLOTS {
+                let updated = reference.last().unwrap() * decay + dt * 0.004 * 0.3;
+                reference.push(match dtype {
+                    MambaSsmDtype::F32 => updated,
+                    MambaSsmDtype::Bf16 => bf16_to_f32(f32_to_bf16(updated)),
+                });
+            }
+            match dtype {
+                MambaSsmDtype::F32 => fp32_final = reference[SLOTS],
+                MambaSsmDtype::Bf16 => bf16_final = reference[SLOTS],
+            }
+            let snapshot_values = decode(&snapshots.copy_to_host(&stream).unwrap());
+            for sequence in 0..3 {
+                let actual = decode(&states[sequence].copy_to_host(&stream).unwrap());
+                assert_close(
+                    &actual,
+                    &vec![reference[LENGTHS[sequence] as usize]; STATE_LEN],
+                    2.0e-5,
+                    "final SSM state",
+                );
+                for (slot, &expected) in reference
+                    .iter()
+                    .enumerate()
+                    .take(SLOTS.min(LENGTHS[sequence] as usize + 1))
+                {
+                    let begin = (sequence * SLOTS + slot) * STATE_LEN;
+                    assert_close(
+                        &snapshot_values[begin..begin + STATE_LEN],
+                        &vec![expected; STATE_LEN],
+                        2.0e-5,
+                        "SSM snapshot",
+                    );
+                }
+            }
+            // Zero, partial and full acceptance; a full acceptance leaves the live state intact.
+            for selected in [[0_u32, 17, SLOTS as u32], [32, 0, 7]] {
+                let selected_device = DeviceBuffer::from_host(&selected).unwrap();
+                select_mamba_ssm_state_snapshot_into_on_stream(
+                    &table,
+                    1,
+                    &snapshots,
+                    &selected_device,
+                    3,
+                    SLOTS,
+                    STATE_LEN,
+                    dtype,
+                    &stream,
+                )
+                .unwrap();
+                for sequence in 0..3 {
+                    let slot = if selected[sequence] == SLOTS as u32 {
+                        LENGTHS[sequence]
+                    } else {
+                        selected[sequence]
+                    } as usize;
+                    assert_close(
+                        &decode(&states[sequence].copy_to_host(&stream).unwrap()),
+                        &vec![reference[slot]; STATE_LEN],
+                        2.0e-5,
+                        "selected SSM state",
+                    );
+                }
+            }
+            assert_eq!(
+                decode(&sentinel.copy_to_host(&stream).unwrap()),
+                vec![-7.0; STATE_LEN]
+            );
+            // Decode must retain the same precision as batched prefill and snapshots.
+            let one_projected = DeviceBuffer::from_host(&projection).unwrap();
+            let one_conv = DeviceBuffer::from_host(&conv).unwrap();
+            let mut one_state = DeviceBuffer::from_host(&encode(&initial)).unwrap();
+            let mut one_output = DeviceBuffer::zeroed(INNER).unwrap();
+            for _ in 0..SLOTS {
+                nemotron3_mamba_state_update_f32_into_on_stream(
+                    &one_projected,
+                    &one_conv,
+                    &a_log,
+                    &d,
+                    &dt_bias,
+                    &norm,
+                    one_state.inout(),
+                    one_output.output(),
+                    HEADS,
+                    HEAD_DIM,
+                    GROUPS,
+                    STATE,
+                    dtype,
+                    1.0e-4,
+                    1.0e-5,
+                    &stream,
+                )
+                .unwrap();
+            }
+            assert_close(
+                &decode(&one_state.copy_to_host(&stream).unwrap()),
+                &vec![reference[SLOTS]; STATE_LEN],
+                2.0e-5,
+                "decode SSM state",
+            );
+            let chunk_output = output.copy_to_host(&stream).unwrap();
+            assert_close(
+                &one_output.copy_to_host(&stream).unwrap(),
+                &chunk_output[(SLOTS - 1) * INNER..SLOTS * INNER],
+                0.0,
+                "decode vs chunk output",
+            );
+        }
+        assert!(
+            (fp32_final - bf16_final).abs() > 0.001,
+            "fixture must expose state rounding loss"
+        );
     }
 
     #[serial]

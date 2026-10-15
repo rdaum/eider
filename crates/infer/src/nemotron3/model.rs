@@ -16,7 +16,7 @@ use eider_cuda::{
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
     rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
-    speculative_accept_argmax_f32_into_on_stream,
+    select_mamba_ssm_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use std::path::Path;
@@ -1520,7 +1520,7 @@ impl Nemotron3Model {
                     conv_state_size,
                     &self.stream,
                 )?;
-                select_bf16_state_snapshot_into_on_stream(
+                select_mamba_ssm_state_snapshot_into_on_stream(
                     &workspace.ssm_state_table,
                     state_table_offset,
                     &snapshot.ssm,
@@ -1528,6 +1528,7 @@ impl Nemotron3Model {
                     states.len(),
                     snapshot_slots,
                     ssm_state_size,
+                    self.manifest.mamba_ssm_dtype,
                     &self.stream,
                 )?;
             }
@@ -2059,7 +2060,7 @@ impl Nemotron3SpeculativeCycleWorkspace {
 
 struct Nemotron3MambaSnapshots {
     conv: DeviceBuffer<u16>,
-    ssm: DeviceBuffer<u16>,
+    ssm: DeviceBuffer<u8>,
 }
 
 impl Nemotron3LayerRowsWorkspace {
@@ -2091,7 +2092,7 @@ pub struct Nemotron3BlockWorkspace {
     sequence_lengths: DeviceBuffer<u32>,
     start_positions: DeviceBuffer<u32>,
     conv_state_table: DeviceBuffer<DeviceAddress<u16>>,
-    ssm_state_table: DeviceBuffer<DeviceAddress<u16>>,
+    ssm_state_table: DeviceBuffer<DeviceAddress<u8>>,
     page_table_table: DeviceBuffer<DeviceAddress<u32>>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     previous_logits_table: DeviceBuffer<DeviceAddress<f32>>,
@@ -2174,7 +2175,10 @@ impl Nemotron3BlockWorkspace {
                                 sequence_count * snapshot_slots * conv_state_size,
                             )?,
                             ssm: DeviceBuffer::zeroed(
-                                sequence_count * snapshot_slots * ssm_state_size,
+                                sequence_count
+                                    * snapshot_slots
+                                    * ssm_state_size
+                                    * model.manifest.mamba_ssm_dtype.element_bytes(),
                             )?,
                         })
                     })

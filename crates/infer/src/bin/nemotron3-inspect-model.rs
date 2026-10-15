@@ -48,8 +48,9 @@ fn main() -> eider_cuda::Result<()> {
         manifest.moe_intermediate_size,
     );
     println!(
-        "  per-sequence FP32 Mamba state: {:.3} GiB",
-        manifest.mamba_state_bytes_fp32() as f64 / (1024.0 * 1024.0 * 1024.0),
+        "  per-sequence Mamba state (BF16 conv, {:?} SSM): {:.3} GiB",
+        manifest.mamba_ssm_dtype,
+        manifest.mamba_state_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
     );
     println!("  checkpoint tensor topology: valid");
     Ok(())

@@ -12071,6 +12071,7 @@ infer_nemotron3_mamba_conv_update_f32_chunks_snapshot_on_stream(
     return cudaGetLastError();
 }
 
+template <typename State>
 __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     const float* projected,
     const float* conv_output,
@@ -12078,7 +12079,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     const std::uint16_t* d_bf16,
     const std::uint16_t* dt_bias_bf16,
     const std::uint16_t* norm_weight_bf16,
-    std::uint16_t* ssm_state,
+    std::uint8_t* ssm_state,
     float* output,
     std::uint32_t heads,
     std::uint32_t head_dim,
@@ -12126,17 +12127,15 @@ __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     decay = __shfl_sync(0xffffffff, decay, 0);
     d = __shfl_sync(0xffffffff, d, 0);
 
-    std::uint16_t* state = ssm_state + static_cast<std::size_t>(flat) * state_size;
+    State* state = reinterpret_cast<State*>(ssm_state) + static_cast<std::size_t>(flat) * state_size;
     const float* b = conv_output + intermediate_size + group * state_size;
     const float* c = conv_output + intermediate_size + bc_width + group * state_size;
     float y = 0.0f;
     for (std::uint32_t state_index = lane; state_index < state_size; state_index += 32) {
         const float updated =
-            __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
-                state + state_index)) * decay +
+            static_cast<float>(state[state_index]) * decay +
             dt * b[state_index] * x;
-        *reinterpret_cast<__nv_bfloat16*>(state + state_index) =
-            __float2bfloat16_rn(updated);
+        state[state_index] = static_cast<State>(updated);
         y = __fmaf_rn(updated, c[state_index], y);
     }
     y = infer_warp_reduce_sum(y);
@@ -12206,17 +12205,18 @@ __global__ void infer_nemotron3_group_rms_norm_f32_chunks_kernel(
     }
 }
 
+template <typename State>
 __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
     const float* projected,
     const float* conv_output,
     const std::uint16_t* a_log_bf16,
     const std::uint16_t* d_bf16,
     const std::uint16_t* dt_bias_bf16,
-    std::uint16_t* const* ssm_state_table,
+    std::uint8_t* const* ssm_state_table,
     const std::uint32_t* sequence_offsets,
     const std::uint32_t* sequence_lengths,
     float* output,
-    std::uint16_t* state_snapshots_bf16,
+    std::uint8_t* state_snapshots,
     std::uint32_t snapshot_slots,
     std::uint32_t projection_size,
     std::uint32_t heads,
@@ -12239,21 +12239,20 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
     const std::uint32_t group = flat / group_width;
     const std::uint32_t bc_width = groups * state_size;
     const std::uint32_t conv_channels = intermediate_size + 2 * bc_width;
-    std::uint16_t* state = ssm_state_table[sequence] +
+    State* state = reinterpret_cast<State*>(ssm_state_table[sequence]) +
                    static_cast<std::size_t>(flat) * state_size;
     const std::uint32_t begin = sequence_offsets[sequence];
     const std::uint32_t end = begin + sequence_lengths[sequence];
     const std::size_t complete_state_size =
         static_cast<std::size_t>(intermediate_size) * state_size;
-    if (state_snapshots_bf16 != nullptr) {
-        std::uint16_t* initial = state_snapshots_bf16 +
+    if (state_snapshots != nullptr) {
+        State* initial = reinterpret_cast<State*>(state_snapshots) +
             static_cast<std::size_t>(sequence) * snapshot_slots *
                 complete_state_size +
             static_cast<std::size_t>(flat) * state_size;
         for (std::uint32_t state_index = lane; state_index < state_size;
              state_index += 32) {
-            *reinterpret_cast<__nv_bfloat16*>(initial + state_index) =
-                *reinterpret_cast<const __nv_bfloat16*>(state + state_index);
+            initial[state_index] = state[state_index];
         }
     }
     for (std::uint32_t row = begin; row < end; ++row) {
@@ -12295,20 +12294,17 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
         for (std::uint32_t state_index = lane; state_index < state_size;
              state_index += 32) {
             const float updated =
-                __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
-                    state + state_index)) * decay +
+                static_cast<float>(state[state_index]) * decay +
                 dt * b[state_index] * x;
-            *reinterpret_cast<__nv_bfloat16*>(state + state_index) =
-                __float2bfloat16_rn(updated);
-            if (state_snapshots_bf16 != nullptr) {
+            state[state_index] = static_cast<State>(updated);
+            if (state_snapshots != nullptr) {
                 const std::uint32_t slot = row - begin + 1;
                 if (slot < snapshot_slots) {
-                    std::uint16_t* snapshot = state_snapshots_bf16 +
+                    State* snapshot = reinterpret_cast<State*>(state_snapshots) +
                         (static_cast<std::size_t>(sequence) * snapshot_slots + slot) *
                             complete_state_size +
                         static_cast<std::size_t>(flat) * state_size;
-                    *reinterpret_cast<__nv_bfloat16*>(snapshot + state_index) =
-                        __float2bfloat16_rn(updated);
+                    snapshot[state_index] = state[state_index];
                 }
             }
             y = __fmaf_rn(updated, c[state_index], y);
@@ -12330,12 +12326,13 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
     const std::uint16_t* d_bf16,
     const std::uint16_t* dt_bias_bf16,
     const std::uint16_t* norm_weight_bf16,
-    std::uint16_t* ssm_state,
+    std::uint8_t* ssm_state,
     float* output,
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
+    int ssm_fp32,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12351,20 +12348,28 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
     const std::uint32_t intermediate_size = heads * head_dim;
     const std::uint32_t state_blocks =
         (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    infer_nemotron3_mamba_state_update_f32_kernel<<<state_blocks, kThreads, 0, stream>>>(
-        projected,
-        conv_output,
-        a_log_bf16,
-        d_bf16,
-        dt_bias_bf16,
-        norm_weight_bf16,
-        ssm_state,
-        output,
-        heads,
-        head_dim,
-        groups,
-        state_size,
-        dt_floor);
+    auto launch = [&](auto state_element) {
+        infer_nemotron3_mamba_state_update_f32_kernel<decltype(state_element)><<<
+            state_blocks, kThreads, 0, stream>>>(
+            projected,
+            conv_output,
+            a_log_bf16,
+            d_bf16,
+            dt_bias_bf16,
+            norm_weight_bf16,
+            ssm_state,
+            output,
+            heads,
+            head_dim,
+            groups,
+            state_size,
+            dt_floor);
+    };
+    if (ssm_fp32) {
+        launch(float{});
+    } else {
+        launch(__nv_bfloat16{});
+    }
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
@@ -12382,7 +12387,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     const std::uint16_t* d_bf16,
     const std::uint16_t* dt_bias_bf16,
     const std::uint16_t* norm_weight_bf16,
-    std::uint16_t* const* ssm_state_table,
+    std::uint8_t* const* ssm_state_table,
     const std::uint32_t* sequence_offsets,
     const std::uint32_t* sequence_lengths,
     float* output,
@@ -12393,6 +12398,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
+    int ssm_fp32,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12411,25 +12417,32 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     const std::uint32_t state_blocks =
         (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const dim3 blocks(sequence_count, state_blocks, 1);
-    infer_nemotron3_mamba_state_update_f32_chunks_kernel<<<
-        blocks, kThreads, 0, stream>>>(
-        projected,
-        conv_output,
-        a_log_bf16,
-        d_bf16,
-        dt_bias_bf16,
-        ssm_state_table,
-        sequence_offsets,
-        sequence_lengths,
-        output,
-        nullptr,
-        0,
-        projection_size,
-        heads,
-        head_dim,
-        groups,
-        state_size,
-        dt_floor);
+    auto launch = [&](auto state_element) {
+        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element)><<<
+            blocks, kThreads, 0, stream>>>(
+            projected,
+            conv_output,
+            a_log_bf16,
+            d_bf16,
+            dt_bias_bf16,
+            ssm_state_table,
+            sequence_offsets,
+            sequence_lengths,
+            output,
+            nullptr,
+            0,
+            projection_size,
+            heads,
+            head_dim,
+            groups,
+            state_size,
+            dt_floor);
+    };
+    if (ssm_fp32) {
+        launch(float{});
+    } else {
+        launch(__nv_bfloat16{});
+    }
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
@@ -12450,11 +12463,11 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     const std::uint16_t* d_bf16,
     const std::uint16_t* dt_bias_bf16,
     const std::uint16_t* norm_weight_bf16,
-    std::uint16_t* const* ssm_state_table,
+    std::uint8_t* const* ssm_state_table,
     const std::uint32_t* sequence_offsets,
     const std::uint32_t* sequence_lengths,
     float* output,
-    std::uint16_t* state_snapshots_bf16,
+    std::uint8_t* state_snapshots,
     std::uint32_t sequence_count,
     std::uint32_t total_tokens,
     std::uint32_t snapshot_slots,
@@ -12463,6 +12476,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
+    int ssm_fp32,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12470,7 +12484,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
         d_bf16 == nullptr || dt_bias_bf16 == nullptr || norm_weight_bf16 == nullptr ||
         ssm_state_table == nullptr || sequence_offsets == nullptr ||
         sequence_lengths == nullptr || output == nullptr ||
-        state_snapshots_bf16 == nullptr || sequence_count == 0 ||
+        state_snapshots == nullptr || sequence_count == 0 ||
         total_tokens == 0 || snapshot_slots == 0 || projection_size == 0 ||
         heads == 0 || head_dim == 0 || groups == 0 || state_size == 0 ||
         heads % groups != 0 || !(dt_floor > 0.0f) || !(eps > 0.0f)) {
@@ -12482,25 +12496,32 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     const std::uint32_t state_blocks =
         (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const dim3 blocks(sequence_count, state_blocks, 1);
-    infer_nemotron3_mamba_state_update_f32_chunks_kernel<<<
-        blocks, kThreads, 0, stream>>>(
-        projected,
-        conv_output,
-        a_log_bf16,
-        d_bf16,
-        dt_bias_bf16,
-        ssm_state_table,
-        sequence_offsets,
-        sequence_lengths,
-        output,
-        state_snapshots_bf16,
-        snapshot_slots,
-        projection_size,
-        heads,
-        head_dim,
-        groups,
-        state_size,
-        dt_floor);
+    auto launch = [&](auto state_element) {
+        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element)><<<
+            blocks, kThreads, 0, stream>>>(
+            projected,
+            conv_output,
+            a_log_bf16,
+            d_bf16,
+            dt_bias_bf16,
+            ssm_state_table,
+            sequence_offsets,
+            sequence_lengths,
+            output,
+            state_snapshots,
+            snapshot_slots,
+            projection_size,
+            heads,
+            head_dim,
+            groups,
+            state_size,
+            dt_floor);
+    };
+    if (ssm_fp32) {
+        launch(float{});
+    } else {
+        launch(__nv_bfloat16{});
+    }
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
@@ -12513,9 +12534,10 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     return cudaGetLastError();
 }
 
-__global__ void infer_select_bf16_state_snapshot_kernel(
-    std::uint16_t* const* state_table,
-    const std::uint16_t* snapshots_bf16,
+template <typename State>
+__global__ void infer_select_state_snapshot_kernel(
+    State* const* state_table,
+    const State* snapshots,
     const std::uint32_t* selected_slots,
     std::uint32_t snapshot_slots,
     std::uint32_t state_size) {
@@ -12527,8 +12549,8 @@ __global__ void infer_select_bf16_state_snapshot_kernel(
     if (slot > snapshot_slots) {
         return;
     }
-    std::uint16_t* state = state_table[sequence];
-    const std::uint16_t* snapshot = snapshots_bf16 +
+    State* state = state_table[sequence];
+    const State* snapshot = snapshots +
         (static_cast<std::size_t>(sequence) * snapshot_slots + slot) * state_size;
     const std::uint32_t index = blockIdx.y * blockDim.x + threadIdx.x;
     if (index < state_size) {
@@ -12553,13 +12575,46 @@ extern "C" cudaError_t infer_select_bf16_state_snapshot_on_stream(
     const std::uint32_t state_blocks =
         (state_size + kThreads - 1) / kThreads;
     const dim3 blocks(sequence_count, state_blocks, 1);
-    infer_select_bf16_state_snapshot_kernel<<<
+    infer_select_state_snapshot_kernel<std::uint16_t><<<
         blocks, kThreads, 0, stream>>>(
         state_table,
         snapshots_bf16,
         selected_slots,
         snapshot_slots,
         state_size);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_select_mamba_ssm_state_snapshot_on_stream(
+    std::uint8_t* const* state_table,
+    const std::uint8_t* snapshots,
+    const std::uint32_t* selected_slots,
+    std::uint32_t sequence_count,
+    std::uint32_t snapshot_slots,
+    std::uint32_t state_size,
+    int ssm_fp32,
+    cudaStream_t stream) {
+    if (state_table == nullptr || snapshots == nullptr ||
+        selected_slots == nullptr || sequence_count == 0 || snapshot_slots == 0 ||
+        state_size == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t state_blocks =
+        (state_size + kThreads - 1) / kThreads;
+    const dim3 blocks(sequence_count, state_blocks, 1);
+    auto launch = [&](auto state_element) {
+        using State = decltype(state_element);
+        infer_select_state_snapshot_kernel<State><<<blocks, kThreads, 0, stream>>>(
+            reinterpret_cast<State* const*>(state_table),
+            reinterpret_cast<const State*>(snapshots), selected_slots,
+            snapshot_slots, state_size);
+    };
+    if (ssm_fp32) {
+        launch(float{});
+    } else {
+        launch(std::uint16_t{});
+    }
     return cudaGetLastError();
 }
 

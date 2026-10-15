@@ -1,6 +1,6 @@
 use super::{NEMOTRON_OMNI_ARCHITECTURE, Nemotron3Manifest, Nemotron3Model, Nemotron3Router};
 use crate::{CheckpointArchitecture, checkpoint_architecture};
-use eider_cuda::{CudaStream, DeviceBuffer};
+use eider_cuda::{CudaStream, DeviceBuffer, MambaSsmDtype};
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use serde_json::{Value, json};
 use std::fs;
@@ -40,6 +40,49 @@ fn omni_configuration_selects_text_dimensions_and_namespace() {
     }
     let plain = Nemotron3Manifest::from_config_str(&text_config().to_string()).unwrap();
     assert_eq!(plain.tensor_name("lm_head.weight"), "lm_head.weight");
+}
+
+#[test]
+fn super_35_release_configuration_preserves_state_precision() {
+    // NVIDIA NVFP4 revision 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c;
+    // vision and per-tensor quantization metadata are omitted from this fixture.
+    let manifest =
+        Nemotron3Manifest::from_config_str(include_str!("fixtures/super-3.5-vl-config.json"))
+            .unwrap();
+    assert_eq!(manifest.layers.len(), 88);
+    assert_eq!(manifest.hidden_size, 4096);
+    assert_eq!(manifest.mamba_ssm_dtype, MambaSsmDtype::F32);
+    assert_eq!(manifest.mamba_projection_size(), 18560);
+    assert_eq!(manifest.routed_experts, 512);
+    assert_eq!(manifest.experts_per_token, 22);
+    assert_eq!(manifest.moe_latent_size, Some(1024));
+    assert_eq!(manifest.mtp_layers.len(), 2);
+    let mamba_layers = manifest
+        .layers
+        .iter()
+        .filter(|&&kind| kind == super::Nemotron3LayerKind::Mamba)
+        .count();
+    assert_eq!(
+        manifest.mamba_state_bytes(),
+        mamba_layers * (128 * 64 * 128 * 4 + 10240 * 4 * 2)
+    );
+}
+
+#[test]
+fn mamba_precision_defaults_to_bf16_and_rejects_unknown_storage() {
+    let mut config = text_config();
+    let default = Nemotron3Manifest::from_config_str(&config.to_string()).unwrap();
+    assert_eq!(default.mamba_ssm_dtype, MambaSsmDtype::Bf16);
+    config["mamba_ssm_cache_dtype"] = json!("bfloat16");
+    assert_eq!(
+        Nemotron3Manifest::from_config_str(&config.to_string()).unwrap(),
+        default
+    );
+    for dtype in ["float16", "auto", "unknown"] {
+        config["mamba_ssm_cache_dtype"] = json!(dtype);
+        let error = Nemotron3Manifest::from_config_str(&config.to_string()).unwrap_err();
+        assert!(error.to_string().contains("SSM cache precision"), "{error}");
+    }
 }
 
 #[test]
@@ -113,6 +156,27 @@ fn wrapped_checkpoint_loads_backbone_and_mtp_with_variable_expert_counts() {
     let model = Nemotron3Model::load(&fixture.root).unwrap();
     assert!(model.has_mtp());
     assert!(model.device_bytes() > 0);
+}
+
+#[test]
+fn fp32_mamba_storage_is_budgeted_in_live_state_and_verification() {
+    let fixture = Fixture::new(true, 4);
+    let sizes = |dtype: &str| {
+        let mut config = omni_config("llm_config");
+        config["llm_config"]["mamba_ssm_cache_dtype"] = json!(dtype);
+        fs::write(fixture.root.join("config.json"), config.to_string()).unwrap();
+        let model = Nemotron3Model::load(&fixture.root).unwrap();
+        let state = model.sequence_state(16).unwrap();
+        let workspace = model.speculative_workspace(1, 4).unwrap();
+        (state.device_bytes(), workspace.device_bytes())
+    };
+    let bf16 = sizes("bfloat16");
+    let fp32 = sizes("float32");
+    let manifest = Nemotron3Manifest::from_model_dir(&fixture.root).unwrap();
+    let extra_bytes = manifest.mamba_intermediate_size() * manifest.mamba_state_size * 2;
+    // The live sequence also owns one rollback copy; verification owns four slots.
+    assert_eq!(fp32.0 - bf16.0, 2 * extra_bytes);
+    assert_eq!(fp32.1 - bf16.1, 4 * extra_bytes);
 }
 
 #[test]
@@ -197,7 +261,19 @@ impl Fixture {
         };
         fixture.bf16("backbone.embeddings.weight", &[128, 128], 0.125);
         fixture.bf16("backbone.norm_f.weight", &[128], 1.0);
-        fixture.bf16("lm_head.weight", &[128, 128], 0.125);
+        if wrapped {
+            // Released Omni checkpoints mix scalar and singleton FP8 scales.
+            fixture.tensor(
+                "lm_head.weight",
+                "F8_E4M3",
+                &[128, 128],
+                &vec![0x38; 128 * 128],
+            );
+            fixture.tensor("lm_head.weight_scale", "F32", &[], &0.125_f32.to_le_bytes());
+            fixture.tensor("lm_head.input_scale", "F32", &[1], &1.0_f32.to_le_bytes());
+        } else {
+            fixture.bf16("lm_head.weight", &[128, 128], 0.125);
+        }
         fixture.bf16("backbone.layers.0.norm.weight", &[128], 1.0);
         let mamba = "backbone.layers.0.mixer";
         for (name, shape) in [
@@ -244,6 +320,7 @@ impl Fixture {
 
     fn nvfp4(&mut self, prefix: &str, value: f32) {
         let weight = ModelOptNvfp4Linear::quantize_values(prefix, 64, 64, |_| value).unwrap();
+        let scalar_shape: &[usize] = if self.prefix.is_empty() { &[] } else { &[1] };
         self.tensor(
             &format!("{prefix}.weight"),
             "U8",
@@ -259,13 +336,13 @@ impl Fixture {
         self.tensor(
             &format!("{prefix}.weight_scale_2"),
             "F32",
-            &[],
+            scalar_shape,
             &weight.weight_scale_2.to_le_bytes(),
         );
         self.tensor(
             &format!("{prefix}.input_scale"),
             "F32",
-            &[],
+            scalar_shape,
             &weight.input_scale.to_le_bytes(),
         );
     }
