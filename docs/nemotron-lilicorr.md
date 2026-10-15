@@ -68,6 +68,8 @@ The launcher resolves that pinned snapshot and enables three proposals by defaul
 Set `EIDER_LILICORR=0` to run without the companion.
 Set `LILICORR_DIR` to select a different local snapshot path.
 Explicit server arguments still take precedence.
+Prefill chunks default to 2,048 tokens. Set `EIDER_PREFILL_TOKEN_CAPACITY` to
+override this size. The context limit remains 1,048,576 tokens.
 `EIDER_SPECULATIVE_DRAFTS=0` disables proposals. Values one through seven select
 the proposal length. The direct server option is
 `--lilicorr-dir DIR`. It defaults to three proposals unless overridden.
@@ -116,6 +118,12 @@ Nemotron prepares the checkpoint's NVFP4 dense weights once for batched
 projections. The shared experts add about 3.3 GiB of prepared BF16 weights.
 Single-token decode retains packed weights. Explicit BF16/FP8-to-NVFP4 storage
 policies retain their compact representation and expand batch weights in scratch.
+
+Target prefill attention shares each 32-key tile across 64 queries and retains
+FP32 scores, softmax, and accumulation. Calibrated routed experts use NVFP4
+activations for batches of at least four rows, including speculative verification.
+This extends the existing activation recipe to batches of 4–127 rows and can
+change token choices relative to their previous W4A16 path.
 
 ## Validation
 
@@ -207,6 +215,79 @@ The shared NVFP4 projection remained faster on its small-batch matvec path:
 ```sh
 cargo bench -p eider-cuda --bench nemotron35_experts -- verification
 cargo bench -p eider-cuda --bench nemotron35_dense -- Verification
+```
+
+A separate HTTP replay measured cached suffix prefill with 6,577 prompt tokens,
+4,992 cached tokens, and one generated token. Both runs used greedy sampling,
+three LiLiCorr proposals, a 1 GiB prefix budget, and a 16,384-token test context.
+Nsight CUDA instrumentation was loaded in both runs; recording was inactive
+during the timings below. These are single-run results from one code-review prompt.
+
+| Configuration | Prefill compute | Prefill throughput | TTFT |
+| --- | ---: | ---: | ---: |
+| Previous attention, 1,024-token chunks | 3.263 s | 485 tok/s | 3.318 s |
+| Shared K/V tiles, 2,048-token chunks | 2.395 s | 661 tok/s | 2.565 s |
+| Plus calibrated NVFP4 batches of 32 or more rows | 2.211 s | 716 tok/s | 2.377 s |
+
+The actor counts 1,584 prefill tokens; the final uncached token starts decoding.
+Prefill throughput improved 48%, and TTFT fell 28%. Cold prefill for the
+5,104-token prefix improved from 695 to 904 tok/s in the same replay.
+Two subsequent 128-token generations restored the prefix and produced identical
+output. This checks repeatability, not equivalence to the previous activation path.
+
+The attention micromeasure fell from 75.1 to 17.2 ms for 1,024 queries after a
+4,992-token prefix. It checks every output against serial FP32 attention and
+selected outputs against an independent CPU reference. Ragged sequence tests
+cover page boundaries, query tails, and noncontiguous page maps.
+The expert micromeasure compares 32- and 48-row batches, including route sorting
+and activation quantization. Both use the existing W4A16 path as a reference.
+
+```sh
+cargo bench -p eider-cuda --bench nemotron35_attention -- suffix
+cargo bench -p eider-cuda --bench nemotron35_nvfp4 -- suffix
+```
+
+Profiling a 128-token continuation at the same 6,577-token prompt separated
+the steady cycle into 108 ms of target verification and 14 ms of remaining work.
+The latter includes draft generation, context updates, and committing accepted
+tokens. These intervals use the existing proposal and target-result transfers
+as boundaries, excluding the first two cycles.
+
+Routed expert projections consumed about 46 ms per cycle. Other large costs
+included FP8 dense projections, shared experts, and target attention. Device
+copies took about 2 ms per cycle. Changes to graph launch overhead alone cannot
+remove most of this cost.
+
+Short attention batches now use 16 or 32 warps per head to expose more context
+parallelism. Four-row attention at a 13,184-token prefix fell from 1.254 to
+0.724 ms in the micromeasure. Small calibrated FP8 plans allow 4 MiB of workspace,
+which improves cuBLASLt's algorithm selection. The four-row Mamba input projection
+fell from 0.403 to 0.378 ms. Shared NVFP4 projections load four activations together,
+preserving their FP32 arithmetic order. The four-row shared up projection fell
+from 0.137 to 0.091 ms.
+
+The native NVFP4 expert path also wins at the four-row verification shape. Its
+micromeasure includes sorting and quantization, with both distinct experts and
+four routes sharing each expert. These results lower its minimum batch size
+from 32 to four rows.
+
+| Configuration | Target verification | Complete cycle | Decode, 256 output tokens |
+| --- | ---: | ---: | ---: |
+| Before decode changes | 108.2 ms | 122.1 ms | 22.93 tok/s |
+| Attention, FP8 plans, and shared loads | 99.3 ms | 113.0 ms | 25.92 tok/s |
+| Plus native NVFP4 verification | 89.1 ms | 102.7 ms | 26.65 tok/s |
+
+Cycle times are means from the 128-token CUDA traces. Decode rates come from
+subsequent requests with recording inactive. All runs used the same prompt and
+settings. Changed FP32 reduction orders and FP4 activations changed generated
+tokens, so these are not timings of an identical token stream. Final draft
+acceptance averaged 1.71 per cycle, compared with 1.80 before the changes.
+Cold and cached 128-token generations matched within the final build.
+
+```sh
+cargo bench -p eider-cuda --bench nemotron35_attention -- verification
+cargo bench -p eider-cuda --bench nemotron35_dense -- Verification
+cargo bench -p eider-cuda --bench nemotron35_nvfp4 -- verification
 ```
 
 The model card reports coding acceptance lengths of 5.65 at temperature zero and

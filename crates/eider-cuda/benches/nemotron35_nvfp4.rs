@@ -1,7 +1,8 @@
 use eider_cuda::{
     CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer,
-    MoeSortedNvfp4Rows, MoeSortedRoutes,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, lfm2_expert_gemm_pipelined_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
+    nvfp4_w4a16_reuse_matvec_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -26,6 +27,7 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
     stop: CudaEvent,
     routes: MoeSortedRoutes,
     indices: DeviceBuffer<u32>,
+    repeated_indices: DeviceBuffer<u32>,
     _weights: Vec<DeviceBuffer<u8>>,
     _scales: Vec<DeviceBuffer<u8>>,
     _input: DeviceBuffer<f32>,
@@ -39,10 +41,14 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
 
 impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, ROUTES> {
     fn enqueue(&mut self, mode: usize) {
+        let indices = if mode >= 4 {
+            &self.repeated_indices
+        } else {
+            &self.indices
+        };
+        let mode = mode % 4;
         if mode == 1 {
-            self.routes
-                .sort_on_stream(&self.indices, &self.stream)
-                .unwrap();
+            self.routes.sort_on_stream(indices, &self.stream).unwrap();
             self.native_input
                 .set_rows(self.routes.active_routes())
                 .unwrap();
@@ -75,9 +81,28 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, RO
                     &self.stream,
                 )
                 .unwrap();
+        } else if mode == 2 || mode == 3 {
+            self.routes.sort_on_stream(indices, &self.stream).unwrap();
+            let project = if mode == 3 {
+                nvfp4_w4a16_reuse_matvec_into_on_stream
+            } else {
+                lfm2_expert_gemm_pipelined_into_on_stream
+            };
+            project(
+                &self.routes,
+                &self.inputs,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                &self.outputs,
+                OUT,
+                IN,
+                &self.stream,
+            )
+            .unwrap();
         } else {
             nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
-                &self.indices,
+                indices,
                 &self.inputs,
                 &self.weights,
                 &self.scales,
@@ -187,6 +212,12 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
             stop: CudaEvent::new().expect("stop"),
             routes: MoeSortedRoutes::new(ROUTES, EXPERTS).expect("routes"),
             indices,
+            repeated_indices: DeviceBuffer::from_host(
+                &(0..ROUTES)
+                    .map(|i| ((i / 4 * 17) % EXPERTS) as u32)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
             weights: DeviceBuffer::from_host(
                 &weights
                     .iter()
@@ -233,6 +264,16 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
                 .copy_to_host(&context.stream)
                 .unwrap()
                 .to_vec();
+            context.enqueue(2);
+            let pipeline = context.output.copy_to_host(&context.stream).unwrap();
+            for (&a, &b) in pipeline[..routes * OUT].iter().zip(&reference) {
+                assert!(a.is_finite() && (a - b).abs() <= 0.005 + b.abs() * 0.004);
+            }
+            if ROUTES <= 176 {
+                context.enqueue(3);
+                let reused = context.output.copy_to_host(&context.stream).unwrap();
+                assert_eq!(&reused[..routes * OUT], &reference[..routes * OUT]);
+            }
             context.enqueue(1);
             let order = context
                 .routes
@@ -311,6 +352,58 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Experts<2688, 1024, 88>>("verification up 4 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 reuse including sort", sample::<2688, 1024, 3, 88>);
+                group.bench_sample("W4A16 shared experts", sample::<2688, 1024, 7, 88>);
+                group.bench_sample("NVFP4 shared experts", sample::<2688, 1024, 5, 88>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<2688, 1024, 1, 88>,
+                );
+            });
+            runner.group::<Experts<1024, 2688, 88>>("verification down 4 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 reuse including sort", sample::<1024, 2688, 3, 88>);
+                group.bench_sample("W4A16 shared experts", sample::<1024, 2688, 7, 88>);
+                group.bench_sample("NVFP4 shared experts", sample::<1024, 2688, 5, 88>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<1024, 2688, 1, 88>,
+                );
+            });
+            runner.group::<Experts<2688, 1024, 704>>("suffix up 32 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 including sort", sample::<2688, 1024, 2, 704>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<2688, 1024, 1, 704>,
+                );
+            });
+            runner.group::<Experts<1024, 2688, 704>>("suffix down 32 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 including sort", sample::<1024, 2688, 2, 704>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<1024, 2688, 1, 704>,
+                );
+            });
+            runner.group::<Experts<2688, 1024, 1056>>("suffix up 48 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 including sort", sample::<2688, 1024, 2, 1056>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<2688, 1024, 1, 1056>,
+                );
+            });
+            runner.group::<Experts<1024, 2688, 1056>>("suffix down 48 tokens x 22", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("W4A16 including sort", sample::<1024, 2688, 2, 1056>);
+                group.bench_sample(
+                    "NVFP4 including quantization and sort",
+                    sample::<1024, 2688, 1, 1056>,
+                );
+            });
             runner.group::<Experts<2688, 1024, 2816>>("Nemotron 3.5 up 128 tokens x 22", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample(

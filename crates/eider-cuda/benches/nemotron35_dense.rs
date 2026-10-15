@@ -315,8 +315,13 @@ fn main() {
             });
             runner.group::<Dense<5376, 4096, 4>>("Verification shared up 4 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
-                g.bench_sample("per-row NVFP4 weights", sample::<5376, 4096, 3, 0, 4>);
+                g.bench_sample("reused NVFP4 weights", sample::<5376, 4096, 3, 0, 4>);
                 g.bench_sample("prepared NVFP4 weights", sample::<5376, 4096, 3, 4, 4>);
+            });
+            runner.group::<Dense<4096, 5376, 4>>("Verification shared down 4 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("reused NVFP4 weights", sample::<4096, 5376, 3, 0, 4>);
+                g.bench_sample("prepared NVFP4 weights", sample::<4096, 5376, 3, 4, 4>);
             });
             runner.group::<Dense<512, 4096, 4>>("Verification router 4 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);

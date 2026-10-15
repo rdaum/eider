@@ -20595,24 +20595,25 @@ mod tests {
     #[test]
     fn ragged_gqa_attention_matches_independent_sequence_reference() {
         const SEQUENCES: usize = 2;
-        const TOKENS: usize = 5;
         const Q_HEADS: usize = 4;
         const KV_HEADS: usize = 2;
-        const MAX_TOKENS: usize = 6;
-        const PAGE_TOKENS: usize = 4;
-        for head_dim in [8, 128] {
+        const MAX_TOKENS: usize = 32;
+        const PAGE_TOKENS: usize = 16;
+        for (head_dim, tokens, offsets, lengths, starts) in [
+            (8, 37, [0u32, 17], [17u32, 20], [15u32, 7]),
+            (128, 37, [0, 17], [17, 20], [15, 7]),
+            (128, 5, [0, 2], [2, 3], [3, 3]),
+            (128, 9, [0, 4], [4, 5], [3, 7]),
+        ] {
             let kv_width = KV_HEADS * head_dim;
             let query_width = Q_HEADS * head_dim;
-            let offsets = [0u32, 2];
-            let lengths = [2u32, 3];
-            let starts = [3u32, 3];
-            let query = (0..TOKENS * query_width)
+            let query = (0..tokens * query_width)
                 .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.0234375)
                 .collect::<Vec<_>>();
-            let key = (0..TOKENS * kv_width)
+            let key = (0..tokens * kv_width)
                 .map(|index| ((index * 17 % 53) as f32 - 26.0) * 0.01953125)
                 .collect::<Vec<_>>();
-            let value = (0..TOKENS * kv_width)
+            let value = (0..tokens * kv_width)
                 .map(|index| ((index * 19 % 59) as f32 - 29.0) * 0.015625)
                 .collect::<Vec<_>>();
             let mut expected_keys = (0..SEQUENCES)
@@ -20694,12 +20695,12 @@ mod tests {
                 &lengths_device,
                 &starts_device,
                 SEQUENCES,
-                TOKENS,
+                tokens,
                 kv_width,
                 &stream,
             )
             .expect("ragged KV append");
-            let mut actual = DeviceBuffer::zeroed(TOKENS * query_width).expect("output");
+            let mut actual = DeviceBuffer::zeroed(tokens * query_width).expect("output");
             ragged_gqa_attention_f32_into_on_stream(
                 &query_device,
                 &key_table,
@@ -20710,7 +20711,7 @@ mod tests {
                 &starts_device,
                 actual.output(),
                 SEQUENCES,
-                TOKENS,
+                tokens,
                 Q_HEADS,
                 KV_HEADS,
                 head_dim,
@@ -20790,14 +20791,14 @@ mod tests {
                 &lengths_device,
                 &starts_device,
                 SEQUENCES,
-                TOKENS,
+                tokens,
                 PAGE_TOKENS,
                 kv_width,
                 &stream,
             )
             .expect("ragged paged KV append");
             let mut paged_output =
-                DeviceBuffer::zeroed(TOKENS * query_width).expect("paged output");
+                DeviceBuffer::zeroed(tokens * query_width).expect("paged output");
             ragged_paged_gqa_attention_f32_into_on_stream(
                 &query_device,
                 &paged_keys,
@@ -20808,7 +20809,7 @@ mod tests {
                 &starts_device,
                 paged_output.output(),
                 SEQUENCES,
-                TOKENS,
+                tokens,
                 PAGE_TOKENS,
                 Q_HEADS,
                 KV_HEADS,

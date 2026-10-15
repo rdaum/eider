@@ -199,7 +199,9 @@ impl F32DenseGemm {
                     n: rows,
                     k: cols,
                 },
-                1 << 20,
+                // A larger allowance improves skinny FP8 plan selection on GB10,
+                // even when the selected plan needs no workspace.
+                if rows < 8 { 4 << 20 } else { 1 << 20 },
             )?);
         }
         unsafe {

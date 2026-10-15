@@ -25,7 +25,7 @@ add_default --max-context-tokens "${EIDER_MAX_CONTEXT_TOKENS:-1048576}"
 add_default --max-active-sequences 1
 add_default --decode-capacity 1
 add_default --prefill-sequence-capacity 1
-add_default --prefill-token-capacity "${EIDER_PREFILL_TOKEN_CAPACITY:-1024}"
+add_default --prefill-token-capacity "${EIDER_PREFILL_TOKEN_CAPACITY:-2048}"
 add_default --retained-prefix-gib 1
 speculative_drafts=0
 for arg in "${server_args[@]}"; do

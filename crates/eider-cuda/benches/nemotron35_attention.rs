@@ -193,6 +193,18 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Attention<6577, 1>>("decode at 6577", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<6577, 1, true>);
+            });
+            runner.group::<Attention<6577, 4>>("verification at 6577", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<6577, 4, true>);
+            });
+            runner.group::<Attention<13184, 4>>("verification at 13184", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<13184, 4, true>);
+            });
             runner.group::<Attention<0, 1>>("empty prefix", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
                     .bench_sample("paged", sample::<0, 1, true>);
@@ -204,12 +216,24 @@ fn main() {
             runner.group::<Attention<4096, 128>>("prefill 128 rows at 4K", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("serial reference", sample::<4096, 128, false>);
-                g.bench_sample("partitioned paged", sample::<4096, 128, true>);
+                g.bench_sample("paged", sample::<4096, 128, true>);
             });
             runner.group::<Attention<16384, 128>>("prefill 128 rows at 16K", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("serial reference", sample::<16384, 128, false>);
-                g.bench_sample("partitioned paged", sample::<16384, 128, true>);
+                g.bench_sample("paged", sample::<16384, 128, true>);
+            });
+            runner.group::<Attention<4992, 1024>>("suffix 1024 rows at 4992", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<4992, 1024, true>);
+            });
+            runner.group::<Attention<6016, 384>>("suffix 384 rows at 6016", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<6016, 384, true>);
+            });
+            runner.group::<Attention<127, 129>>("suffix crossing pages and query tiles", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("paged", sample::<127, 129, true>);
             });
         },
     );

@@ -921,12 +921,15 @@ impl Nemotron3MoeRowsWorkspace {
         let down_input_table = address_table(&routed_activated, routes, intermediate)?;
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
+        let use_nvfp4 = calibrated && rows >= 4;
         Ok(Self {
-            nvfp4: (calibrated && rows >= 128)
+            nvfp4: use_nvfp4
                 .then(|| Nemotron3Nvfp4MoeWorkspace::new(moe, rows, latent))
                 .transpose()?,
             router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
-            sorted_routes: (rows >= 16 || (rows > 1 && latent <= 3072 && intermediate <= 3072))
+            sorted_routes: (use_nvfp4
+                || rows >= 16
+                || (rows > 1 && latent <= 3072 && intermediate <= 3072))
                 .then(|| MoeSortedRoutes::new(routes, moe.routed_experts))
                 .transpose()?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,

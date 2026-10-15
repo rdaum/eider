@@ -6778,6 +6778,7 @@ __global__ void infer_ragged_paged_gqa_attention_f32_kernel(
 
 // Partition a head's causal range between warps. Only the final softmax merge
 // crosses warps; each partition retains FP32 queries, values, and accumulation.
+template <unsigned kWarps>
 __global__ void infer_ragged_paged_gqa_head128_f32_kernel(
     const float* query, const float* key_pool, const float* value_pool,
     const std::uint32_t* const* page_tables,
@@ -6785,7 +6786,6 @@ __global__ void infer_ragged_paged_gqa_head128_f32_kernel(
     const std::uint32_t* start_positions, float* output,
     std::uint32_t sequence_count, std::uint32_t page_tokens,
     std::uint32_t q_heads, std::uint32_t kv_heads) {
-    constexpr unsigned kWarps = 8;
     const unsigned row = blockIdx.x, head = blockIdx.y;
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     __shared__ unsigned sequence, local_row;
@@ -6838,6 +6838,109 @@ __global__ void infer_ragged_paged_gqa_head128_f32_kernel(
     }
 }
 
+// Share each paged K/V tile across sixty-four queries. Each lane scores one key,
+// then accumulates four output dimensions using the tile's FP32 softmax weights.
+__global__ void infer_ragged_paged_gqa_prefill_head128_f32_kernel(
+    const float* query, const float* key_pool, const float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets, const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions, float* output,
+    std::uint32_t page_tokens, std::uint32_t q_heads, std::uint32_t kv_heads) {
+    constexpr unsigned Queries = 8, Warps = 8, Rows = Queries * Warps;
+    const unsigned sequence = blockIdx.z, first_query = blockIdx.x * Rows;
+    const unsigned length = sequence_lengths[sequence];
+    if (first_query >= length) return;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned head = blockIdx.y, kv_head = head / (q_heads / kv_heads);
+    const unsigned start = start_positions[sequence], offset = sequence_offsets[sequence];
+    const unsigned end = start + min(first_query + Rows, length);
+    const auto* table = page_tables[sequence];
+    extern __shared__ float scratch[];
+    auto* keys = reinterpret_cast<float (*)[33]>(scratch);
+    auto* values = reinterpret_cast<float (*)[128]>(scratch + 128 * 33);
+    auto* queries = reinterpret_cast<float (*)[128]>(scratch + 128 * 33 + 32 * 128);
+    auto* weights = reinterpret_cast<float (*)[32]>(scratch + 128 * 33 + 32 * 128 + Rows * 128);
+    float maximum[Queries], sum[Queries] = {}, accum[Queries][4] = {};
+    #pragma unroll
+    for (unsigned n = 0; n < Queries; ++n) {
+        const unsigned local = first_query + warp + n * Warps;
+        const size_t base = (size_t(offset + local) * q_heads + head) * 128;
+        #pragma unroll
+        for (unsigned d = 0; d < 4; ++d)
+            queries[warp + n * Warps][lane + d * 32] =
+                local < length ? query[base + lane + d * 32] : 0;
+        maximum[n] = -INFINITY;
+    }
+    for (unsigned first_key = 0; first_key < end; first_key += 32) {
+        for (unsigned i = threadIdx.x; i < 32 * 128; i += blockDim.x) {
+            const unsigned token = first_key + i / 128, d = i % 128;
+            float key = 0, value = 0;
+            if (token < end) {
+                const size_t physical = size_t(table[token / page_tokens]) * page_tokens
+                    + token % page_tokens;
+                const size_t base = (physical * kv_heads + kv_head) * 128 + d;
+                key = key_pool[base];
+                value = value_pool[base];
+            }
+            keys[d][i / 128] = key;
+            values[i / 128][d] = value;
+        }
+        __syncthreads();
+        float dot[Queries] = {};
+        #pragma unroll
+        for (unsigned d = 0; d < 128; ++d) {
+            const float key = keys[d][lane];
+            #pragma unroll
+            for (unsigned n = 0; n < Queries; ++n)
+                dot[n] = fmaf(queries[warp + n * Warps][d], key, dot[n]);
+        }
+        #pragma unroll
+        for (unsigned n = 0; n < Queries; ++n) {
+            const unsigned local = first_query + warp + n * Warps;
+            const bool valid = local < length && first_key + lane <= start + local;
+            const float score = valid ? dot[n] * 0.08838834764831845f : -INFINITY;
+            float tile_max = score;
+            #pragma unroll
+            for (unsigned delta = 16; delta; delta >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, delta));
+            const float next_max = fmaxf(maximum[n], tile_max);
+            const float rescale = maximum[n] != -INFINITY ? expf(maximum[n] - next_max) : 0;
+            const float weight = valid ? expf(score - next_max) : 0;
+            weights[warp + n * Warps][lane] = weight;
+            float tile_sum = weight;
+            #pragma unroll
+            for (unsigned delta = 16; delta; delta >>= 1)
+                tile_sum += __shfl_xor_sync(0xffffffffu, tile_sum, delta);
+            sum[n] = sum[n] * rescale + tile_sum;
+            maximum[n] = next_max;
+            #pragma unroll
+            for (unsigned d = 0; d < 4; ++d) accum[n][d] *= rescale;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (unsigned t = 0; t < 32; ++t) {
+            #pragma unroll
+            for (unsigned d = 0; d < 4; ++d) {
+                const float value = values[t][lane + d * 32];
+                #pragma unroll
+                for (unsigned n = 0; n < Queries; ++n)
+                    accum[n][d] = fmaf(weights[warp + n * Warps][t], value, accum[n][d]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned n = 0; n < Queries; ++n) {
+        const unsigned local = first_query + warp + n * Warps;
+        if (local < length) {
+            const size_t base = (size_t(offset + local) * q_heads + head) * 128;
+            #pragma unroll
+            for (unsigned d = 0; d < 4; ++d)
+                output[base + lane + d * 32] = accum[n][d] / sum[n];
+        }
+    }
+}
+
 extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
     const float* query,
     const float* key_pool,
@@ -6862,11 +6965,34 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
         head_dim == 0 || head_dim > kThreads || q_heads % kv_heads != 0) {
         return cudaErrorInvalidValue;
     }
+    if (head_dim == 128 && total_tokens >= 32 && sequence_count <= 65535) {
+        constexpr unsigned kSharedBytes = (128 * 33 + 32 * 128 + 64 * (128 + 32)) * sizeof(float);
+        const auto status = cudaFuncSetAttribute(infer_ragged_paged_gqa_prefill_head128_f32_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+        if (status != cudaSuccess) return status;
+        infer_ragged_paged_gqa_prefill_head128_f32_kernel<<<
+            dim3((total_tokens - 1) / 64 + 1, q_heads, sequence_count), 256, kSharedBytes, stream>>>(
+            query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+            start_positions, output, page_tokens, q_heads, kv_heads);
+        return cudaGetLastError();
+    }
     const dim3 blocks(total_tokens, q_heads);
     if (head_dim == 128) {
-        infer_ragged_paged_gqa_head128_f32_kernel<<<blocks, kThreads, 0, stream>>>(
-            query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
-            start_positions, output, sequence_count, page_tokens, q_heads, kv_heads);
+        // Short decode and verification batches need more context parallelism
+        // within each head to fill the SMs.
+        if (uint64_t(total_tokens) * q_heads <= 32) {
+            infer_ragged_paged_gqa_head128_f32_kernel<32><<<blocks, 1024, 0, stream>>>(
+                query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+                start_positions, output, sequence_count, page_tokens, q_heads, kv_heads);
+        } else if (uint64_t(total_tokens) * q_heads <= 128) {
+            infer_ragged_paged_gqa_head128_f32_kernel<16><<<blocks, 512, 0, stream>>>(
+                query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+                start_positions, output, sequence_count, page_tokens, q_heads, kv_heads);
+        } else {
+            infer_ragged_paged_gqa_head128_f32_kernel<8><<<blocks, kThreads, 0, stream>>>(
+                query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+                start_positions, output, sequence_count, page_tokens, q_heads, kv_heads);
+        }
         return cudaGetLastError();
     }
 
@@ -13074,10 +13200,11 @@ __global__ void infer_nvfp4_w4a16_matvec_f32_reuse_weights_batch_kernel(
                 continue;
             }
             const float* input_row = input + batch * in_features;
-            acc[batch] = __fmaf_rn(input_row[col], w0, acc[batch]);
-            acc[batch] = __fmaf_rn(input_row[col + 1], w1, acc[batch]);
-            acc[batch] = __fmaf_rn(input_row[col + 2], w2, acc[batch]);
-            acc[batch] = __fmaf_rn(input_row[col + 3], w3, acc[batch]);
+            const float4 x = *reinterpret_cast<const float4*>(input_row + col);
+            acc[batch] = __fmaf_rn(x.x, w0, acc[batch]);
+            acc[batch] = __fmaf_rn(x.y, w1, acc[batch]);
+            acc[batch] = __fmaf_rn(x.z, w2, acc[batch]);
+            acc[batch] = __fmaf_rn(x.w, w3, acc[batch]);
         }
     }
 #pragma unroll
