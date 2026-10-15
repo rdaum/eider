@@ -20,7 +20,7 @@ use crate::laguna::LagunaModel;
 use crate::lfm2::Lfm2Model;
 use crate::ling3::Ling3Model;
 use crate::muse_glimmer::MuseGlimmerModel;
-use crate::nemotron3::Nemotron3Model;
+use crate::nemotron3::{NEMOTRON_OMNI_ARCHITECTURE, Nemotron3Manifest, Nemotron3Model};
 use crate::qwen3::qwen36::Qwen36TextModel;
 use crate::qwen38_flash_next::Qwen38FlashNextModel;
 use crate::step37::Step37TextModel;
@@ -65,6 +65,8 @@ pub enum CheckpointArchitecture {
 #[derive(Deserialize)]
 struct CheckpointConfig {
     model_type: String,
+    #[serde(default)]
+    architectures: Option<Vec<String>>,
 }
 
 /// Reads the checkpoint configuration and selects its execution family.
@@ -76,6 +78,16 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
     let config: CheckpointConfig = serde_json::from_str(&contents).map_err(|error| {
         InferenceError::Deployment(format!("failed to parse {}: {error}", path.display()))
     })?;
+    if config
+        .architectures
+        .iter()
+        .flatten()
+        .any(|name| name == NEMOTRON_OMNI_ARCHITECTURE)
+    {
+        Nemotron3Manifest::from_config_str(&contents)
+            .map_err(|error| InferenceError::Deployment(error.to_string()))?;
+        return Ok(CheckpointArchitecture::Nemotron3);
+    }
     match config.model_type.as_str() {
         "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),

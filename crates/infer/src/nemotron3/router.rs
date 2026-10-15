@@ -44,7 +44,7 @@ impl Nemotron3Router {
             checkpoint,
             manifest,
             moe,
-            &format!("backbone.layers.{layer}.mixer.gate"),
+            &manifest.tensor_name(&format!("backbone.layers.{layer}.mixer.gate")),
         )
     }
 
@@ -63,7 +63,7 @@ impl Nemotron3Router {
             checkpoint,
             manifest,
             manifest.mtp_moe_layer_config(layer)?,
-            &format!("mtp.layers.{layer}.mixer.gate"),
+            &manifest.tensor_name(&format!("mtp.layers.{layer}.mixer.gate")),
         )
     }
 
@@ -73,18 +73,19 @@ impl Nemotron3Router {
         moe: Nemotron3MoeLayerConfig,
         prefix: &str,
     ) -> Result<Self> {
+        let moe = manifest.resolve_moe_config(checkpoint, moe, prefix)?;
         let weight = load_bf16_host(
             checkpoint,
             &format!("{prefix}.weight"),
-            &[manifest.routed_experts, manifest.hidden_size],
+            &[moe.routed_experts, manifest.hidden_size],
         )?;
         let bias_name = format!("{prefix}.e_score_correction_bias");
         let bias_shard = checkpoint.open_shard_for_tensor(&bias_name)?;
         let bias_info = bias_shard.require_tensor(&bias_name)?;
-        if bias_info.dtype != "F32" || bias_info.shape != [manifest.routed_experts] {
+        if bias_info.dtype != "F32" || bias_info.shape != [moe.routed_experts] {
             return Err(Error::Shape {
                 label: "Nemotron 3 router correction bias",
-                expected: format!("F32 [{}]", manifest.routed_experts),
+                expected: format!("F32 [{}]", moe.routed_experts),
                 actual: format!("{} {:?}", bias_info.dtype, bias_info.shape),
             });
         }
@@ -99,12 +100,12 @@ impl Nemotron3Router {
 
     /// Allocates one route computation's scratch and output buffers.
     pub fn workspace(&self) -> Result<Nemotron3RouterWorkspace> {
-        Nemotron3RouterWorkspace::new(&self.manifest, self.moe)
+        Nemotron3RouterWorkspace::new(self.moe)
     }
 
     /// Allocates route scratch and outputs for a flattened set of rows.
     pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3RouterRowsWorkspace> {
-        Nemotron3RouterRowsWorkspace::new(&self.manifest, self.moe, rows)
+        Nemotron3RouterRowsWorkspace::new(self.moe, rows)
     }
 
     /// Computes one token's logical expert IDs and routing weights.
@@ -121,11 +122,12 @@ impl Nemotron3Router {
                 actual: format!("{} values", hidden.len()),
             });
         }
+        workspace.require_shape(self.moe)?;
         bf16_linear_logits_f32_into_on_stream(
             hidden,
             &self.weight,
             workspace.logits.output(),
-            self.manifest.routed_experts,
+            self.moe.routed_experts,
             self.manifest.hidden_size,
             stream,
         )?;
@@ -158,13 +160,13 @@ impl Nemotron3Router {
                 actual: format!("{} values", hidden.len()),
             });
         }
-        workspace.require_manifest(&self.manifest, self.moe, rows)?;
+        workspace.require_shape(self.moe, rows)?;
         bf16_linear_logits_f32_batch_into_on_stream(
             hidden,
             &self.weight,
             workspace.logits.output(),
             rows,
-            self.manifest.routed_experts,
+            self.moe.routed_experts,
             self.manifest.hidden_size,
             stream,
         )?;
@@ -197,11 +199,7 @@ pub struct Nemotron3RouterRowsWorkspace {
 }
 
 impl Nemotron3RouterRowsWorkspace {
-    pub(super) fn new(
-        manifest: &Nemotron3Manifest,
-        moe: Nemotron3MoeLayerConfig,
-        rows: usize,
-    ) -> Result<Self> {
+    pub(super) fn new(moe: Nemotron3MoeLayerConfig, rows: usize) -> Result<Self> {
         if rows == 0 {
             return Err(Error::Shape {
                 label: "Nemotron 3 router row workspace",
@@ -210,19 +208,14 @@ impl Nemotron3RouterRowsWorkspace {
             });
         }
         Ok(Self {
-            logits: DeviceBuffer::zeroed(rows * manifest.routed_experts)?,
+            logits: DeviceBuffer::zeroed(rows * moe.routed_experts)?,
             indices: DeviceBuffer::zeroed(rows * moe.experts_per_token)?,
             weights: DeviceBuffer::zeroed(rows * moe.experts_per_token)?,
         })
     }
 
-    fn require_manifest(
-        &self,
-        manifest: &Nemotron3Manifest,
-        moe: Nemotron3MoeLayerConfig,
-        rows: usize,
-    ) -> Result<()> {
-        if self.logits.len() == rows * manifest.routed_experts
+    fn require_shape(&self, moe: Nemotron3MoeLayerConfig, rows: usize) -> Result<()> {
+        if self.logits.len() == rows * moe.routed_experts
             && self.indices.len() == rows * moe.experts_per_token
             && self.weights.len() == rows * moe.experts_per_token
         {
@@ -263,11 +256,28 @@ pub struct Nemotron3RouterWorkspace {
 }
 
 impl Nemotron3RouterWorkspace {
-    pub(super) fn new(manifest: &Nemotron3Manifest, moe: Nemotron3MoeLayerConfig) -> Result<Self> {
+    pub(super) fn new(moe: Nemotron3MoeLayerConfig) -> Result<Self> {
         Ok(Self {
-            logits: DeviceBuffer::zeroed(manifest.routed_experts)?,
+            logits: DeviceBuffer::zeroed(moe.routed_experts)?,
             indices: DeviceBuffer::zeroed(moe.experts_per_token)?,
             weights: DeviceBuffer::zeroed(moe.experts_per_token)?,
+        })
+    }
+
+    fn require_shape(&self, moe: Nemotron3MoeLayerConfig) -> Result<()> {
+        if self.logits.len() == moe.routed_experts
+            && self.indices.len() == moe.experts_per_token
+            && self.weights.len() == moe.experts_per_token
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 router workspace",
+            expected: format!(
+                "{} experts and {} routes",
+                moe.routed_experts, moe.experts_per_token
+            ),
+            actual: "workspace belongs to another layer".to_string(),
         })
     }
 

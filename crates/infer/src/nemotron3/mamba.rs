@@ -65,7 +65,7 @@ impl Nemotron3MambaLayer {
                 detail: format!("layer {layer} is {}, not mamba", kind.as_str()),
             });
         }
-        let prefix = format!("backbone.layers.{layer}");
+        let prefix = manifest.tensor_name(&format!("backbone.layers.{layer}"));
         let mixer = format!("{prefix}.mixer");
         let hidden = manifest.hidden_size;
         let intermediate = manifest.mamba_intermediate_size();

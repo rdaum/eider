@@ -95,7 +95,7 @@ impl Nemotron3AttentionLayer {
                 detail: format!("layer {layer} is {}, not attention", kind.as_str()),
             });
         }
-        let prefix = format!("backbone.layers.{layer}");
+        let prefix = manifest.tensor_name(&format!("backbone.layers.{layer}"));
         Self::load_at_prefix(checkpoint, manifest, layer, &prefix, storage)
     }
 
@@ -115,7 +115,7 @@ impl Nemotron3AttentionLayer {
             checkpoint,
             manifest,
             layer,
-            &format!("mtp.layers.{layer}"),
+            &manifest.tensor_name(&format!("mtp.layers.{layer}")),
             storage,
         )
     }

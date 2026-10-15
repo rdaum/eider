@@ -70,7 +70,7 @@ impl Nemotron3MoeLayer {
             checkpoint,
             manifest,
             layer,
-            &format!("backbone.layers.{layer}"),
+            &manifest.tensor_name(&format!("backbone.layers.{layer}")),
             storage,
             false,
         )
@@ -92,7 +92,7 @@ impl Nemotron3MoeLayer {
             checkpoint,
             manifest,
             layer,
-            &format!("mtp.layers.{layer}"),
+            &manifest.tensor_name(&format!("mtp.layers.{layer}")),
             storage,
             true,
         )
@@ -116,6 +116,7 @@ impl Nemotron3MoeLayer {
             manifest.moe_layer_config(layer)?
         };
         let mixer = format!("{prefix}.mixer");
+        let moe = manifest.resolve_moe_config(checkpoint, moe, &format!("{mixer}.gate"))?;
         Ok(Self {
             layer,
             manifest: manifest.clone(),
@@ -144,7 +145,7 @@ impl Nemotron3MoeLayer {
                 latent,
                 storage,
             )?,
-            experts: Nemotron3ExpertSlab::load(checkpoint, manifest, moe, &mixer, latent)?,
+            experts: Nemotron3ExpertSlab::load(checkpoint, moe, &mixer, latent)?,
             shared_up: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.shared_experts.up_proj"),
@@ -342,12 +343,11 @@ struct Nemotron3ExpertSlab {
 impl Nemotron3ExpertSlab {
     fn load(
         checkpoint: &ModelOptCheckpoint,
-        manifest: &Nemotron3Manifest,
         moe: Nemotron3MoeLayerConfig,
         mixer: &str,
         latent: usize,
     ) -> Result<Self> {
-        let experts = manifest.routed_experts;
+        let experts = moe.routed_experts;
         let intermediate = moe.intermediate_size;
         let packed_stride = intermediate * latent / 2;
         let scale_stride = intermediate * latent / 16;
@@ -646,7 +646,7 @@ impl Nemotron3MoeRowsWorkspace {
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
-            router: Nemotron3RouterRowsWorkspace::new(manifest, moe, rows)?,
+            router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
             latent: latent_buffer,
             routed_up,
@@ -751,7 +751,7 @@ impl Nemotron3MoeWorkspace {
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
-            router: Nemotron3RouterWorkspace::new(manifest, moe)?,
+            router: Nemotron3RouterWorkspace::new(moe)?,
             normed: DeviceBuffer::zeroed(manifest.hidden_size)?,
             latent: DeviceBuffer::zeroed(latent)?,
             routed_up,

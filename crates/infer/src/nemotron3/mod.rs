@@ -6,6 +6,9 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+/// Multimodal wrapper used by Nemotron Super 3.5 VL and Bolt.
+pub const NEMOTRON_OMNI_ARCHITECTURE: &str = "NemotronH_Omni_Reasoning_V3";
+
 mod attention;
 mod execution;
 mod linear;
@@ -15,6 +18,9 @@ mod moe;
 mod mtp;
 mod router;
 mod sequence;
+
+#[cfg(test)]
+mod checkpoint_tests;
 
 pub use attention::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
@@ -55,10 +61,12 @@ pub enum Nemotron3LayerKind {
 
 /// Dimensions and routing count for one sparse MoE block.
 ///
-/// Nemotron 3 Super uses one shape for every MoE block, while Puzzle varies
-/// both values by layer.
+/// Nemotron 3 Super uses one shape for every MoE block. Other checkpoints can
+/// vary the width, routing count, and number of resident experts by layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nemotron3MoeLayerConfig {
+    /// Expert count, resolved from router metadata when the layer loads.
+    pub routed_experts: usize,
     /// Routed expert hidden width.
     pub intermediate_size: usize,
     /// Experts selected for each token.
@@ -103,6 +111,8 @@ impl Nemotron3LayerKind {
 /// Validated architecture description shared by Nemotron 3 checkpoints.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nemotron3Manifest {
+    /// Checkpoint namespace for the text model, including its trailing dot.
+    text_prefix: &'static str,
     /// Token vocabulary size.
     pub vocab_size: usize,
     /// Backbone hidden width.
@@ -234,8 +244,39 @@ impl Nemotron3Manifest {
 
     /// Parses and validates a Nemotron 3 Hugging Face configuration.
     pub fn from_config_str(contents: &str) -> Result<Self> {
-        let config: Nemotron3Config =
+        let root: serde_json::Value =
             serde_json::from_str(contents).map_err(|error| Error::Format {
+                label: "Nemotron 3 config json",
+                detail: error.to_string(),
+            })?;
+        let is_omni = root["architectures"]
+            .as_array()
+            .is_some_and(|architectures| {
+                architectures
+                    .iter()
+                    .any(|name| name.as_str() == Some(NEMOTRON_OMNI_ARCHITECTURE))
+            });
+        let text_config = if is_omni {
+            match (root.get("text_config"), root.get("llm_config")) {
+                (Some(text), Some(llm)) if text != llm => {
+                    return Err(Error::Format {
+                        label: "Nemotron Omni text configuration",
+                        detail: "conflicting text_config and llm_config".to_string(),
+                    });
+                }
+                (Some(text), _) | (_, Some(text)) if text.is_object() => text,
+                _ => {
+                    return Err(Error::Format {
+                        label: "Nemotron Omni text configuration",
+                        detail: "expected a text_config or llm_config object".to_string(),
+                    });
+                }
+            }
+        } else {
+            &root
+        };
+        let config: Nemotron3Config =
+            serde_json::from_value(text_config.clone()).map_err(|error| Error::Format {
                 label: "Nemotron 3 config json",
                 detail: error.to_string(),
             })?;
@@ -277,12 +318,14 @@ impl Nemotron3Manifest {
         let moe_layers = parse_moe_layers(
             &layers,
             config.block_configs.as_deref(),
+            config.n_routed_experts,
             config.moe_intermediate_size,
             config.num_experts_per_tok,
         )?;
         let mtp_moe_layers = parse_moe_layers(
             &mtp_layers,
             config.mtp_block_configs.as_deref(),
+            config.n_routed_experts,
             config.moe_intermediate_size,
             config.num_experts_per_tok,
         )?;
@@ -302,6 +345,7 @@ impl Nemotron3Manifest {
             "Nemotron 3 norm epsilon",
         )?;
         let manifest = Self {
+            text_prefix: if is_omni { "language_model." } else { "" },
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
             layers,
@@ -332,6 +376,44 @@ impl Nemotron3Manifest {
         };
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Resolves a text tensor name without changing the checkpoint index.
+    pub(super) fn tensor_name(&self, name: &str) -> String {
+        format!("{}{name}", self.text_prefix)
+    }
+
+    /// Reads the layer's expert count from its BF16 router before allocation.
+    pub(super) fn resolve_moe_config(
+        &self,
+        checkpoint: &ModelOptCheckpoint,
+        mut moe: Nemotron3MoeLayerConfig,
+        gate: &str,
+    ) -> Result<Nemotron3MoeLayerConfig> {
+        let tensor = format!("{gate}.weight");
+        let info = checkpoint.tensor_info(&tensor)?;
+        let valid_shape = info.shape.len() == 2 && info.shape[1] == self.hidden_size;
+        let experts = info.shape.first().copied().unwrap_or(0);
+        if info.dtype != "BF16"
+            || !valid_shape
+            || experts < moe.experts_per_token
+            || experts > self.routed_experts
+            || !experts.is_multiple_of(self.expert_groups)
+        {
+            return Err(Error::Shape {
+                label: "Nemotron 3 per-layer router",
+                expected: format!(
+                    "{tensor}: BF16 [experts, {}], {} <= experts <= {}, divisible by {} groups",
+                    self.hidden_size,
+                    moe.experts_per_token,
+                    self.routed_experts,
+                    self.expert_groups
+                ),
+                actual: format!("{} {:?}", info.dtype, info.shape),
+            });
+        }
+        moe.routed_experts = experts;
+        Ok(moe)
     }
 
     /// Returns the Mamba projected-state width before the output projection.
@@ -395,10 +477,13 @@ impl Nemotron3Manifest {
             "backbone.norm_f.weight",
             "lm_head.weight",
         ] {
-            require_tensor(checkpoint, tensor)?;
+            require_tensor(checkpoint, &self.tensor_name(tensor))?;
         }
         for (layer, kind) in self.layers.iter().copied().enumerate() {
-            require_tensor(checkpoint, &format!("backbone.layers.{layer}.norm.weight"))?;
+            require_tensor(
+                checkpoint,
+                &self.tensor_name(&format!("backbone.layers.{layer}.norm.weight")),
+            )?;
             match kind {
                 Nemotron3LayerKind::Mamba => self.validate_mamba_layer(checkpoint, layer)?,
                 Nemotron3LayerKind::Attention => {
@@ -560,7 +645,7 @@ impl Nemotron3Manifest {
     }
 
     fn validate_mamba_layer(&self, checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
-        let prefix = format!("backbone.layers.{layer}.mixer");
+        let prefix = self.tensor_name(&format!("backbone.layers.{layer}.mixer"));
         for suffix in [
             "A_log",
             "D",
@@ -581,7 +666,7 @@ impl Nemotron3Manifest {
         checkpoint: &ModelOptCheckpoint,
         layer: usize,
     ) -> Result<()> {
-        let prefix = format!("backbone.layers.{layer}.mixer");
+        let prefix = self.tensor_name(&format!("backbone.layers.{layer}.mixer"));
         for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
             require_tensor(checkpoint, &format!("{prefix}.{projection}.weight"))?;
         }
@@ -589,7 +674,7 @@ impl Nemotron3Manifest {
     }
 
     fn validate_moe_layer(&self, checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
-        let prefix = format!("backbone.layers.{layer}.mixer");
+        let prefix = self.tensor_name(&format!("backbone.layers.{layer}.mixer"));
         for suffix in [
             "gate.weight",
             "gate.e_score_correction_bias",
@@ -602,7 +687,12 @@ impl Nemotron3Manifest {
             require_tensor(checkpoint, &format!("{prefix}.fc1_latent_proj.weight"))?;
             require_tensor(checkpoint, &format!("{prefix}.fc2_latent_proj.weight"))?;
         }
-        for expert in 0..self.routed_experts {
+        let moe = self.resolve_moe_config(
+            checkpoint,
+            self.moe_layer_config(layer)?,
+            &format!("{prefix}.gate"),
+        )?;
+        for expert in 0..moe.routed_experts {
             require_tensor(
                 checkpoint,
                 &format!("{prefix}.experts.{expert}.up_proj.weight"),
@@ -640,6 +730,7 @@ fn parse_layers(
 fn parse_moe_layers(
     layers: &[Nemotron3LayerKind],
     block_configs: Option<&[Nemotron3BlockConfig]>,
+    routed_experts: usize,
     default_intermediate: Option<usize>,
     default_top_k: Option<usize>,
 ) -> Result<Vec<Option<Nemotron3MoeLayerConfig>>> {
@@ -688,6 +779,7 @@ fn parse_moe_layers(
                     detail: format!("missing num_experts_per_tok for layer {layer}"),
                 })?;
             Ok(Some(Nemotron3MoeLayerConfig {
+                routed_experts,
                 intermediate_size: intermediate,
                 experts_per_token,
             }))
@@ -798,6 +890,7 @@ mod tests {
         assert_eq!(
             manifest.moe_layer_config(1).expect("first MoE"),
             Nemotron3MoeLayerConfig {
+                routed_experts: 512,
                 intermediate_size: 1280,
                 experts_per_token: 4,
             }
@@ -805,6 +898,7 @@ mod tests {
         assert_eq!(
             manifest.moe_layer_config(4).expect("second MoE"),
             Nemotron3MoeLayerConfig {
+                routed_experts: 512,
                 intermediate_size: 2688,
                 experts_per_token: 18,
             }

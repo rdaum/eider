@@ -54,17 +54,17 @@ impl Nemotron3Mtp {
             manifest: manifest.clone(),
             embedding_norm: load_bf16_as_f32(
                 checkpoint,
-                "mtp.layers.0.enorm.weight",
+                &manifest.tensor_name("mtp.layers.0.enorm.weight"),
                 &[manifest.hidden_size],
             )?,
             hidden_norm: load_bf16_as_f32(
                 checkpoint,
-                "mtp.layers.0.hnorm.weight",
+                &manifest.tensor_name("mtp.layers.0.hnorm.weight"),
                 &[manifest.hidden_size],
             )?,
             fusion: Nemotron3Linear::load(
                 checkpoint,
-                "mtp.layers.0.eh_proj",
+                &manifest.tensor_name("mtp.layers.0.eh_proj"),
                 manifest.hidden_size,
                 2 * manifest.hidden_size,
                 storage,
@@ -73,7 +73,7 @@ impl Nemotron3Mtp {
             moe: Nemotron3MoeLayer::load_mtp(checkpoint, manifest, 1, storage)?,
             final_norm: load_bf16_as_f32(
                 checkpoint,
-                "mtp.layers.1.final_layernorm.weight",
+                &manifest.tensor_name("mtp.layers.1.final_layernorm.weight"),
                 &[manifest.hidden_size],
             )?,
         }))

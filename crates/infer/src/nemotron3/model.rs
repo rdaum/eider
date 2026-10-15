@@ -55,7 +55,7 @@ impl Nemotron3Model {
         info!(?storage, "selected Nemotron 3 dense-linear storage");
         let embedding = load_bf16(
             &checkpoint,
-            "backbone.embeddings.weight",
+            &manifest.tensor_name("backbone.embeddings.weight"),
             &[manifest.vocab_size, manifest.hidden_size],
         )?;
         let mut layers = Vec::with_capacity(manifest.layers.len());
@@ -88,12 +88,12 @@ impl Nemotron3Model {
         }
         let final_norm = load_bf16_as_f32(
             &checkpoint,
-            "backbone.norm_f.weight",
+            &manifest.tensor_name("backbone.norm_f.weight"),
             &[manifest.hidden_size],
         )?;
         let lm_head = Nemotron3Linear::load(
             &checkpoint,
-            "lm_head",
+            &manifest.tensor_name("lm_head"),
             manifest.vocab_size,
             manifest.hidden_size,
             storage,

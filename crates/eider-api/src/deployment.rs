@@ -1,5 +1,6 @@
 //! Supported-model resolution and immutable Hugging Face snapshot handling.
 
+use eider_inference::nemotron3::{NEMOTRON_OMNI_ARCHITECTURE, Nemotron3Manifest};
 use fs2::available_space;
 use futures::StreamExt;
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
@@ -290,6 +291,8 @@ pub struct ResolvedModel {
 #[derive(Deserialize)]
 struct CheckpointConfig {
     model_type: String,
+    #[serde(default)]
+    architectures: Option<Vec<String>>,
 }
 
 /// All reviewed models available through Eider's built-in catalogue.
@@ -722,9 +725,18 @@ fn checkpoint_model_type(checkpoint_dir: &Path) -> Result<String, String> {
     let path = checkpoint_dir.join("config.json");
     let contents = std::fs::read_to_string(&path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
-    serde_json::from_str::<CheckpointConfig>(&contents)
-        .map(|config| config.model_type)
-        .map_err(|error| format!("parse {}: {error}", path.display()))
+    let config: CheckpointConfig = serde_json::from_str(&contents)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if config
+        .architectures
+        .iter()
+        .flatten()
+        .any(|name| name == NEMOTRON_OMNI_ARCHITECTURE)
+    {
+        Nemotron3Manifest::from_config_str(&contents).map_err(|error| error.to_string())?;
+        return Ok("nemotron_h".to_string());
+    }
+    Ok(config.model_type)
 }
 
 fn validate_weight_index(checkpoint_dir: &Path) -> Result<(), String> {
@@ -1067,6 +1079,38 @@ mod tests {
         let resolved = resolve_local_model(fixture.path()).expect("resolve complete fixture");
         assert_eq!(resolved.preparation, ArtifactKind::None);
         assert!(resolved.artifact_dir.ends_with("none"));
+    }
+
+    #[test]
+    fn local_nemotron_omni_selects_the_text_runtime() {
+        let fixture = CheckpointFixture::new(NEMOTRON_OMNI_ARCHITECTURE, true);
+        std::fs::write(
+            fixture.path().join("config.json"),
+            include_str!("../../infer/src/nemotron3/fixtures/omni-config.json"),
+        )
+        .unwrap();
+        let resolved = resolve_local_model(fixture.path()).expect("resolve Omni text model");
+        assert_eq!(resolved.identity, "local-nemotron_h");
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(
+            eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
+            eider_inference::CheckpointArchitecture::Nemotron3,
+        );
+    }
+
+    #[test]
+    fn local_nemotron_omni_rejects_missing_text_config_before_loading_weights() {
+        let fixture = CheckpointFixture::new(NEMOTRON_OMNI_ARCHITECTURE, true);
+        let config = serde_json::json!({
+            "model_type": NEMOTRON_OMNI_ARCHITECTURE,
+            "architectures": [NEMOTRON_OMNI_ARCHITECTURE],
+        });
+        std::fs::write(fixture.path().join("config.json"), config.to_string()).unwrap();
+        assert!(
+            resolve_local_model(fixture.path())
+                .unwrap_err()
+                .contains("text configuration")
+        );
     }
 
     #[test]
