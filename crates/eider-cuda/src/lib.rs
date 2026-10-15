@@ -35,9 +35,11 @@ mod tensor;
 mod ternary_g64;
 
 pub use kernels::lfm2::{
-    lfm2_decode_inputs_on_stream, lfm2_dense_gemm_into_on_stream, lfm2_expert_gemm_into_on_stream,
-    lfm2_router_batch_into_on_stream, lfm2_router_into_on_stream,
-    lfm2_short_conv_batch_into_on_stream, lfm2_short_conv_into_on_stream,
+    Head64DecodeAttention, Lfm2DenseGemm, lfm2_decode_inputs_on_stream,
+    lfm2_dense_gemm_into_on_stream, lfm2_expert_gemm_into_on_stream,
+    lfm2_expert_gemm_pipelined_into_on_stream, lfm2_router_batch_into_on_stream,
+    lfm2_router_into_on_stream, lfm2_short_conv_batch_into_on_stream,
+    lfm2_short_conv_into_on_stream,
 };
 
 pub use bitnet::{

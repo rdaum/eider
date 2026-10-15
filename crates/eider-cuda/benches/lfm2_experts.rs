@@ -1,7 +1,7 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, MoeSortedRoutes,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Lfm2DenseGemm, MoeSortedRoutes,
     bf16_linear_logits_f32_batch_into_on_stream, lfm2_dense_gemm_into_on_stream,
-    lfm2_expert_gemm_into_on_stream,
+    lfm2_expert_gemm_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
 };
 use micromeasure::{
@@ -11,9 +11,8 @@ use micromeasure::{
 use std::time::Duration;
 
 const EXPERTS: usize = 64;
-const ROUTES: usize = 1024;
 
-struct Experts<const OUT: usize, const IN: usize> {
+struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -30,9 +29,25 @@ struct Experts<const OUT: usize, const IN: usize> {
     outputs: DeviceBuffer<DeviceAddress<f32>>,
 }
 
-impl<const OUT: usize, const IN: usize> Experts<OUT, IN> {
-    fn enqueue(&mut self, tensor: bool) {
-        if tensor {
+impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, ROUTES> {
+    fn enqueue(&mut self, mode: usize) {
+        if mode == 2 {
+            self.routes
+                .sort_on_stream(&self.indices, &self.stream)
+                .unwrap();
+            lfm2_expert_gemm_pipelined_into_on_stream(
+                &self.routes,
+                &self.inputs,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                &self.outputs,
+                OUT,
+                IN,
+                &self.stream,
+            )
+            .unwrap();
+        } else if mode == 1 {
             self.routes
                 .sort_on_stream(&self.indices, &self.stream)
                 .expect("sort");
@@ -66,7 +81,9 @@ impl<const OUT: usize, const IN: usize> Experts<OUT, IN> {
     }
 }
 
-impl<const OUT: usize, const IN: usize> BenchContext for Experts<OUT, IN> {
+impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
+    for Experts<OUT, IN, ROUTES>
+{
     fn prepare(_: usize) -> Self {
         let weights = (0..EXPERTS)
             .map(|expert| {
@@ -155,13 +172,13 @@ impl<const OUT: usize, const IN: usize> BenchContext for Experts<OUT, IN> {
         // populated workspace reused at a smaller active length.
         for routes in [ROUTES, 1, 7, 9, 67, ROUTES] {
             context.routes.set_routes(routes).expect("active routes");
-            context.enqueue(false);
+            context.enqueue(0);
             let reference = context
                 .output
                 .copy_to_host(&context.stream)
                 .expect("reference")
                 .to_vec();
-            context.enqueue(true);
+            context.enqueue(1);
             let actual = context
                 .output
                 .copy_to_host(&context.stream)
@@ -172,6 +189,14 @@ impl<const OUT: usize, const IN: usize> BenchContext for Experts<OUT, IN> {
                     "route count {routes}, element {i}: tensor={a}, SIMT={b}"
                 );
             }
+            let tensor = actual.to_vec();
+            context.enqueue(2);
+            let prepared = context.output.copy_to_host(&context.stream).unwrap();
+            assert_eq!(
+                &prepared[..routes * OUT],
+                &tensor[..routes * OUT],
+                "pipelined arithmetic"
+            );
         }
         context
     }
@@ -180,8 +205,8 @@ impl<const OUT: usize, const IN: usize> BenchContext for Experts<OUT, IN> {
     }
 }
 
-fn sample<const OUT: usize, const IN: usize, const TENSOR: bool>(
-    context: &mut Experts<OUT, IN>,
+fn sample<const OUT: usize, const IN: usize, const MODE: usize, const ROUTES: usize>(
+    context: &mut Experts<OUT, IN, ROUTES>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -190,7 +215,7 @@ fn sample<const OUT: usize, const IN: usize, const TENSOR: bool>(
         .record_on_stream(&context.stream)
         .expect("start");
     for _ in 0..count {
-        context.enqueue(TENSOR);
+        context.enqueue(MODE);
     }
     context
         .stop
@@ -208,6 +233,7 @@ fn sample<const OUT: usize, const IN: usize, const TENSOR: bool>(
     ))
 }
 struct Dense<const OUT: usize, const IN: usize> {
+    gemm: Lfm2DenseGemm,
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -216,8 +242,22 @@ struct Dense<const OUT: usize, const IN: usize> {
     output: DeviceBuffer<f32>,
 }
 impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
-    fn enqueue(&mut self, tensor: bool, rows: usize) {
-        let run = if tensor {
+    fn enqueue(&mut self, mode: usize, rows: usize) {
+        if mode == 2 {
+            self.gemm
+                .run_on_stream(
+                    &self.input,
+                    &self.weight,
+                    self.output.output(),
+                    rows,
+                    OUT,
+                    IN,
+                    &self.stream,
+                )
+                .unwrap();
+            return;
+        }
+        let run = if mode == 1 {
             lfm2_dense_gemm_into_on_stream
         } else {
             bf16_linear_logits_f32_batch_into_on_stream
@@ -237,6 +277,7 @@ impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
 impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
     fn prepare(_: usize) -> Self {
         let mut context = Self {
+            gemm: Lfm2DenseGemm::new(256, OUT.max(IN)).unwrap(),
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
             stop: CudaEvent::new().unwrap(),
@@ -255,19 +296,21 @@ impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
             output: DeviceBuffer::zeroed(256 * OUT).unwrap(),
         };
         for rows in [256, 1, 7, 9, 67] {
-            context.enqueue(false, rows);
+            context.enqueue(0, rows);
             let reference = context
                 .output
                 .copy_to_host(&context.stream)
                 .unwrap()
                 .to_vec();
-            context.enqueue(true, rows);
-            let actual = context.output.copy_to_host(&context.stream).unwrap();
-            for (&a, &b) in actual.iter().zip(&reference).take(rows * OUT) {
-                assert!(
-                    a.is_finite() && (a - b).abs() < 2e-4 + b.abs() * 2e-5,
-                    "{a} vs {b}"
-                );
+            for mode in [1, 2] {
+                context.enqueue(mode, rows);
+                let actual = context.output.copy_to_host(&context.stream).unwrap();
+                for (&a, &b) in actual.iter().zip(&reference).take(rows * OUT) {
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 2e-4 + b.abs() * 2e-5,
+                        "{a} vs {b}"
+                    );
+                }
             }
         }
         context
@@ -276,14 +319,14 @@ impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
         Some(1)
     }
 }
-fn dense_sample<const OUT: usize, const IN: usize, const TENSOR: bool>(
+fn dense_sample<const OUT: usize, const IN: usize, const MODE: usize>(
     context: &mut Dense<OUT, IN>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
     context.start.record_on_stream(&context.stream).unwrap();
     for _ in 0..count {
-        context.enqueue(TENSOR, 256);
+        context.enqueue(MODE, 256);
     }
     context.stop.record_on_stream(&context.stream).unwrap();
     context.stop.synchronize().unwrap();
@@ -308,25 +351,39 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Experts<1536, 2048, 4096>>("LFM2 gate or up 4096 routes", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("tensor including sort", sample::<1536, 2048, 1, 4096>);
+                group.bench_sample("pipelined tiles", sample::<1536, 2048, 2, 4096>);
+            });
+            runner.group::<Experts<2048, 1536, 4096>>("LFM2 down 4096 routes", |group| {
+                let group = group.measurement_domain(MeasurementDomain::Gpu);
+                group.bench_sample("tensor including sort", sample::<2048, 1536, 1, 4096>);
+                group.bench_sample("pipelined tiles", sample::<2048, 1536, 2, 4096>);
+            });
             runner.group::<Dense<6144, 2048>>("LFM2 convolution projection", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("SIMT", dense_sample::<6144, 2048, false>);
-                group.bench_sample("tensor", dense_sample::<6144, 2048, true>);
+                group.bench_sample("SIMT", dense_sample::<6144, 2048, 0>);
+                group.bench_sample("tensor", dense_sample::<6144, 2048, 1>);
+                group.bench_sample("cuBLAS components", dense_sample::<6144, 2048, 2>);
             });
             runner.group::<Dense<2048, 11776>>("LFM2 dense FFN down", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("SIMT", dense_sample::<2048, 11776, false>);
-                group.bench_sample("tensor", dense_sample::<2048, 11776, true>);
+                group.bench_sample("SIMT", dense_sample::<2048, 11776, 0>);
+                group.bench_sample("tensor", dense_sample::<2048, 11776, 1>);
+                group.bench_sample("cuBLAS components", dense_sample::<2048, 11776, 2>);
             });
-            runner.group::<Experts<1536, 2048>>("LFM2 gate or up", |group| {
+            runner.group::<Experts<1536, 2048, 1024>>("LFM2 gate or up", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("SIMT", sample::<1536, 2048, false>);
-                group.bench_sample("tensor including sort", sample::<1536, 2048, true>);
+                group.bench_sample("SIMT", sample::<1536, 2048, 0, 1024>);
+                group.bench_sample("tensor including sort", sample::<1536, 2048, 1, 1024>);
+                group.bench_sample("pipelined tiles", sample::<1536, 2048, 2, 1024>);
             });
-            runner.group::<Experts<2048, 1536>>("LFM2 down", |group| {
+            runner.group::<Experts<2048, 1536, 1024>>("LFM2 down", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("SIMT", sample::<2048, 1536, false>);
-                group.bench_sample("tensor including sort", sample::<2048, 1536, true>);
+                group.bench_sample("SIMT", sample::<2048, 1536, 0, 1024>);
+                group.bench_sample("tensor including sort", sample::<2048, 1536, 1, 1024>);
+                group.bench_sample("pipelined tiles", sample::<2048, 1536, 2, 1024>);
             });
         },
     );

@@ -1,6 +1,6 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, cached_gqa_attention_f32_indexed_into_on_stream,
-    prefill_gqa_attention_f32_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, Head64DecodeAttention,
+    cached_gqa_attention_f32_indexed_into_on_stream, prefill_gqa_attention_f32_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -12,7 +12,7 @@ const Q_HEADS: usize = 32;
 const KV_HEADS: usize = 8;
 const DIM: usize = 64;
 
-struct Attention<const PREFIX: usize, const ROWS: usize> {
+struct Attention<const PREFIX: usize, const ROWS: usize, const SPLIT: bool = false> {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -21,11 +21,23 @@ struct Attention<const PREFIX: usize, const ROWS: usize> {
     value: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
     length: DeviceBuffer<u32>,
+    split: Head64DecodeAttention,
 }
 
-impl<const PREFIX: usize, const ROWS: usize> Attention<PREFIX, ROWS> {
+impl<const PREFIX: usize, const ROWS: usize, const SPLIT: bool> Attention<PREFIX, ROWS, SPLIT> {
     fn enqueue(&mut self) {
-        if ROWS == 1 {
+        if SPLIT {
+            self.split
+                .run_on_stream(
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    &self.length,
+                    self.output.output(),
+                    &self.stream,
+                )
+                .expect("split decode");
+        } else if ROWS == 1 {
             cached_gqa_attention_f32_indexed_into_on_stream(
                 &self.query,
                 &self.key,
@@ -57,7 +69,9 @@ impl<const PREFIX: usize, const ROWS: usize> Attention<PREFIX, ROWS> {
     }
 }
 
-impl<const PREFIX: usize, const ROWS: usize> BenchContext for Attention<PREFIX, ROWS> {
+impl<const PREFIX: usize, const ROWS: usize, const SPLIT: bool> BenchContext
+    for Attention<PREFIX, ROWS, SPLIT>
+{
     fn prepare(_: usize) -> Self {
         let values = |len, factor| {
             (0..len)
@@ -75,6 +89,7 @@ impl<const PREFIX: usize, const ROWS: usize> BenchContext for Attention<PREFIX, 
             key: DeviceBuffer::from_host(&k).expect("key"),
             value: DeviceBuffer::from_host(&v).expect("value"),
             output: DeviceBuffer::zeroed(q.len()).expect("output"),
+            split: Head64DecodeAttention::new(PREFIX + ROWS, Q_HEADS, KV_HEADS).unwrap(),
             length: DeviceBuffer::from_host(&[(PREFIX + ROWS) as u32]).expect("length"),
         };
         context.enqueue();
@@ -126,8 +141,8 @@ impl<const PREFIX: usize, const ROWS: usize> BenchContext for Attention<PREFIX, 
     }
 }
 
-fn sample<const PREFIX: usize, const ROWS: usize>(
-    context: &mut Attention<PREFIX, ROWS>,
+fn sample<const PREFIX: usize, const ROWS: usize, const SPLIT: bool>(
+    context: &mut Attention<PREFIX, ROWS, SPLIT>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -169,6 +184,26 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Attention<14983, 1>>("LFM2 decode long", |group| {
+                group
+                    .measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("context14984", sample);
+            });
+            runner.group::<Attention<14983, 1, true>>("LFM2 split decode long", |group| {
+                group
+                    .measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("context14984", sample);
+            });
+            runner.group::<Attention<4863, 1, true>>("LFM2 split decode", |group| {
+                group
+                    .measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("context4864", sample);
+            });
+            runner.group::<Attention<14728, 256>>("LFM2 prefill long suffix", |group| {
+                group
+                    .measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("rows256_context14984", sample);
+            });
             runner.group::<Attention<4863, 1>>("LFM2 decode", |group| {
                 group
                     .measurement_domain(MeasurementDomain::Gpu)

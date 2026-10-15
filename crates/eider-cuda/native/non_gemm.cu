@@ -6736,6 +6736,9 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t infer_lfm2_prefill_attention_on_stream(
+    const float*, const float*, const float*, float*, unsigned, unsigned, unsigned, unsigned, cudaStream_t);
+
 extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* query,
                                                              const float* key_cache,
                                                              const float* value_cache,
@@ -6755,9 +6758,8 @@ extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* qu
 
     const dim3 blocks(tokens, q_heads);
     if (head_dim == 64) {
-        infer_gqa_attention_head64_f32_kernel<false><<<blocks, kThreads, 0, stream>>>(
-            query, key_cache, value_cache, output, nullptr, start_position, q_heads, kv_heads);
-        return cudaGetLastError();
+        return infer_lfm2_prefill_attention_on_stream(
+            query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, stream);
     }
     infer_prefill_gqa_attention_f32_kernel<<<
         blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(

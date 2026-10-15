@@ -36,7 +36,7 @@ API requests use `eider-lfm2.5-24b-a2b`. Both `/v1/responses` and
 starts a reasoning section. Tool calls use the LFM function-list protocol.
 The parser accepts literal arguments and never evaluates generated code.
 
-The catalogue defaults to 32,768 context tokens and prompt chunks of 256 tokens.
+The catalogue defaults to 32,768 context tokens and prompt chunks of 1,024 tokens.
 The checkpoint permits 131,072 tokens. Attention uses F32 KV storage, so longer
 contexts increase memory use. Prefix snapshots retain both convolution state and attention history.
 The cache retains chunk boundaries and the prompt before its final token.
@@ -46,17 +46,22 @@ storage. LRU eviction enforces `--retained-prefix-gib`; zero disables retention.
 
 ## Implementation boundary
 
-Prefill groups routes by expert and multiplies eight rows per tensor-core tile.
+Prefill groups routes by expert and multiplies sixteen rows per tensor-core tile.
 The kernel reads the original NVFP4 weight and scale tables without expanding
 the resident weights. It applies each projection's global scale before SiLU.
 F32 activations are split into three BF16 components for tensor-core products.
-Separate accumulators limit rounding error. Dense BF16 prefill projections use
-the same arithmetic. Prefill scratch and route-sorting storage are reusable.
+Separate accumulators limit rounding error. Asynchronous copies overlap compressed
+weight, scale, and activation loads with computation. Most dense BF16 projections
+use cached cuBLASLt plans with three activation components. The two long dense
+FFN reductions retain the kernel with four high-component accumulators.
+Prefill scratch and route-sorting storage are reusable.
 
-Head-64 attention divides KV rows among eight warps, then merges their softmax
-sums. It uses F32 queries, keys, values, and accumulators.
+Head-64 prefill attention shares K/V tiles across 64 queries. Each warp computes
+eight queries and reuses its loads. Decode partitions KV rows across GPU blocks,
+then merges their softmax sums. Queries, keys, values, and accumulators remain F32.
 Decode captures one CUDA graph per active sequence. Device inputs select the
 next token, RoPE position, and valid KV length on each replay.
+Single-token prefill uses this decode graph too.
 Graph lifetimes retain the model and sequence buffers they reference.
 Speculative decoding is not implemented.
 
@@ -66,8 +71,8 @@ and [Transformers implementation](https://github.com/huggingface/transformers/bl
 
 ## Correctness checks
 
-The small fixture and full-checkpoint reference tests pass with maximum
-absolute logit error below `2e-4`. They cover sequential execution, batched
+The small fixture and 128-token full-checkpoint reference tests pass with
+maximum absolute logit error below `2e-4`. They cover sequential execution, batched
 chunks, graph replay, and prefix restoration after the source request advances.
 The fixture also covers cache eviction and disabled retention.
 Offline catalogue startup, reasoning separation, and tool-call round trips
@@ -122,36 +127,34 @@ cargo bench -p eider-cuda --bench lfm2_experts
 
 ## Request timings
 
-Measured on GB10 with the pinned checkpoint, greedy sampling, one request at a
-time, and an 8,192-token context limit. Each binary served one cold request
-and one repeat. Model loading is excluded. The prompt has 4,864 tokens;
-the completion limit is 96 tokens. Both versions use batched prefill, decode
-graphs, and the prefix cache. Request timings exclude profiler instrumentation.
+Measured on GB10 with the pinned checkpoint, greedy sampling, and one request at
+a time. Each fresh server handled one cold request and one repeat, with a
+96-token completion limit. Model loading and profiler instrumentation are excluded.
+The baseline is commit `4b310f2`, which already had batched prefill, graphs, and
+prefix caching. Current runs use the catalogue's 1,024-token prompt chunks.
 
-| Measurement | Before kernel changes | Current |
-| --- | ---: | ---: |
-| Prefill throughput | 172 tok/s | 684 tok/s |
-| Decode throughput | 14.77 tok/s | 52.63 tok/s |
-| Cold time to first token | 28.35 s | 7.14 s |
-| Cold total request time | 34.79 s | 8.95 s |
-| Repeated-prompt time to first token | 0.089 s | 0.065 s |
-| Repeated-prompt total request time | 6.52 s | 1.87 s |
+| Prompt | Baseline prefill | Current prefill | Baseline decode | Current decode |
+| --- | ---: | ---: | ---: | ---: |
+| 4,864 tokens | 684 tok/s | 1,908 tok/s | 52.63 tok/s | 61.38 tok/s |
+| 14,984 tokens | 525 tok/s | 1,729 tok/s | 36.07 tok/s | 56.39 tok/s |
 
-The repeated request restored 4,863 prompt tokens. All 96 generated tokens
-matched the baseline on both requests. The completion limit truncates reasoning
-in this timing workload. Separate API checks validate final answers, tool-call
-round trips, streaming, output limits, and cancellation.
+Cold time to first token fell from 7.14 to 2.56 seconds at 5K, and from 28.59 to
+8.71 seconds at 15K. Repeated-prompt time to first token was 36 ms and 71 ms,
+respectively. Each repeat restored all but the final prompt token.
 
-The original GPU trace showed serial attention and repeated expert matrix-vector
-products as the main costs. At this context, the head-64 attention microbenchmark
-improved from 2.88 to 0.22 ms for decode. Its final 256-row prefill chunk improved
-from 82.6 to 9.46 ms. Grouped expert projections improved from about 7.4 to
-1.5–1.7 ms per projection, including route sorting. These kernel measurements
-use synthetic inputs; the request table measures the full runtime.
+The 15K run generated the same 96 tokens as the baseline. Cold and repeated
+requests also matched. The completion limit truncates reasoning in this timing
+workload. A separate long-context suffix request restored 14,336 tokens and
+processed 656 new tokens at 1,255 tok/s. Its first token arrived in 574 ms, and
+its completed answer correctly identified the kestrel and the eastward stream.
 
-Run the same workload against a freshly started server:
+See [the performance analysis](lfm2-performance.md) for hardware ceilings,
+rejected experiments, numerical checks, and remaining costs.
+
+Run the workload against a freshly started server:
 
 ```sh
 python3 scripts/lfm2-request-bench.py --repetitions 220 \
   --output /tmp/lfm2-request-timing.json
+# Use --repetitions 680 for the 14,984-token prompt.
 ```

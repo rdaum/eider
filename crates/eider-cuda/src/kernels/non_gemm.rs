@@ -19929,6 +19929,8 @@ mod tests {
         let decode_q = DeviceBuffer::from_host(&query[..Q * D]).unwrap();
         let mut output = DeviceBuffer::zeroed(3 * Q * D + 1).unwrap();
         let mut decode_output = DeviceBuffer::zeroed(Q * D).unwrap();
+        let mut split = crate::Head64DecodeAttention::new(CAPACITY, Q, KV).unwrap();
+        let mut split_output = DeviceBuffer::zeroed(Q * D).unwrap();
         let mut length = DeviceBuffer::from_host(&[1u32]).unwrap();
         let stream = CudaStream::new_non_blocking().unwrap();
         let graph = stream
@@ -19944,7 +19946,8 @@ mod tests {
                     KV,
                     D,
                     &stream,
-                )
+                )?;
+                split.run_on_stream(&decode_q, &k, &v, &length, split_output.output(), &stream)
             })
             .unwrap();
         for prefix in [0, 1, 6, 7, 8, 255, 5120] {
@@ -19983,7 +19986,17 @@ mod tests {
             length.copy_from_host(&[(prefix + 1) as u32]).unwrap();
             graph.launch(&stream).unwrap();
             let decoded = decode_output.copy_to_host(&stream).unwrap();
-            assert_eq!(&decoded[..], &actual[..Q * D]);
+            let partitioned = split_output.copy_to_host(&stream).unwrap();
+            for (index, (&a, &b)) in decoded.iter().zip(partitioned.iter()).enumerate() {
+                assert!(
+                    (a - actual[index]).abs() < 2e-5,
+                    "prefill/decode at {prefix}/{index}"
+                );
+                assert!(
+                    (a - b).abs() < 2e-5 && b.is_finite(),
+                    "partition merge at {prefix}/{index}: {a} vs {b}"
+                );
+            }
         }
     }
 

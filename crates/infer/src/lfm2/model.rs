@@ -1,8 +1,8 @@
 use super::config::{Lfm2Config, invalid};
 use crate::execution::kv_cache::{LayerKvCache, LayerKvCacheCheckpoint};
 use eider_cuda::{
-    CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Result, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Head64DecodeAttention, Result,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
     fill_f32_into_on_stream, lfm2_decode_inputs_on_stream, lfm2_router_into_on_stream,
     lfm2_short_conv_into_on_stream, moe_weighted_accumulate_slot_addresses_f32_on_stream,
@@ -232,6 +232,7 @@ pub struct Lfm2Sequence<'model> {
     token: DeviceBuffer<u32>,
     device_position: DeviceBuffer<u32>,
     cache_len: DeviceBuffer<u32>,
+    split_attention: Option<Head64DecodeAttention>,
     layers: Vec<LayerState>,
     position: usize,
     capacity: usize,
@@ -393,6 +394,15 @@ impl Lfm2Model {
             token: DeviceBuffer::zeroed(1)?,
             device_position: DeviceBuffer::zeroed(1)?,
             cache_len: DeviceBuffer::zeroed(1)?,
+            split_attention: if c.head_dim() == 64 {
+                Some(Head64DecodeAttention::new(
+                    capacity,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                )?)
+            } else {
+                None
+            },
             layers,
             position: 0,
             capacity,
@@ -617,14 +627,24 @@ impl Lfm2Model {
                             s.capacity - 1,
                             stream,
                         )?;
-                        cache.decode_attention_indexed_into_on_stream(
-                            &s.q_rope,
-                            s.mixed.output(),
-                            &s.cache_len,
-                            s.capacity,
-                            c.num_attention_heads,
-                            stream,
-                        )?;
+                        if let Some(attention) = &mut s.split_attention {
+                            cache.decode_attention_partitioned_into_on_stream(
+                                attention,
+                                &s.q_rope,
+                                s.mixed.output(),
+                                &s.cache_len,
+                                stream,
+                            )?;
+                        } else {
+                            cache.decode_attention_indexed_into_on_stream(
+                                &s.q_rope,
+                                s.mixed.output(),
+                                &s.cache_len,
+                                s.capacity,
+                                c.num_attention_heads,
+                                stream,
+                            )?;
+                        }
                     } else {
                         rope_neox_f32_into_on_stream(
                             c.num_attention_heads,
@@ -819,6 +839,10 @@ impl Lfm2Sequence<'_> {
             + self.token.device_bytes()
             + self.device_position.device_bytes()
             + self.cache_len.device_bytes()
+            + self
+                .split_attention
+                .as_ref()
+                .map_or(0, Head64DecodeAttention::device_bytes)
             + self.indices.device_bytes()
             + self.next_id.device_bytes()
             + [

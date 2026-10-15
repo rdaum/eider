@@ -1,8 +1,137 @@
-//! LFM2 gated short convolution and sigmoid expert routing.
+//! LFM2 projections, gated short convolution, routing, and head-64 attention.
 
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
-use crate::{DeviceAddress, Error, MoeSortedRoutes, Result};
+use crate::{Bf16TnMatmulPlan, CublasLt, DeviceAddress, Error, GemmShape, MoeSortedRoutes, Result};
+use std::collections::HashMap;
 use std::ffi::c_void;
+
+unsafe extern "C" {
+    fn infer_lfm2_split_bf16_on_stream(
+        input: *const f32,
+        parts: *mut u16,
+        count: u32,
+        stride: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn infer_lfm2_sum_parts_on_stream(
+        parts: *const f32,
+        output: *mut f32,
+        count: u32,
+        stride: u32,
+        stream: *mut c_void,
+    ) -> i32;
+}
+
+/// Reusable dense projections with three BF16 components per F32 activation.
+pub struct Lfm2DenseGemm {
+    lt: CublasLt,
+    plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
+    input: DeviceBuffer<u16>,
+    products: DeviceBuffer<f32>,
+    capacity: usize,
+    features: usize,
+}
+
+impl Lfm2DenseGemm {
+    /// Allocates scratch for the largest input/output width and prompt chunk.
+    pub fn new(capacity: usize, features: usize) -> Result<Self> {
+        let count = capacity
+            .checked_next_power_of_two()
+            .and_then(|rows| rows.checked_mul(features))
+            .and_then(|n| n.checked_mul(3));
+        if capacity == 0 || features == 0 || count.is_none_or(|n| n > u32::MAX as usize) {
+            return Err(Error::Format {
+                label: "LFM2 dense GEMM",
+                detail: "invalid workspace dimensions".into(),
+            });
+        }
+        Ok(Self {
+            lt: CublasLt::new()?,
+            plans: HashMap::new(),
+            input: DeviceBuffer::zeroed(count.unwrap())?,
+            products: DeviceBuffer::zeroed(count.unwrap())?,
+            capacity,
+            features,
+        })
+    }
+
+    /// Projects active rows, preserving F32 activation residuals in three products.
+    /// Plans are cached by matrix shape and power-of-two row count. The first
+    /// call for each shape creates its plan outside CUDA graph capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u16>,
+        mut output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > self.capacity
+            || out == 0
+            || cols == 0
+            || out > self.features
+            || cols > self.features
+            || input.len() < rows * cols
+            || output.len() < rows * out
+            || out.checked_mul(cols) != Some(weight.len())
+        {
+            return Err(Error::Format {
+                label: "LFM2 dense GEMM",
+                detail: "invalid projection dimensions or buffers".into(),
+            });
+        }
+        // Power-of-two row buckets bound the plan cache across prompt lengths.
+        let padded_rows = rows.next_power_of_two();
+        let shape = (out, cols, padded_rows);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.plans.entry(shape) {
+            entry.insert(Bf16TnMatmulPlan::new(
+                &self.lt,
+                GemmShape {
+                    m: out,
+                    n: 3 * padded_rows,
+                    k: cols,
+                },
+                1 << 20,
+            )?);
+        }
+        let plan = &self.plans[&shape];
+        unsafe {
+            check_cuda(
+                "infer_lfm2_split_bf16_on_stream",
+                infer_lfm2_split_bf16_on_stream(
+                    input.ptr,
+                    self.input.ptr,
+                    (rows * cols) as u32,
+                    (padded_rows * cols) as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        plan.run_on_stream(
+            &self.lt,
+            weight,
+            &self.input,
+            self.products.output(),
+            stream,
+        )?;
+        unsafe {
+            check_cuda(
+                "infer_lfm2_sum_parts_on_stream",
+                infer_lfm2_sum_parts_on_stream(
+                    self.products.ptr,
+                    output.buffer_mut().ptr,
+                    (rows * out) as u32,
+                    (padded_rows * out) as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+}
 
 unsafe extern "C" {
     fn infer_lfm2_short_conv_on_stream(
@@ -291,9 +420,23 @@ unsafe extern "C" {
         in_features: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn infer_lfm2_expert_gemm_pipelined_on_stream(
+        sorted_routes: *const u32,
+        offsets: *const u32,
+        inputs: *const *const f32,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        globals: *const f32,
+        outputs: *const *mut f32,
+        routes: u32,
+        experts: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
-/// Groups eight routes per tensor-core tile, retaining F32 activation precision.
+/// Groups sixteen routes per tensor-core tile, retaining F32 activation precision.
 /// Weight tables contain row-major ModelOpt NVFP4 and K16 UE4M3 scales. Each
 /// route's input and output addresses must cover the declared feature counts.
 #[allow(clippy::too_many_arguments)]
@@ -331,6 +474,62 @@ pub fn lfm2_expert_gemm_into_on_stream(
         check_cuda(
             "infer_lfm2_expert_gemm_on_stream",
             infer_lfm2_expert_gemm_on_stream(
+                routes.sorted_routes().as_const_ptr().cast(),
+                routes.expert_offsets().as_const_ptr().cast(),
+                inputs.ptr.cast(),
+                weights.ptr.cast(),
+                scales.ptr.cast(),
+                globals.ptr,
+                outputs.ptr.cast(),
+                routes.active_routes() as u32,
+                experts as u32,
+                out_features as u32,
+                in_features as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Pipelines compressed weight tiles for sixteen routes, retaining F32 activations.
+/// Source vectors must be 16-byte aligned when K is divisible by 64.
+/// Weight tables contain row-major ModelOpt NVFP4 and K16 UE4M3 scales. Each
+/// route's input and output addresses must cover the declared feature counts.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm2_expert_gemm_pipelined_into_on_stream(
+    routes: &MoeSortedRoutes,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    scales: &DeviceBuffer<DeviceAddress<u8>>,
+    globals: &DeviceBuffer<f32>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let experts = weights.len();
+    if experts == 0
+        || experts > 1024
+        || scales.len() != experts
+        || globals.len() != experts
+        || routes.expert_offsets().len() != experts + 1
+        || inputs.len() < routes.active_routes()
+        || outputs.len() < routes.active_routes()
+        || out_features == 0
+        || out_features > u32::MAX as usize - 63
+        || in_features == 0
+        || in_features > u32::MAX as usize
+        || !in_features.is_multiple_of(16)
+    {
+        return Err(Error::Format {
+            label: "LFM2 grouped expert GEMM",
+            detail: "expected matching route and expert tables, positive dimensions and K divisible by 16".into(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_lfm2_expert_gemm_pipelined_on_stream",
+            infer_lfm2_expert_gemm_pipelined_on_stream(
                 routes.sorted_routes().as_const_ptr().cast(),
                 routes.expert_offsets().as_const_ptr().cast(),
                 inputs.ptr.cast(),
@@ -406,9 +605,171 @@ pub fn lfm2_dense_gemm_into_on_stream(
     }
 }
 
+unsafe extern "C" {
+    fn infer_lfm2_decode_attention_on_stream(
+        query: *const f32,
+        key: *const f32,
+        value: *const f32,
+        length: *const u32,
+        partial: *mut f32,
+        output: *mut f32,
+        q_heads: u32,
+        kv_heads: u32,
+        partitions: u32,
+        stream: *mut c_void,
+    ) -> i32;
+}
+
+/// Reusable partial softmax storage for F32 head-64 decode attention.
+pub struct Head64DecodeAttention {
+    partial: DeviceBuffer<f32>,
+    capacity: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    partitions: usize,
+}
+impl Head64DecodeAttention {
+    /// Allocates F32 softmax partials for a fixed cache capacity and head layout.
+    pub fn new(capacity: usize, q_heads: usize, kv_heads: usize) -> Result<Self> {
+        if capacity == 0
+            || capacity > u32::MAX as usize - 63
+            || q_heads == 0
+            || q_heads > 65535
+            || kv_heads == 0
+            || !q_heads.is_multiple_of(kv_heads)
+        {
+            return Err(Error::Format {
+                label: "head-64 decode attention",
+                detail: "expected positive capacity and query heads divisible by KV heads".into(),
+            });
+        }
+        let partitions = capacity.div_ceil(256).min(32);
+        Ok(Self {
+            partial: DeviceBuffer::zeroed(q_heads * partitions * 66)?,
+            capacity,
+            q_heads,
+            kv_heads,
+            partitions,
+        })
+    }
+    /// Returns the bytes owned by the partial-reduction buffer.
+    pub fn device_bytes(&self) -> usize {
+        self.partial.device_bytes()
+    }
+    /// The device length must be in `1..=capacity` at execution time.
+    pub fn run_on_stream(
+        &mut self,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        length: &DeviceBuffer<u32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if query.len() != self.q_heads * 64
+            || output.len() != query.len()
+            || key.len() < self.capacity * self.kv_heads * 64
+            || value.len() < key.len()
+            || length.len() != 1
+        {
+            return Err(Error::Format {
+                label: "head-64 decode attention",
+                detail: "query, cache, length or output does not match the workspace".into(),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_lfm2_decode_attention_on_stream",
+                infer_lfm2_decode_attention_on_stream(
+                    query.ptr,
+                    key.ptr,
+                    value.ptr,
+                    length.ptr,
+                    self.partial.ptr,
+                    output.buffer_mut().ptr,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.partitions as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn lfm2_expert_all_finite_scales_and_packed_codes() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        for cols in [16, 64, 128] {
+            let rows = 127 * 256 + 1;
+            let mut packed = vec![0u8; rows * cols / 2];
+            let scales = (0..rows * cols / 16)
+                .map(|i| ((i / (cols / 16) / 256).min(126)) as u8)
+                .collect::<Vec<_>>();
+            for row in 0..rows {
+                packed[row * cols / 2] = (row % 256) as u8;
+            }
+            let weight = DeviceBuffer::from_host(&packed).unwrap();
+            let scale = DeviceBuffer::from_host(&scales).unwrap();
+            let weights = DeviceBuffer::from_host(&[weight.cuda_address()]).unwrap();
+            let scale_table = DeviceBuffer::from_host(&[scale.cuda_address()]).unwrap();
+            let global = DeviceBuffer::from_host(&[1.0f32]).unwrap();
+            let indices = DeviceBuffer::from_host(&[0u32]).unwrap();
+            let mut routes = MoeSortedRoutes::new(1, 1).unwrap();
+            routes.sort_on_stream(&indices, &stream).unwrap();
+            let output = DeviceBuffer::<f32>::zeroed(rows).unwrap();
+            let outputs = DeviceBuffer::from_host(&[output.cuda_address()]).unwrap();
+            let values = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            for nibble in 0..2 {
+                let mut input = vec![0.0f32; cols];
+                input[nibble] = 1.0;
+                let input = DeviceBuffer::from_host(&input).unwrap();
+                let inputs = DeviceBuffer::from_host(&[input.cuda_address()]).unwrap();
+                for kernel in [
+                    lfm2_expert_gemm_into_on_stream,
+                    lfm2_expert_gemm_pipelined_into_on_stream,
+                ] {
+                    kernel(
+                        &routes,
+                        &inputs,
+                        &weights,
+                        &scale_table,
+                        &global,
+                        &outputs,
+                        rows,
+                        cols,
+                        &stream,
+                    )
+                    .unwrap();
+                    let actual = output.copy_to_host(&stream).unwrap();
+                    for (row, &value) in actual.iter().enumerate() {
+                        let code = (row % 256) >> (nibble * 4) & 15;
+                        let scale = (row / 256).min(126);
+                        let exponent = (scale >> 3) as i32;
+                        let mantissa = (scale & 7) as f32;
+                        let scale = if exponent == 0 {
+                            mantissa * 2.0f32.powi(-9)
+                        } else {
+                            (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+                        };
+                        let sign = if code & 8 == 0 { 1.0 } else { -1.0 };
+                        assert_eq!(
+                            value,
+                            sign * values[code & 7] * scale,
+                            "packed byte {}, scale {}, nibble {nibble}",
+                            row % 256,
+                            row / 256
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     #[serial_test::serial]

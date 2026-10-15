@@ -2,9 +2,9 @@
 
 use super::*;
 use eider_cuda::{
-    CudaEvent, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
+    CudaEvent, Lfm2DenseGemm, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, lfm2_dense_gemm_into_on_stream,
-    lfm2_expert_gemm_into_on_stream, lfm2_router_batch_into_on_stream,
+    lfm2_expert_gemm_pipelined_into_on_stream, lfm2_router_batch_into_on_stream,
     lfm2_short_conv_batch_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream,
     rope_neox_sequence_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
@@ -13,6 +13,7 @@ use eider_cuda::{
 pub struct Lfm2PrefillWorkspace<'model> {
     model: &'model Lfm2Model,
     capacity: usize,
+    dense_gemm: Lfm2DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
     upload_done: CudaEvent,
@@ -52,7 +53,20 @@ impl Bf16Linear {
         output: &mut DeviceBuffer<f32>,
         rows: usize,
         stream: &CudaStream,
+        gemm: &mut Lfm2DenseGemm,
     ) -> Result<()> {
+        // Long reductions retain four high-component accumulators.
+        if rows >= 16 && self.rows >= 512 && self.cols <= 4096 {
+            return gemm.run_on_stream(
+                input,
+                &self.weight,
+                output.output(),
+                rows,
+                self.rows,
+                self.cols,
+                stream,
+            );
+        }
         lfm2_dense_gemm_into_on_stream(
             input,
             &self.weight,
@@ -73,7 +87,7 @@ impl ExpertProjection {
         outputs: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
-        lfm2_expert_gemm_into_on_stream(
+        lfm2_expert_gemm_pipelined_into_on_stream(
             routes,
             inputs,
             &self.weights,
@@ -105,6 +119,7 @@ impl Lfm2Model {
         Ok(Lfm2PrefillWorkspace {
             model: self,
             capacity,
+            dense_gemm: Lfm2DenseGemm::new(capacity, (h * 3).max(c.intermediate_size))?,
             host_tokens: PinnedHostBuffer::zeroed(capacity)?,
             tokens: DeviceBuffer::zeroed(capacity)?,
             upload_done: CudaEvent::new()?,
@@ -155,6 +170,9 @@ impl Lfm2Model {
             || tokens.iter().any(|&t| t as usize >= self.config.vocab_size)
         {
             return Err(invalid("invalid prefill model, state, tokens or capacity"));
+        }
+        if rows == 1 {
+            return self.decode(s, tokens[0]);
         }
         s.valid = false;
         self.prefill_inner(w, s, tokens)?;
@@ -209,7 +227,7 @@ impl Lfm2Model {
                     },
                     LayerState::Conv(state),
                 ) => {
-                    input.run_rows(&w.normalized, &mut w.bcx, rows, stream)?;
+                    input.run_rows(&w.normalized, &mut w.bcx, rows, stream, &mut w.dense_gemm)?;
                     lfm2_short_conv_batch_into_on_stream(
                         &w.bcx,
                         weight,
@@ -220,7 +238,7 @@ impl Lfm2Model {
                         rows,
                         stream,
                     )?;
-                    output.run_rows(&w.mixed, &mut w.projected, rows, stream)?;
+                    output.run_rows(&w.mixed, &mut w.projected, rows, stream, &mut w.dense_gemm)?;
                 }
                 (
                     Mixer::Attention {
@@ -233,9 +251,9 @@ impl Lfm2Model {
                     },
                     LayerState::Attention(cache),
                 ) => {
-                    q.run_rows(&w.normalized, &mut w.q, rows, stream)?;
-                    k.run_rows(&w.normalized, &mut w.k, rows, stream)?;
-                    v.run_rows(&w.normalized, &mut w.v, rows, stream)?;
+                    q.run_rows(&w.normalized, &mut w.q, rows, stream, &mut w.dense_gemm)?;
+                    k.run_rows(&w.normalized, &mut w.k, rows, stream, &mut w.dense_gemm)?;
+                    v.run_rows(&w.normalized, &mut w.v, rows, stream, &mut w.dense_gemm)?;
                     rms_norm_f32_into_on_stream(
                         rows * c.num_attention_heads,
                         c.head_dim(),
@@ -283,7 +301,7 @@ impl Lfm2Model {
                         c.num_attention_heads,
                         stream,
                     )?;
-                    output.run_rows(&w.mixed, &mut w.projected, rows, stream)?;
+                    output.run_rows(&w.mixed, &mut w.projected, rows, stream, &mut w.dense_gemm)?;
                 }
                 _ => return Err(invalid("mismatched prefill state")),
             }
@@ -305,8 +323,20 @@ impl Lfm2Model {
             )?;
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    gate.run_rows(&w.normalized, &mut w.dense_gate, rows, stream)?;
-                    up.run_rows(&w.normalized, &mut w.dense_up, rows, stream)?;
+                    gate.run_rows(
+                        &w.normalized,
+                        &mut w.dense_gate,
+                        rows,
+                        stream,
+                        &mut w.dense_gemm,
+                    )?;
+                    up.run_rows(
+                        &w.normalized,
+                        &mut w.dense_up,
+                        rows,
+                        stream,
+                        &mut w.dense_gemm,
+                    )?;
                     silu_mul_f32_prefix_into_on_stream(
                         &w.dense_gate,
                         &w.dense_up,
@@ -314,12 +344,23 @@ impl Lfm2Model {
                         rows * c.intermediate_size,
                         stream,
                     )?;
-                    down.run_rows(&w.dense_act, &mut w.projected, rows, stream)?;
+                    down.run_rows(
+                        &w.dense_act,
+                        &mut w.projected,
+                        rows,
+                        stream,
+                        &mut w.dense_gemm,
+                    )?;
                 }
                 Ffn::Moe(moe) => {
                     let groups = rows * c.num_experts_per_tok;
-                    moe.router
-                        .run_rows(&w.normalized, &mut w.router, rows, stream)?;
+                    moe.router.run_rows(
+                        &w.normalized,
+                        &mut w.router,
+                        rows,
+                        stream,
+                        &mut w.dense_gemm,
+                    )?;
                     lfm2_router_batch_into_on_stream(
                         &w.router,
                         &moe.bias,

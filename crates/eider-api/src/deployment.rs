@@ -69,7 +69,7 @@ const CATALOGUE: &[ModelSpec] = &[
         defaults: ServingDefaults {
             served_model_name: "eider-lfm2.5-24b-a2b",
             max_context_tokens: 32_768,
-            prefill_token_capacity: 256,
+            prefill_token_capacity: 1_024,
             step_expert_capacity: 240,
         },
     },
@@ -686,7 +686,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
-                "lfm2_moe" => 256,
+                "lfm2_moe" => 1_024,
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
                 "qwen3_8_flash_next" => 512,
@@ -921,9 +921,10 @@ mod tests {
         assert_eq!(spec.revision, "2d61270a276c320af204143d3d73e524f9ef44d2");
         assert_eq!(spec.model_type, "lfm2_moe");
         assert_eq!(spec.artifact_kind, ArtifactKind::None);
+        assert_eq!(spec.defaults.prefill_token_capacity, 1_024);
         let fixture = CheckpointFixture::new("lfm2_moe", true);
         let resolved = resolve_local_model(fixture.path()).unwrap();
-        assert_eq!(resolved.defaults.prefill_token_capacity, 256);
+        assert_eq!(resolved.defaults.prefill_token_capacity, 1_024);
     }
 
     #[test]

@@ -204,6 +204,7 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
             }
         }
         let mut token_budget = self.config.prefill_token_capacity;
+        let prefix_interval = self.config.prefill_token_capacity;
         let mut sequence_budget = self.config.prefill_sequence_capacity;
         for (&id, r) in &mut self.requests {
             let Some(s) = r.sequence.as_mut() else {
@@ -220,14 +221,14 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
             let boundary = if self.prefixes.enabled() && r.position < target {
                 // Hybrid state can resume only at a retained endpoint. Keep
                 // regular checkpoints as well as the final prompt prefix.
-                ((r.position / 256 + 1) * 256).min(target)
+                ((r.position / prefix_interval + 1) * prefix_interval).min(target)
             } else {
                 r.prompt.len()
             };
             let end = boundary.min(r.position + token_budget);
             self.model
                 .prefill(&mut self.prefill, s, &r.prompt[r.position..end])?;
-            if self.prefixes.enabled() && (end == target || end.is_multiple_of(256)) {
+            if self.prefixes.enabled() && (end == target || end.is_multiple_of(prefix_interval)) {
                 self.prefixes.retain(self.model, s, &r.prompt[..end])?;
             }
             token_budget -= end - r.position;

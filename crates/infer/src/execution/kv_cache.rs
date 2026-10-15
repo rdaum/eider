@@ -477,6 +477,23 @@ impl LayerKvCache {
         )
     }
 
+    pub(crate) fn decode_attention_partitioned_into_on_stream(
+        &self,
+        workspace: &mut eider_cuda::Head64DecodeAttention,
+        query: &DeviceBuffer<f32>,
+        output: DeviceOutput<'_, f32>,
+        cache_len: &DeviceBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if self.head_dim != 64 {
+            return Err(Error::Format {
+                label: "partitioned KV attention",
+                detail: "requires head dimension 64".into(),
+            });
+        }
+        workspace.run_on_stream(query, &self.key, &self.value, cache_len, output, stream)
+    }
+
     /// Runs causal grouped-query attention for a contiguous prefill chunk.
     pub fn prefill_attention_into(
         &self,
