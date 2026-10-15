@@ -3246,6 +3246,18 @@ unsafe extern "C" {
         in_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_sm121_w4a16_dense_batch_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        scales: *const u8,
+        global: *const f32,
+        output: *mut f32,
+        rows: u32,
+        out: u32,
+        input_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_quantize_fp8_e4m3_f32_on_stream(
         input: *const f32,
         output: *mut u8,

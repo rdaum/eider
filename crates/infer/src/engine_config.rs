@@ -18,6 +18,8 @@ pub struct InferenceEngineConfig {
     pub dflash_gguf: Option<PathBuf>,
     /// Optional Qwen DFlash2 directory.
     pub dflash2_dir: Option<PathBuf>,
+    /// Optional Nemotron LiLiCorr companion directory.
+    pub lilicorr_dir: Option<PathBuf>,
     /// Request scheduling limits.
     pub scheduler: SchedulerConfig,
     /// Logical prefix-retention policy.
@@ -48,6 +50,7 @@ impl InferenceEngineConfig {
             artifact_dir: model_dir.join(".eider-cache"),
             dflash_gguf: None,
             dflash2_dir: None,
+            lilicorr_dir: None,
             model_dir,
             scheduler: SchedulerConfig::default(),
             sequence_cache: SequenceCacheConfig::default(),

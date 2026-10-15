@@ -177,6 +177,66 @@ impl Sampler {
     pub fn next_gpu_draw(&mut self) -> f32 {
         self.rng.random::<f32>()
     }
+
+    /// Verifies a token drawn from a sparse proposal distribution against the
+    /// request's filtered target distribution. A rejection samples from
+    /// `max(p - q, 0)`; accepted tokens retain the target distribution as well.
+    pub fn verify_sparse_draft(
+        &mut self,
+        logits: &[f32],
+        history: &TokenHistory,
+        draft: u32,
+        candidate_ids: &[u32],
+        proposal_probabilities: &[f32],
+    ) -> Result<(SampledToken, bool)> {
+        if candidate_ids.is_empty()
+            || candidate_ids.len() != proposal_probabilities.len()
+            || candidate_ids
+                .iter()
+                .enumerate()
+                .any(|(i, id)| *id as usize >= logits.len() || candidate_ids[..i].contains(id))
+            || proposal_probabilities
+                .iter()
+                .any(|p| !p.is_finite() || *p < 0.0 || *p > 1.0)
+            || (proposal_probabilities.iter().sum::<f32>() - 1.0).abs() > 1e-4
+        {
+            return Err(Error::Format {
+                label: "speculative proposal",
+                detail: "expected unique vocabulary IDs and normalized probabilities".into(),
+            });
+        }
+        let Some(index) = candidate_ids.iter().position(|&id| id == draft) else {
+            return Err(Error::Format {
+                label: "speculative proposal",
+                detail: "draft token is absent from its proposal distribution".into(),
+            });
+        };
+        let q = proposal_probabilities[index];
+        if q <= 0.0 {
+            return Err(Error::Format {
+                label: "speculative proposal",
+                detail: "draft token has zero proposal probability".into(),
+            });
+        }
+        let mut target = weighted_candidates(logits, self.config, history)?;
+        let total = target.iter().map(|(_, p)| p).sum::<f32>();
+        let target_draft = target.iter().find(|(c, _)| c.id == draft);
+        let p = target_draft.map_or(0.0, |(_, p)| p / total);
+        if p >= q || self.rng.random::<f32>() < p / q {
+            return Ok((
+                to_sampled(target_draft.expect("positive accepted probability").0),
+                true,
+            ));
+        }
+        for (candidate, probability) in &mut target {
+            let q = candidate_ids
+                .iter()
+                .position(|&id| id == candidate.id)
+                .map_or(0.0, |i| proposal_probabilities[i]);
+            *probability = (*probability / total - q).max(0.0);
+        }
+        Ok((sample_weighted(&target, &mut self.rng)?, false))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -193,6 +253,18 @@ pub fn sample_next_token<R: Rng + ?Sized>(
     history: &TokenHistory,
     rng: &mut R,
 ) -> Result<SampledToken> {
+    let weighted = weighted_candidates(logits, config, history)?;
+    if config.temperature == 0.0 || config.top_k == 1 {
+        return Ok(to_sampled(weighted[0].0));
+    }
+    sample_weighted(&weighted, rng)
+}
+
+fn weighted_candidates(
+    logits: &[f32],
+    config: SamplingConfig,
+    history: &TokenHistory,
+) -> Result<Vec<(Candidate, f32)>> {
     config.validate()?;
     let candidates = logits
         .iter()
@@ -217,7 +289,7 @@ pub fn sample_next_token<R: Rng + ?Sized>(
             .into_iter()
             .min_by(candidate_order)
             .expect("finite candidates are non-empty");
-        return Ok(to_sampled(best));
+        return Ok(vec![(best, 1.0)]);
     }
     let mut candidates = candidates;
     if config.top_k > 0 && config.top_k < candidates.len() {
@@ -253,11 +325,27 @@ pub fn sample_next_token<R: Rng + ?Sized>(
         .position(|sum| sum >= config.top_p)
         .map_or(weighted.len(), |index| index + 1);
     weighted.truncate(cutoff.max(1));
+    Ok(weighted)
+}
 
+fn sample_weighted<R: Rng + ?Sized>(
+    weighted: &[(Candidate, f32)],
+    rng: &mut R,
+) -> Result<SampledToken> {
     let retained = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+    if !retained.is_finite() || retained <= 0.0 {
+        return Err(Error::Format {
+            label: "sampling probabilities",
+            detail: "no positive residual probability mass".into(),
+        });
+    }
     let mut draw = rng.random::<f32>() * retained;
-    let fallback = weighted.last().expect("nucleus retains one candidate").0;
-    for (candidate, weight) in weighted {
+    let fallback = weighted
+        .iter()
+        .rfind(|(_, weight)| *weight > 0.0)
+        .expect("positive retained mass")
+        .0;
+    for &(candidate, weight) in weighted {
         if draw < weight {
             return Ok(to_sampled(candidate));
         }
@@ -399,6 +487,79 @@ mod tests {
                 ..SamplingConfig::default()
             }
             .supports_gpu_sampling(MAX_TOP_K)
+        );
+    }
+
+    #[test]
+    fn sparse_rejection_preserves_target_distribution() {
+        let config = SamplingConfig {
+            temperature: 1.,
+            top_k: 0,
+            top_p: 1.,
+            seed: Some(9821),
+            ..SamplingConfig::default()
+        };
+        let mut sampler = Sampler::new(config).unwrap();
+        let logits = [0.1_f32.ln(), 0.4_f32.ln(), 0.5_f32.ln()];
+        let history = TokenHistory::default();
+        let mut counts = [0usize; 3];
+        let mut accepted = 0;
+        const TRIALS: usize = 50_000;
+        for _ in 0..TRIALS {
+            let draft = u32::from(sampler.next_gpu_draw() >= 0.7);
+            let (sample, keep) = sampler
+                .verify_sparse_draft(&logits, &history, draft, &[0, 1], &[0.7, 0.3])
+                .unwrap();
+            counts[sample.id as usize] += 1;
+            accepted += usize::from(keep);
+        }
+        for (count, p) in counts.into_iter().zip([0.1, 0.4, 0.5]) {
+            assert!((count as f64 / TRIALS as f64 - p).abs() < 0.008);
+        }
+        assert!((accepted as f64 / TRIALS as f64 - 0.4).abs() < 0.008);
+    }
+
+    #[test]
+    fn sparse_rejection_uses_target_penalties_and_nucleus_filter() {
+        let config = SamplingConfig {
+            temperature: 1.,
+            top_k: 2,
+            top_p: 0.6,
+            presence_penalty: 2.,
+            frequency_penalty: 1.,
+            seed: Some(51),
+        };
+        let history = TokenHistory::from_tokens([0, 0]);
+        let mut sampler = Sampler::new(config).unwrap();
+        // Penalized token zero is excluded; nucleus retains only token one.
+        for _ in 0..10 {
+            let (sample, accepted) = sampler
+                .verify_sparse_draft(&[4., 3., 1.], &history, 0, &[0], &[1.])
+                .unwrap();
+            assert!(!accepted);
+            assert_eq!(sample.id, 1);
+        }
+        assert_eq!(history.tokens(), &[0, 0]);
+    }
+
+    #[test]
+    fn sparse_proposals_require_unique_ids_and_positive_sample_probability() {
+        let mut sampler = Sampler::new(SamplingConfig::default()).unwrap();
+        let history = TokenHistory::default();
+        assert!(
+            sampler
+                .verify_sparse_draft(&[0., 1.], &history, 0, &[0, 0], &[0.5, 0.5])
+                .is_err()
+        );
+        assert!(
+            sampler
+                .verify_sparse_draft(&[0., 1.], &history, 0, &[0, 1], &[0., 1.])
+                .is_err()
+        );
+        assert!(
+            sampler
+                .verify_sparse_draft(&[0., 1.], &history, 0, &[0], &[0.5])
+                .is_err()
         );
     }
 }

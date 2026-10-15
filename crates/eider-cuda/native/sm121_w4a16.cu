@@ -286,6 +286,81 @@ cudaError_t launch_routed(
 
 }  // namespace
 
+namespace {
+// Each MMA column consumes a different activation row. Reuse the decoded
+// weight fragment across eight rows, retaining the routed kernel's K reduction.
+template <unsigned Warps>
+__global__ __launch_bounds__(Warps * 32) void dense_w4a16_batch_kernel(
+    const float* __restrict__ input,
+    const std::uint8_t* __restrict__ weight,
+    const std::uint8_t* __restrict__ scales,
+    const float* __restrict__ global,
+    float* __restrict__ output,
+    unsigned rows, unsigned out, unsigned in) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned row0 = lane >> 2;
+    const unsigned row1 = row0 + 8;
+    const unsigned pair = (lane & 3) * 2;
+    const unsigned first = blockIdx.y * 8;
+    const unsigned input_row = first + row0;
+    const unsigned tiles = in / 16;
+    const float scale = global[0];
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    for (unsigned k = warp; k < tiles; k += Warps) {
+        const size_t tile = size_t(blockIdx.x) * tiles + k;
+        const auto* w = weight + tile * kPackedTileBytes;
+        const auto* s = scales + tile * kScaleTileBytes;
+        float s0 = 0.f, s1 = 0.f;
+        if ((lane & 3) == 0) {
+            s0 = e4m3_value(s[row0]) * scale;
+            s1 = e4m3_value(s[row1]) * scale;
+        }
+        s0 = __shfl_sync(0xffffffff, s0, row0 * 4);
+        s1 = __shfl_sync(0xffffffff, s1, row0 * 4);
+        const auto a0 = dequant_pair(w[row0 * 8 + pair / 2], s0);
+        const auto a1 = dequant_pair(w[row1 * 8 + pair / 2], s1);
+        const auto a2 = dequant_pair(w[row0 * 8 + pair / 2 + 4], s0);
+        const auto a3 = dequant_pair(w[row1 * 8 + pair / 2 + 4], s1);
+        unsigned b0 = 0, b1 = 0;
+        if (input_row < rows) {
+            const float* x = input + size_t(input_row) * in + k * 16 + pair;
+            b0 = pack_bf16_pair(x[0], x[1]);
+            b1 = pack_bf16_pair(x[8], x[9]);
+        }
+        mma_m16n8k16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+    }
+    __shared__ float partial[Warps][16 * 8];
+    partial[warp][row0 * 8 + pair] = d0;
+    partial[warp][row0 * 8 + pair + 1] = d1;
+    partial[warp][row1 * 8 + pair] = d2;
+    partial[warp][row1 * 8 + pair + 1] = d3;
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        const unsigned index = threadIdx.x;
+        const unsigned row = first + index % 8;
+        if (row < rows) {
+            float sum = 0.f;
+            #pragma unroll
+            for (unsigned w = 0; w < Warps; ++w) sum += partial[w][index];
+            output[size_t(row) * out + blockIdx.x * 16 + index / 8] =
+                __bfloat162float(__float2bfloat16_rn(sum));
+        }
+    }
+}
+}  // namespace
+
+extern "C" cudaError_t infer_sm121_w4a16_dense_batch_on_stream(
+    const float* input, const std::uint8_t* weight, const std::uint8_t* scales,
+    const float* global, float* output, unsigned rows, unsigned out, unsigned in,
+    cudaStream_t stream) {
+    if (!input || !weight || !scales || !global || !output || !rows || !out || !in
+        || out % 16 || in % 16) return cudaErrorInvalidValue;
+    dense_w4a16_batch_kernel<8><<<dim3(out / 16, (rows + 7) / 8), 256, 0, stream>>>(
+        input, weight, scales, global, output, rows, out, in);
+    return cudaGetLastError();
+}
+
 extern "C" int infer_sm121_w4a16_supported() {
     int device = 0;
     cudaDeviceProp properties{};

@@ -188,3 +188,7 @@ harness = false
 [[bench]]
 name = "nemotron35_nvfp4"
 harness = false
+
+[[bench]]
+name = "lilicorr_kernels"
+harness = false

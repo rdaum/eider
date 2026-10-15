@@ -7712,7 +7712,7 @@ pub fn speculative_accept_argmax_f32_into_on_stream(
     let logits_len = rows.saturating_mul(vocab_size);
     if sequence_count == 0
         || draft_count == 0
-        || draft_count > 4
+        || draft_count > 8
         || vocab_size == 0
         || sequence_count > u32::MAX as usize
         || draft_count > u32::MAX as usize
@@ -7726,7 +7726,7 @@ pub fn speculative_accept_argmax_f32_into_on_stream(
         return Err(Error::Shape {
             label: "speculative argmax acceptance buffers",
             expected: format!(
-                "previous/accepted/next={sequence_count} drafts={rows} verification_logits={logits_len} with 1..=4 drafts"
+                "previous/accepted/next={sequence_count} drafts={rows} verification_logits={logits_len} with 1..=8 drafts"
             ),
             actual: format!(
                 "previous={} drafts={} verification_logits={} accepted={} next={} sequences={sequence_count} draft_count={draft_count} vocab={vocab_size}",
@@ -15416,10 +15416,10 @@ mod tests {
     #[serial]
     #[test]
     fn dflash2_attention_matches_wrapped_multi_tile_reference() {
-        let rows = 3;
-        let q_heads = 2;
+        let rows = 8;
+        let q_heads = 4;
         let kv_heads = 1;
-        let head_dim = 4;
+        let head_dim = 128;
         let window = 320;
         let context_end = 400;
         let context_len = 320;
@@ -15442,9 +15442,9 @@ mod tests {
             .map(|index| ((index * 19 % 41) as f32 - 20.0) / 21.0)
             .collect::<Vec<_>>();
         let mut expected = vec![0.0f32; query.len()];
-        let context_start = (context_end - context_len).max(context_end + rows - window);
         let scale = 1.0 / (head_dim as f32).sqrt();
         for row in 0..rows {
+            let context_start = (context_end - context_len).max(context_end + row + 1 - window);
             for head in 0..q_heads {
                 let q = &query
                     [(row * q_heads + head) * head_dim..(row * q_heads + head + 1) * head_dim];
@@ -15485,29 +15485,37 @@ mod tests {
         let block_value_device = DeviceBuffer::from_host(&block_value).expect("block value");
         let mut output = DeviceBuffer::zeroed(query.len()).expect("output");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        dflash2_noncausal_attention_f32_into_on_stream(
-            &query_device,
-            &context_key_device,
-            &context_value_device,
-            &block_key_device,
-            &block_value_device,
-            output.output(),
-            context_end,
-            context_len,
-            rows,
-            q_heads,
-            kv_heads,
-            head_dim,
-            window,
-            &stream,
-        )
-        .expect("multi-tile attention");
-        let actual = output.copy_to_host(&stream).expect("attention output");
-        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-            assert!(
-                (actual - expected).abs() < 2.0e-5,
-                "value {index}: expected {expected}, got {actual}"
-            );
+        let mut first = None;
+        for _ in 0..16 {
+            dflash2_noncausal_attention_f32_into_on_stream(
+                &query_device,
+                &context_key_device,
+                &context_value_device,
+                &block_key_device,
+                &block_value_device,
+                output.output(),
+                context_end,
+                context_len,
+                rows,
+                q_heads,
+                kv_heads,
+                head_dim,
+                window,
+                &stream,
+            )
+            .expect("multi-tile attention");
+            let actual = output.copy_to_host(&stream).expect("attention output");
+            if let Some(first) = &first {
+                assert_eq!(actual.as_slice(), first, "attention must be repeatable");
+            } else {
+                first = Some(actual.to_vec());
+            }
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 2.0e-5,
+                    "value {index}: expected {expected}, got {actual}"
+                );
+            }
         }
     }
 
@@ -15765,6 +15773,48 @@ mod tests {
             [9, 8, 10]
         );
         drop(previous);
+    }
+
+    #[serial]
+    #[test]
+    fn speculative_acceptance_handles_eight_rows() {
+        let vocab = 12;
+        let mut previous = vec![-10.0f32; vocab];
+        previous[1] = 10.;
+        let previous = DeviceBuffer::from_host(&previous).unwrap();
+        let pointers = DeviceBuffer::from_host(&[previous.cuda_address()]).unwrap();
+        let mut logits = vec![-10.0f32; 8 * vocab];
+        for row in 0..8 {
+            logits[row * vocab + row + 2] = 10.;
+        }
+        let logits = DeviceBuffer::from_host(&logits).unwrap();
+        let mut drafts = DeviceBuffer::from_host(&[1u32, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let mut accepted = DeviceBuffer::zeroed(1).unwrap();
+        let mut next = DeviceBuffer::zeroed(1).unwrap();
+        let stream = CudaStream::new_non_blocking().unwrap();
+        for (last, expected) in [(8, 8), (10, 7)] {
+            drafts.copy_from_host(&[1, 2, 3, 4, 5, 6, 7, last]).unwrap();
+            speculative_accept_argmax_f32_into_on_stream(
+                &pointers,
+                &logits,
+                &drafts,
+                accepted.output(),
+                next.output(),
+                1,
+                8,
+                vocab,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(
+                accepted.copy_to_host(&stream).unwrap().as_slice(),
+                [expected]
+            );
+            assert_eq!(
+                next.copy_to_host(&stream).unwrap().as_slice(),
+                [if expected == 8 { 9 } else { 8 }]
+            );
+        }
     }
 
     #[serial]

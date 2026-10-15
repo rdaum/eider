@@ -13,6 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod format;
+pub use kernels::lilicorr;
 
 mod bitnet;
 mod cublaslt;

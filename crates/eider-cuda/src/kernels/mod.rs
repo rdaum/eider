@@ -5,6 +5,7 @@ pub(crate) mod core_oxide;
 pub(crate) mod deepseek4;
 pub(crate) mod gemma4_attention;
 pub(crate) mod lfm2;
+pub mod lilicorr;
 pub(crate) mod non_gemm;
 pub(crate) mod qwen36_gdn;
 #[cfg(feature = "cuda-oxide")]

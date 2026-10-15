@@ -72,6 +72,7 @@ fn main() {
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let ngram_object = format!("{out_dir}/ngram.o");
     let lfm2_object = format!("{out_dir}/lfm2.o");
+    let lilicorr_object = format!("{out_dir}/lilicorr.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let qwen38_object = format!("{out_dir}/qwen38.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
@@ -541,6 +542,25 @@ fn main() {
         .status()
         .expect("failed to run nvcc for LFM2 kernels");
     assert!(lfm2_status.success(), "nvcc failed to build LFM2 kernels");
+    let lilicorr_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "-arch=sm_121",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/lilicorr.cu",
+            "-o",
+            &lilicorr_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for LiLiCorr kernels");
+    assert!(
+        lilicorr_status.success(),
+        "nvcc failed to build LiLiCorr kernels"
+    );
+    archive_objects.push(lilicorr_object.as_str());
     if !cuda_oxide {
         archive_objects.push(qwen36_gdn_object.as_str());
         archive_objects.push(qwen38_object.as_str());
@@ -573,6 +593,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/ngram.cu");
     println!("cargo:rerun-if-changed=native/lfm2.cu");
+    println!("cargo:rerun-if-changed=native/lilicorr.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/qwen38.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");

@@ -11,6 +11,7 @@ pub const NEMOTRON_OMNI_ARCHITECTURE: &str = "NemotronH_Omni_Reasoning_V3";
 
 mod attention;
 mod execution;
+pub mod lilicorr;
 mod linear;
 mod mamba;
 mod model;

@@ -159,6 +159,17 @@ impl Nemotron3Linear {
                     linear.cols,
                     stream,
                 ),
+                Self::Nvfp4(linear) if linear.prepared_rows.is_some() => gemm
+                    .run_prepared_quantized_on_stream(
+                        input,
+                        linear.prepared_rows.as_ref().unwrap(),
+                        output.output(),
+                        batch_rows,
+                        linear.rows,
+                        linear.cols,
+                        linear.weight_scale_2,
+                        stream,
+                    ),
                 Self::Nvfp4(linear) => gemm.run_quantized_on_stream(
                     input,
                     &linear.packed_weight,
@@ -313,6 +324,7 @@ impl Nemotron3Bf16Linear {
 pub(super) struct Nemotron3Nvfp4Linear {
     packed_weight: DeviceBuffer<u8>,
     weight_scale: DeviceBuffer<u8>,
+    prepared_rows: Option<DeviceBuffer<u16>>,
     rows: usize,
     cols: usize,
     weight_scale_2: f32,
@@ -336,7 +348,15 @@ impl Nemotron3Nvfp4Linear {
                 host.in_features,
             ));
         }
-        Self::from_host(host)
+        let mut linear = Self::from_host(host)?;
+        let stream = CudaStream::new_blocking()?;
+        linear.prepared_rows = Some(F32DenseGemm::prepare_nvfp4_weights(
+            &linear.packed_weight,
+            &linear.weight_scale,
+            &stream,
+        )?);
+        stream.synchronize()?;
+        Ok(linear)
     }
 
     fn load_from_bf16(
@@ -375,6 +395,7 @@ impl Nemotron3Nvfp4Linear {
         Ok(Self {
             packed_weight: DeviceBuffer::from_host(&host.packed_weight)?,
             weight_scale: DeviceBuffer::from_host(&host.weight_scale)?,
+            prepared_rows: None,
             rows: host.out_features,
             cols: host.in_features,
             weight_scale_2: host.weight_scale_2,
@@ -400,7 +421,12 @@ impl Nemotron3Nvfp4Linear {
     }
 
     pub(super) fn device_bytes(&self) -> usize {
-        self.packed_weight.device_bytes() + self.weight_scale.device_bytes()
+        self.packed_weight.device_bytes()
+            + self.weight_scale.device_bytes()
+            + self
+                .prepared_rows
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
     }
 }
 

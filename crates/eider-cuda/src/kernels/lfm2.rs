@@ -252,6 +252,76 @@ impl F32DenseGemm {
         )
     }
 
+    /// Prepares exact BF16 E2M1-by-UE4M3 products once for repeated dense batches.
+    /// The tensor-wide scale remains separate and is applied after projection.
+    pub fn prepare_nvfp4_weights(
+        weight: &DeviceBuffer<u8>,
+        scales: &DeviceBuffer<u8>,
+        stream: &CudaStream,
+    ) -> Result<DeviceBuffer<u16>> {
+        let elements = weight
+            .len()
+            .checked_mul(2)
+            .filter(|&n| n > 0 && n <= u32::MAX as usize && n.is_multiple_of(16))
+            .ok_or_else(|| Error::Format {
+                label: "prepared NVFP4 dense weight",
+                detail: "invalid packed weight size".into(),
+            })?;
+        if scales.len() != elements / 16 {
+            return Err(Error::Format {
+                label: "prepared NVFP4 dense weight",
+                detail: "invalid K16 scales".into(),
+            });
+        }
+        let output = DeviceBuffer::zeroed(elements)?;
+        unsafe {
+            check_cuda(
+                "infer_expand_dense_bf16_on_stream",
+                infer_expand_dense_bf16_on_stream(
+                    weight.ptr,
+                    scales.ptr,
+                    output.ptr,
+                    elements as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        Ok(output)
+    }
+
+    /// Projects prepared quantized weights without repeating their expansion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_prepared_quantized_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u16>,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        global_scale: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if !global_scale.is_finite() {
+            return Err(Error::Format {
+                label: "prepared quantized dense projection",
+                detail: "non-finite global scale".into(),
+            });
+        }
+        self.run_impl(
+            input,
+            DenseGemmWeights::Bf16(weight),
+            None,
+            None,
+            global_scale,
+            output,
+            rows,
+            out,
+            cols,
+            stream,
+        )
+    }
+
     /// Expands compressed weights into shared scratch, then projects F32 rows.
     /// Weight expansion, activation splitting, and scaling run on the same stream.
     #[allow(clippy::too_many_arguments)]

@@ -148,6 +148,10 @@ struct Args {
     #[arg(long, value_name = "DIR", requires = "model_dir")]
     dflash2_dir: Option<PathBuf>,
 
+    /// LiLiCorr companion directory for a Nemotron checkpoint.
+    #[arg(long, value_name = "DIR")]
+    lilicorr_dir: Option<PathBuf>,
+
     /// Prohibit network access while resolving a catalogue model.
     #[arg(long)]
     offline: bool,
@@ -188,8 +192,8 @@ struct Args {
     #[arg(long)]
     max_active_sequences: Option<usize>,
 
-    /// Greedy-only native drafts per speculative cycle.
-    /// Omit this option to use the model default. Zero disables speculation.
+    /// Draft tokens per speculative cycle. Counts and sampling support depend
+    /// on the model or companion. Omit to use its default; zero disables speculation.
     #[arg(long)]
     speculative_drafts: Option<usize>,
 
@@ -344,7 +348,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(defaults.step_expert_capacity);
     let speculative_drafts = args
         .speculative_drafts
-        .unwrap_or(resolved.default_speculative_drafts);
+        .unwrap_or(if args.lilicorr_dir.is_some() {
+            7
+        } else {
+            resolved.default_speculative_drafts
+        });
     let decision_calibration = args
         .decision_calibration
         .as_ref()
@@ -359,6 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     actor_config.engine.artifact_dir = resolved.artifact_dir.clone();
     actor_config.engine.dflash_gguf = resolved.dflash_gguf.clone();
     actor_config.engine.dflash2_dir = resolved.dflash2_dir.clone();
+    actor_config.engine.lilicorr_dir = args.lilicorr_dir;
     actor_config.engine.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         decision_branch_capacity: args.decision_branch_capacity,

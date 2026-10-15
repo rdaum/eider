@@ -1,5 +1,8 @@
 //! Nemotron 3 backbone loading and batched text-model execution.
 
+use super::lilicorr::{
+    LiLiCorrDraft, LiLiCorrProposal, LiLiCorrSequence, LiLiCorrSnapshot, LiLiCorrWorkspace,
+};
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{
@@ -13,14 +16,15 @@ use super::{
 use crate::execution::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm,
-    PinnedHostBuffer, Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
-    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
-    select_bf16_state_snapshot_into_on_stream, select_mamba_ssm_state_snapshot_into_on_stream,
-    speculative_accept_argmax_f32_into_on_stream,
+    PinnedHostBuffer, Result, Sm12xKvAttentionWorkspace, argmax_f32_batch_into_on_stream,
+    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
+    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
+    select_mamba_ssm_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
+use eider_runtime::sampling::{Sampler, TokenHistory};
 use std::path::Path;
 use tracing::info;
 
@@ -35,6 +39,7 @@ pub struct Nemotron3Model {
     final_norm: DeviceBuffer<f32>,
     lm_head: Nemotron3Linear,
     mtp: Option<Nemotron3Mtp>,
+    lilicorr: Option<LiLiCorrDraft>,
     compact_kv_cache: bool,
     stream: CudaStream,
 }
@@ -116,6 +121,7 @@ impl Nemotron3Model {
             final_norm,
             lm_head,
             mtp,
+            lilicorr: None,
             compact_kv_cache: storage.kv_cache == Nemotron3KvCacheStorage::Nvfp4,
             stream: CudaStream::new_non_blocking()?,
         })
@@ -129,6 +135,191 @@ impl Nemotron3Model {
     /// Returns whether this checkpoint includes a multi-token predictor.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Enables the external LiLiCorr companion before creating any sequences.
+    pub fn enable_lilicorr(&mut self, root: impl AsRef<Path>) -> Result<()> {
+        self.lilicorr = Some(LiLiCorrDraft::load(root, &self.manifest)?);
+        Ok(())
+    }
+
+    /// Returns the loaded LiLiCorr companion, when configured.
+    pub fn lilicorr(&self) -> Option<&LiLiCorrDraft> {
+        self.lilicorr.as_ref()
+    }
+
+    /// Adds committed rows from a prefill or verification workspace to draft context.
+    pub fn append_lilicorr_block_context(
+        &self,
+        sequence: &mut Nemotron3Sequence,
+        block: &Nemotron3BlockWorkspace,
+        row: usize,
+        rows: usize,
+        workspace: &mut LiLiCorrWorkspace,
+    ) -> Result<()> {
+        let draft = self.lilicorr.as_ref().ok_or_else(|| Error::Format {
+            label: "LiLiCorr context",
+            detail: "companion is not enabled".into(),
+        })?;
+        let context = sequence
+            .state
+            .lilicorr
+            .as_mut()
+            .ok_or_else(|| Error::Format {
+                label: "LiLiCorr context",
+                detail: "sequence has no draft context".into(),
+            })?;
+        if context.position().checked_add(rows) != Some(sequence.state.tokens) {
+            return Err(Error::Format {
+                label: "LiLiCorr context",
+                detail: "committed target and draft positions differ".into(),
+            });
+        }
+        let captured = block
+            .captured_features
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "LiLiCorr context",
+                detail: "block did not capture target features".into(),
+            })?;
+        draft.append_context(context, captured, row, rows, workspace, &self.stream)
+    }
+
+    /// Adds the last committed ordinary decode token to draft context.
+    pub fn append_lilicorr_decode_context(
+        &self,
+        sequence: &mut Nemotron3Sequence,
+        workspace: &mut LiLiCorrWorkspace,
+    ) -> Result<()> {
+        let draft = self.lilicorr.as_ref().ok_or_else(|| Error::Format {
+            label: "LiLiCorr context",
+            detail: "companion is not enabled".into(),
+        })?;
+        let context = sequence
+            .state
+            .lilicorr
+            .as_mut()
+            .ok_or_else(|| Error::Format {
+                label: "LiLiCorr context",
+                detail: "sequence has no draft context".into(),
+            })?;
+        if context.position().checked_add(1) != Some(sequence.state.tokens) {
+            return Err(Error::Format {
+                label: "LiLiCorr context",
+                detail: "committed target and draft positions differ".into(),
+            });
+        }
+        let captured = sequence
+            .state
+            .captured_features
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "LiLiCorr context",
+                detail: "decode did not capture target features".into(),
+            })?;
+        draft.append_context(context, captured, 0, 1, workspace, &self.stream)
+    }
+
+    /// Proposes a suffix, verifies it with the target, and commits only its accepted prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lilicorr_cycle(
+        &self,
+        sequence: &mut Nemotron3Sequence,
+        anchor: u32,
+        drafts: usize,
+        draft_workspace: &mut LiLiCorrWorkspace,
+        verification: &mut Nemotron3BlockWorkspace,
+        sampler: &mut Sampler,
+        history: &TokenHistory,
+        cache: &mut Nemotron3SequenceCache,
+    ) -> Result<Nemotron3SpeculativeCycleResult> {
+        let draft = self.lilicorr.as_ref().ok_or_else(|| Error::Format {
+            label: "LiLiCorr cycle",
+            detail: "companion is not enabled".into(),
+        })?;
+        let context = sequence
+            .state
+            .lilicorr
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "LiLiCorr cycle",
+                detail: "sequence has no draft context".into(),
+            })?;
+        if !(1..=7).contains(&drafts)
+            || context.position() != sequence.state.tokens
+            || verification.draft_count != Some(drafts + 1)
+            || history.tokens().last() != Some(&anchor)
+        {
+            return Err(Error::Format {
+                label: "LiLiCorr cycle",
+                detail: "anchor, verification shape, or context position is inconsistent".into(),
+            });
+        }
+        draft.propose(
+            &self.embedding,
+            context,
+            anchor,
+            drafts,
+            draft_workspace,
+            &self.stream,
+        )?;
+        let proposal =
+            LiLiCorrProposal::select(draft_workspace, anchor, drafts, sampler, &self.stream)?;
+        let result = self.verify_speculative_by(
+            &mut [sequence],
+            &[proposal.tokens()],
+            verification,
+            cache,
+            |states, ws, count| {
+                let (accepted, next) = if sampler.config().uses_fast_argmax() {
+                    argmax_f32_batch_into_on_stream(
+                        &ws.logits,
+                        ws.row_argmax.output(),
+                        ws.row_maximum.output(),
+                        count,
+                        self.manifest.vocab_size,
+                        &self.stream,
+                    )?;
+                    let target = ws.row_argmax.copy_to_host(&self.stream)?;
+                    let accepted = proposal.tokens()[1..]
+                        .iter()
+                        .zip(target.iter())
+                        .take_while(|(draft, target)| draft == target)
+                        .count();
+                    (accepted, target[accepted])
+                } else {
+                    let logits = ws.logits.copy_to_host(&self.stream)?;
+                    proposal.verify(&logits, self.manifest.vocab_size, sampler, history)?
+                };
+                // The anchor was already sampled and emitted. Its target row always commits.
+                let committed = (accepted + 1) as u32;
+                if ws.upload_pending {
+                    ws.upload_done.synchronize()?;
+                }
+                ws.host_lengths.copy_from_slice(&[committed])?;
+                ws.accepted_counts.copy_range_from_pinned_on_stream(
+                    0,
+                    &ws.host_lengths,
+                    &self.stream,
+                )?;
+                ws.upload_done.record_on_stream(&self.stream)?;
+                ws.upload_pending = true;
+                self.select_speculative_prefix(states, ws, count, vec![committed], vec![next])
+            },
+        )?;
+        self.append_lilicorr_block_context(
+            sequence,
+            verification,
+            0,
+            result.accepted_counts[0] as usize,
+            draft_workspace,
+        )?;
+        Ok(Nemotron3SpeculativeCycleResult {
+            draft_count: drafts,
+            accepted_drafts: vec![result.accepted_counts[0] - 1],
+            next_tokens: result.next_tokens,
+            drafted_tokens: proposal.tokens()[1..].to_vec(),
+        })
     }
 
     pub(crate) fn stream(&self) -> &CudaStream {
@@ -169,6 +360,20 @@ impl Nemotron3Model {
             logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
             next_token: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
+            lilicorr: self
+                .lilicorr
+                .as_ref()
+                .map(LiLiCorrDraft::new_sequence)
+                .transpose()?,
+            captured_features: self
+                .lilicorr
+                .as_ref()
+                .map(|d| {
+                    DeviceBuffer::zeroed(
+                        self.manifest.hidden_size * d.config().target_layers().len(),
+                    )
+                })
+                .transpose()?,
             mtp: self
                 .mtp
                 .as_ref()
@@ -222,12 +427,25 @@ impl Nemotron3Model {
             .as_ref()
             .map(|mtp| mtp.cache.checkpoint_on_stream(&self.stream))
             .transpose()?;
+        let lilicorr = match (&self.lilicorr, &state.lilicorr) {
+            (Some(draft), Some(context)) if context.position() == state.tokens => {
+                Some(draft.snapshot(context, &self.stream)?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(Error::Format {
+                    label: "Nemotron LiLiCorr prefix",
+                    detail: "draft context is not aligned with the target prefix".into(),
+                });
+            }
+        };
         self.stream.synchronize()?;
         Ok(Nemotron3SequenceSnapshot {
             layers,
             final_hidden,
             logits,
             mtp,
+            lilicorr,
             tokens: state.tokens,
         })
     }
@@ -293,6 +511,18 @@ impl Nemotron3Model {
             }
         }
         state.tokens = snapshot.tokens;
+        match (&self.lilicorr, &snapshot.lilicorr, &mut state.lilicorr) {
+            (Some(draft), Some(saved), Some(context)) if saved.position() == snapshot.tokens => {
+                draft.restore(saved, context, &self.stream)?
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(Error::Format {
+                    label: "Nemotron LiLiCorr prefix",
+                    detail: "snapshot draft state does not match the target".into(),
+                });
+            }
+        }
         self.stream.synchronize()?;
         Ok(())
     }
@@ -595,10 +825,10 @@ impl Nemotron3Model {
         sequence_count: usize,
         draft_count: usize,
     ) -> Result<Nemotron3BlockWorkspace> {
-        if !(1..=4).contains(&draft_count) {
+        if !(1..=8).contains(&draft_count) {
             return Err(Error::Shape {
                 label: "Nemotron 3 speculative draft count",
-                expected: "1..=4 drafts per sequence".to_string(),
+                expected: "1..=8 verification rows per sequence".to_string(),
                 actual: draft_count.to_string(),
             });
         }
@@ -987,24 +1217,18 @@ impl Nemotron3Model {
             page_tables,
             &self.stream,
         )?;
-        rms_norm_f32_into_on_stream(
-            rows,
-            self.manifest.hidden_size,
-            &workspace.hidden,
-            &self.final_norm,
-            workspace.final_hidden.output(),
-            self.manifest.norm_epsilon,
-            &self.stream,
-        )?;
-        if !workspace.last_logits_only {
-            self.lm_head.run_rows(
-                &workspace.final_hidden,
-                &mut workspace.logits,
-                rows,
-                &mut workspace.dense_gemm,
-                &self.stream,
-            )?;
+        if let Some(graph) = &workspace.graphs[self.layers.len()] {
+            graph.launch(&self.stream)?;
+        } else if workspace.graph_warm {
+            let graph = self
+                .stream
+                .capture(|stream| self.enqueue_block_head(workspace, stream))?;
+            graph.launch(&self.stream)?;
+            workspace.graphs[self.layers.len()] = Some(graph);
+        } else {
+            self.enqueue_block_head(workspace, &self.stream)?;
         }
+        workspace.graph_warm = workspace.draft_count.is_some();
         if commit_all {
             for (sequence, state) in states.iter_mut().enumerate() {
                 let last_row = offsets[sequence] as usize + lengths[sequence] as usize - 1;
@@ -1034,6 +1258,33 @@ impl Nemotron3Model {
         Ok(())
     }
 
+    fn enqueue_block_head(
+        &self,
+        workspace: &mut Nemotron3BlockWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let rows = workspace.rows;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            &workspace.hidden,
+            &self.final_norm,
+            workspace.final_hidden.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        if !workspace.last_logits_only {
+            self.lm_head.run_rows(
+                &workspace.final_hidden,
+                &mut workspace.logits,
+                rows,
+                &mut workspace.dense_gemm,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Verifies greedy speculative drafts and commits only the accepted prefix.
     /// Acceptance and Mamba state selection remain device resident; only the
     /// compact per-sequence result metadata is copied to the host.
@@ -1044,6 +1295,30 @@ impl Nemotron3Model {
         workspace: &mut Nemotron3BlockWorkspace,
         cache: &mut Nemotron3SequenceCache,
     ) -> Result<Nemotron3SpeculativeResult> {
+        self.verify_speculative_by(
+            sequences,
+            draft_chunks,
+            workspace,
+            cache,
+            |states, workspace, count| self.accept_speculative_argmax(states, workspace, count),
+        )
+    }
+
+    fn verify_speculative_by<F>(
+        &self,
+        sequences: &mut [&mut Nemotron3Sequence],
+        draft_chunks: &[&[u32]],
+        workspace: &mut Nemotron3BlockWorkspace,
+        cache: &mut Nemotron3SequenceCache,
+        decide: F,
+    ) -> Result<Nemotron3SpeculativeResult>
+    where
+        F: FnOnce(
+            &mut [&mut Nemotron3DecodeState],
+            &mut Nemotron3BlockWorkspace,
+            usize,
+        ) -> Result<Nemotron3SpeculativeResult>,
+    {
         let draft_count = workspace.draft_count.ok_or_else(|| Error::Format {
             label: "Nemotron 3 speculative verification",
             detail: "a transactional speculative workspace is required".to_string(),
@@ -1126,7 +1401,7 @@ impl Nemotron3Model {
                 &reservations,
                 &page_tables,
             )?;
-            self.accept_speculative_argmax(&mut states, workspace, draft_count)
+            decide(&mut states, workspace, draft_count)
         })();
         self.finish_speculative_reservations(sequences, reservations, cache, result)
     }
@@ -1511,6 +1786,7 @@ impl Nemotron3Model {
             accepted_drafts.push(accepted - 1);
         }
         Ok(Nemotron3SpeculativeCycleResult {
+            draft_count: NEMOTRON3_SPECULATIVE_DRAFTS,
             accepted_drafts,
             next_tokens: verification.next_tokens,
             drafted_tokens,
@@ -1539,6 +1815,17 @@ impl Nemotron3Model {
             .copy_to_host(&self.stream)?
             .into_vec();
         let next_tokens = workspace.next_tokens.copy_to_host(&self.stream)?.into_vec();
+        self.select_speculative_prefix(states, workspace, draft_count, accepted, next_tokens)
+    }
+
+    fn select_speculative_prefix(
+        &self,
+        states: &mut [&mut Nemotron3DecodeState],
+        workspace: &mut Nemotron3BlockWorkspace,
+        draft_count: usize,
+        accepted: Vec<u32>,
+        next_tokens: Vec<u32>,
+    ) -> Result<Nemotron3SpeculativeResult> {
         for (sequence, &accepted) in accepted.iter().enumerate() {
             if accepted as usize > draft_count {
                 return Err(Error::Format {
@@ -1637,8 +1924,96 @@ impl Nemotron3Model {
         stream: &CudaStream,
     ) -> Result<()> {
         let mut mamba_layer = 0;
-        let mut attention_layer = 0;
-        for layer in 0..self.layers.len() {
+        let mut layer = 0;
+        while layer < self.layers.len() {
+            if matches!(self.layers[layer], Nemotron3Layer::Attention(_)) {
+                self.enqueue_block_layer(
+                    states,
+                    offsets,
+                    lengths,
+                    workspace,
+                    layer,
+                    sequence_count,
+                    rows,
+                    mamba_layer,
+                    0,
+                    cache,
+                    reservations,
+                    page_tables,
+                    stream,
+                )?;
+                layer += 1;
+                continue;
+            }
+            let end = (layer..self.layers.len())
+                .find(|&index| matches!(self.layers[index], Nemotron3Layer::Attention(_)))
+                .unwrap_or(self.layers.len());
+            if let Some(graph) = &workspace.graphs[layer] {
+                graph.launch(stream)?;
+            } else if workspace.graph_warm {
+                let graph = stream.capture(|stream| {
+                    self.enqueue_block_segment(
+                        states,
+                        offsets,
+                        lengths,
+                        workspace,
+                        layer,
+                        end,
+                        sequence_count,
+                        rows,
+                        mamba_layer,
+                        cache,
+                        reservations,
+                        page_tables,
+                        stream,
+                    )
+                })?;
+                graph.launch(stream)?;
+                workspace.graphs[layer] = Some(graph);
+            } else {
+                self.enqueue_block_segment(
+                    states,
+                    offsets,
+                    lengths,
+                    workspace,
+                    layer,
+                    end,
+                    sequence_count,
+                    rows,
+                    mamba_layer,
+                    cache,
+                    reservations,
+                    page_tables,
+                    stream,
+                )?;
+            }
+            mamba_layer += self.layers[layer..end]
+                .iter()
+                .filter(|layer| matches!(layer, Nemotron3Layer::Mamba(_)))
+                .count();
+            layer = end;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_block_segment(
+        &self,
+        states: &mut [&mut Nemotron3DecodeState],
+        offsets: &[u32],
+        lengths: &[u32],
+        workspace: &mut Nemotron3BlockWorkspace,
+        start: usize,
+        end: usize,
+        sequence_count: usize,
+        rows: usize,
+        mut mamba_layer: usize,
+        cache: &mut Nemotron3SequenceCache,
+        reservations: &[seqcache::AppendReservation],
+        page_tables: &[&DeviceBuffer<u32>],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for layer in start..end {
             self.enqueue_block_layer(
                 states,
                 offsets,
@@ -1648,16 +2023,14 @@ impl Nemotron3Model {
                 sequence_count,
                 rows,
                 mamba_layer,
-                attention_layer,
+                0,
                 cache,
                 reservations,
                 page_tables,
                 stream,
             )?;
-            match self.layers[layer] {
-                Nemotron3Layer::Mamba(_) => mamba_layer += 1,
-                Nemotron3Layer::Attention(_) => attention_layer += 1,
-                Nemotron3Layer::Moe(_) => {}
+            if matches!(self.layers[layer], Nemotron3Layer::Mamba(_)) {
+                mamba_layer += 1;
             }
         }
         Ok(())
@@ -1764,7 +2137,25 @@ impl Nemotron3Model {
             0,
             rows * self.manifest.hidden_size,
             stream,
-        )
+        )?;
+        if let (Some(draft), Some(captured)) = (&self.lilicorr, &mut workspace.captured_features)
+            && let Some(tap) = draft
+                .config()
+                .target_layers()
+                .iter()
+                .position(|&id| id == layer)
+        {
+            eider_cuda::lilicorr::capture(
+                &workspace.hidden,
+                captured,
+                rows,
+                self.manifest.hidden_size,
+                draft.config().target_layers().len(),
+                tap,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Runs one token through the complete backbone and language-model head.
@@ -1961,6 +2352,23 @@ impl Nemotron3Model {
                     });
                 }
             }
+            if let (Some(draft), Some(captured)) = (&self.lilicorr, &mut state.captured_features)
+                && let Some(tap) = draft
+                    .config()
+                    .target_layers()
+                    .iter()
+                    .position(|&id| id == layer)
+            {
+                eider_cuda::lilicorr::capture(
+                    current[0].output(),
+                    captured,
+                    1,
+                    self.manifest.hidden_size,
+                    draft.config().target_layers().len(),
+                    tap,
+                    &self.stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2037,6 +2445,10 @@ impl Nemotron3Model {
     pub fn device_bytes(&self) -> usize {
         self.embedding.device_bytes()
             + self
+                .lilicorr
+                .as_ref()
+                .map_or(0, LiLiCorrDraft::device_bytes)
+            + self
                 .layers
                 .iter()
                 .map(Nemotron3Layer::device_bytes)
@@ -2080,6 +2492,7 @@ impl Nemotron3SpeculativeResult {
 
 /// Host-visible tokens and acceptance metadata from a complete MTP cycle.
 pub struct Nemotron3SpeculativeCycleResult {
+    draft_count: usize,
     accepted_drafts: Vec<u32>,
     next_tokens: Vec<u32>,
     drafted_tokens: Vec<u32>,
@@ -2091,7 +2504,7 @@ impl Nemotron3SpeculativeCycleResult {
         &self.accepted_drafts
     }
 
-    /// Returns all three draft tokens in sequence-major order.
+    /// Returns draft tokens in sequence-major order.
     pub fn drafted_tokens(&self) -> &[u32] {
         &self.drafted_tokens
     }
@@ -2111,7 +2524,7 @@ impl Nemotron3SpeculativeCycleResult {
                 actual: sequence.to_string(),
             });
         };
-        let begin = sequence * NEMOTRON3_SPECULATIVE_DRAFTS;
+        let begin = sequence * self.draft_count;
         let mut emitted = self.drafted_tokens[begin..begin + accepted as usize].to_vec();
         emitted.push(self.next_tokens()[sequence]);
         Ok(emitted)
@@ -2209,6 +2622,8 @@ impl Nemotron3LayerRowsWorkspace {
 
 /// Exact-shape scratch, metadata, and pointer tables for block execution.
 pub struct Nemotron3BlockWorkspace {
+    graphs: Vec<Option<CudaGraphExec>>,
+    graph_warm: bool,
     dense_gemm: F32DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     host_offsets: PinnedHostBuffer<u32>,
@@ -2221,10 +2636,13 @@ pub struct Nemotron3BlockWorkspace {
     upload_pending: bool,
     tokens: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
+    captured_features: Option<DeviceBuffer<f32>>,
     layers: Vec<Nemotron3LayerRowsWorkspace>,
     layer_slots: Vec<usize>,
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
+    row_argmax: DeviceBuffer<u32>,
+    row_maximum: DeviceBuffer<f32>,
     sequence_offsets: DeviceBuffer<u32>,
     sequence_lengths: DeviceBuffer<u32>,
     start_positions: DeviceBuffer<u32>,
@@ -2362,6 +2780,8 @@ impl Nemotron3BlockWorkspace {
             dense_weights.push(&model.lm_head);
         }
         let workspace = Self {
+            graphs: (0..=model.layers.len()).map(|_| None).collect(),
+            graph_warm: false,
             dense_gemm: Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?,
             host_tokens: PinnedHostBuffer::zeroed(rows)?,
             host_offsets: PinnedHostBuffer::zeroed(sequence_count)?,
@@ -2374,9 +2794,20 @@ impl Nemotron3BlockWorkspace {
             upload_pending: false,
             tokens: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
+            captured_features: model
+                .lilicorr
+                .as_ref()
+                .map(|d| {
+                    DeviceBuffer::zeroed(
+                        rows * model.manifest.hidden_size * d.config().target_layers().len(),
+                    )
+                })
+                .transpose()?,
             layers,
             layer_slots,
             final_hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
+            row_argmax: DeviceBuffer::zeroed(rows)?,
+            row_maximum: DeviceBuffer::zeroed(rows)?,
             logits: DeviceBuffer::zeroed(if last_logits_only {
                 0
             } else {
@@ -2457,6 +2888,10 @@ impl Nemotron3BlockWorkspace {
     /// Returns bytes owned by block scratch and pointer tables.
     pub fn device_bytes(&self) -> usize {
         self.dense_gemm.device_bytes()
+            + self
+                .captured_features
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
             + self.tokens.device_bytes()
             + self.hidden.device_bytes()
             + self
@@ -2466,6 +2901,8 @@ impl Nemotron3BlockWorkspace {
                 .sum::<usize>()
             + self.final_hidden.device_bytes()
             + self.logits.device_bytes()
+            + self.row_argmax.device_bytes()
+            + self.row_maximum.device_bytes()
             + self.sequence_offsets.device_bytes()
             + self.sequence_lengths.device_bytes()
             + self.start_positions.device_bytes()
@@ -2558,6 +2995,7 @@ pub struct Nemotron3SequenceSnapshot {
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     mtp: Option<LayerKvCacheCheckpoint>,
+    lilicorr: Option<LiLiCorrSnapshot>,
     tokens: usize,
 }
 
@@ -2565,6 +3003,10 @@ impl Nemotron3SequenceSnapshot {
     /// Returns bytes retained by the compact snapshot.
     pub fn device_bytes(&self) -> usize {
         self.final_hidden.device_bytes()
+            + self
+                .lilicorr
+                .as_ref()
+                .map_or(0, LiLiCorrSnapshot::device_bytes)
             + self.logits.device_bytes()
             + self
                 .layers
@@ -2601,6 +3043,8 @@ pub(crate) struct Nemotron3DecodeState {
     logits: DeviceBuffer<f32>,
     next_token: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
+    lilicorr: Option<LiLiCorrSequence>,
+    captured_features: Option<DeviceBuffer<f32>>,
     mtp: Option<Nemotron3MtpState>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     tokens: usize,
@@ -2616,6 +3060,14 @@ impl Nemotron3DecodeState {
     /// Returns bytes owned by this sequence's device-resident state and scratch.
     pub fn device_bytes(&self) -> usize {
         self.hidden.device_bytes()
+            + self
+                .lilicorr
+                .as_ref()
+                .map_or(0, LiLiCorrSequence::device_bytes)
+            + self
+                .captured_features
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
             + self
                 .layers
                 .iter()
@@ -2690,5 +3142,143 @@ impl Nemotron3DecodeState {
         self.tokens = self.rollback_tokens;
         self.append_pending = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lilicorr_tests {
+    use super::*;
+    use crate::nemotron3::new_nemotron3_sequence_cache;
+    use eider_runtime::sampling::SamplingConfig;
+
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_commits_match_serial_target() {
+        let root = std::env::var("NEMOTRON_MODEL_DIR").unwrap();
+        let mut model = Nemotron3Model::load(&root).unwrap();
+        model
+            .enable_lilicorr(std::env::var("LILICORR_DIR").unwrap())
+            .unwrap();
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(Path::new(&root).join("tokenizer.json")).unwrap();
+        let prompt = tokenizer.encode("The capital of Canada is Ottawa. Explain briefly why Ottawa was selected as the capital, and name the province in which it is located.",true).unwrap();
+        let tokens = prompt.get_ids();
+        let mut cache = new_nemotron3_sequence_cache(&model, 2, 1024).unwrap();
+        let mut serial = Nemotron3Sequence::admit(&model, &mut cache, 1024).unwrap();
+        let mut spec = Nemotron3Sequence::admit(&model, &mut cache, 1024).unwrap();
+        let mut prefill = model.prefill_workspace(1, tokens.len()).unwrap();
+        let mut draft = model.lilicorr().unwrap().new_workspace().unwrap();
+        for sequence in [&mut serial, &mut spec] {
+            model
+                .forward_block(&mut [sequence], &[tokens], &mut prefill, &mut cache)
+                .unwrap();
+            model
+                .append_lilicorr_block_context(sequence, &prefill, 0, tokens.len(), &mut draft)
+                .unwrap();
+        }
+        let mut expected = vec![model.argmax(&mut serial).unwrap()];
+        for _ in 1..64 {
+            model
+                .forward_one(&mut serial, &mut cache, *expected.last().unwrap())
+                .unwrap();
+            expected.push(model.argmax(&mut serial).unwrap());
+        }
+        let mut actual = vec![model.argmax(&mut spec).unwrap()];
+        let mut history =
+            TokenHistory::from_tokens(tokens.iter().copied().chain(actual.iter().copied()));
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: 0.,
+            ..SamplingConfig::default()
+        })
+        .unwrap();
+        let mut workspaces = std::collections::BTreeMap::new();
+        let mut accepted = 0;
+        let mut cycles = 0;
+        while actual.len() < expected.len() {
+            let remaining = expected.len() - actual.len();
+            if remaining == 1 {
+                model
+                    .forward_one(&mut spec, &mut cache, *actual.last().unwrap())
+                    .unwrap();
+                model
+                    .append_lilicorr_decode_context(&mut spec, &mut draft)
+                    .unwrap();
+                actual.push(model.argmax(&mut spec).unwrap());
+                break;
+            }
+            // Exercise shortened proposals as well as the released seven-token block.
+            let drafts = if cycles % 3 == 2 { 3 } else { 7 }.min(remaining - 1);
+            if let std::collections::btree_map::Entry::Vacant(entry) = workspaces.entry(drafts) {
+                entry.insert(model.speculative_workspace(1, drafts + 1).unwrap());
+            }
+            let result = model
+                .lilicorr_cycle(
+                    &mut spec,
+                    *actual.last().unwrap(),
+                    drafts,
+                    &mut draft,
+                    workspaces.get_mut(&drafts).unwrap(),
+                    &mut sampler,
+                    &history,
+                    &mut cache,
+                )
+                .unwrap();
+            accepted += result.accepted_counts()[0];
+            cycles += 1;
+            for token in result.emitted_tokens(0).unwrap() {
+                history.push(token);
+                actual.push(token);
+            }
+            assert_eq!(spec.position(), tokens.len() + actual.len() - 1);
+            assert_eq!(
+                spec.state.lilicorr.as_ref().unwrap().position(),
+                spec.position()
+            );
+            assert_eq!(
+                actual,
+                expected[..actual.len()],
+                "diverged after cycle {cycles}, accepted {accepted}"
+            );
+        }
+        assert_eq!(actual, expected);
+        assert!(accepted > 0, "real checkpoint should accept some drafts");
+        spec.finish(&model, &mut cache).unwrap();
+        serial.finish(&model, &mut cache).unwrap();
+    }
+
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR, LILICORR_DIR, and LILICORR_CONTEXT_OUT"]
+    fn capture_lilicorr_reference_context() {
+        let root = std::env::var("NEMOTRON_MODEL_DIR").unwrap();
+        let mut model = Nemotron3Model::load(&root).unwrap();
+        model
+            .enable_lilicorr(std::env::var("LILICORR_DIR").unwrap())
+            .unwrap();
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(Path::new(&root).join("tokenizer.json")).unwrap();
+        let prompt = tokenizer.encode("The capital of Canada is Ottawa. Explain briefly why Ottawa was selected as the capital, and name the province in which it is located.",true).unwrap();
+        let tokens = prompt.get_ids();
+        let mut cache = new_nemotron3_sequence_cache(&model, 1, 1024).unwrap();
+        let mut sequence = Nemotron3Sequence::admit(&model, &mut cache, 1024).unwrap();
+        let mut block = model.prefill_workspace(1, tokens.len()).unwrap();
+        model
+            .forward_block(&mut [&mut sequence], &[tokens], &mut block, &mut cache)
+            .unwrap();
+        let features = block
+            .captured_features
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&model.stream)
+            .unwrap()
+            .into_vec();
+        let anchor = model.argmax(&mut sequence).unwrap();
+        let fixture =
+            serde_json::json!({"rows": tokens.len(), "features": features, "anchor_token": anchor});
+        std::fs::write(
+            std::env::var("LILICORR_CONTEXT_OUT").unwrap(),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+        sequence.finish(&model, &mut cache).unwrap();
     }
 }

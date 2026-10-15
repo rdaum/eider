@@ -831,6 +831,13 @@ impl Sm121W4A4GroupedWorkspace {
 }
 
 impl Sm121W4A16Linear {
+    /// Returns resident weights, scale records, indices, and single-row scratch bytes.
+    pub fn device_bytes(&self) -> usize {
+        self.gate_up.expert_device_bytes()
+            + self.gate_up.output_bf16.device_bytes()
+            + self.indices.device_bytes()
+    }
+
     /// Creates a dense plan from one ModelOpt NVFP4 weight.
     pub fn new(weight: &ModelOptNvfp4Linear) -> Result<Self> {
         let out_features = weight.out_features;
@@ -898,6 +905,26 @@ impl Sm121W4A16Linear {
                     output.len()
                 ),
             });
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        if rows > 1 {
+            let mut output = output;
+            return unsafe {
+                check_cuda(
+                    "infer_sm121_w4a16_dense_batch_on_stream",
+                    ffi::infer_sm121_w4a16_dense_batch_on_stream(
+                        input.ptr,
+                        self.gate_up.tiled_weight.ptr,
+                        self.gate_up.weight_scale.ptr,
+                        self.gate_up.global_scale.ptr,
+                        output.buffer_mut().ptr,
+                        rows as u32,
+                        self.out_features as u32,
+                        self.in_features as u32,
+                        stream.as_raw(),
+                    ),
+                )
+            };
         }
         self.gate_up.launch(
             &workspace.indices,

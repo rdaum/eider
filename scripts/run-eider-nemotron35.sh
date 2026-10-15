@@ -27,7 +27,20 @@ add_default --decode-capacity 1
 add_default --prefill-sequence-capacity 1
 add_default --prefill-token-capacity "${EIDER_PREFILL_TOKEN_CAPACITY:-1024}"
 add_default --retained-prefix-gib 1
-add_default --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-0}"
+speculative_drafts=0
+for arg in "${server_args[@]}"; do
+  if [[ "$arg" == --lilicorr-dir || "$arg" == --lilicorr-dir=* ]]; then
+    speculative_drafts=7
+    break
+  fi
+done
+if [[ "${EIDER_LILICORR:-0}" == 1 || -n "${LILICORR_DIR:-}" ]]; then
+  lilicorr_revision="7c7221aeb4cb3139307aa457f7dce11a8fb6ceb2"
+  lilicorr_dir="${LILICORR_DIR:-$hf_cache/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/$lilicorr_revision}"
+  add_default --lilicorr-dir "$lilicorr_dir"
+  speculative_drafts=7
+fi
+add_default --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-$speculative_drafts}"
 add_default --nemotron-bf16-storage bf16
 add_default --nemotron-fp8-storage fp8
 

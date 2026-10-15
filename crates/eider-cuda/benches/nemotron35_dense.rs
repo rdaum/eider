@@ -20,12 +20,28 @@ struct Dense<const OUT: usize, const IN: usize, const ROWS: usize> {
     fp8: DeviceBuffer<u8>,
     fp4: DeviceBuffer<u8>,
     scales: DeviceBuffer<u8>,
+    prepared: Option<DeviceBuffer<u16>>,
     channels: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
 }
 impl<const OUT: usize, const IN: usize, const ROWS: usize> Dense<OUT, IN, ROWS> {
     fn run(&mut self, format: usize, mode: usize, rows: usize) {
         let output = self.output.output();
+        if mode == 4 {
+            self.gemm
+                .run_prepared_quantized_on_stream(
+                    &self.input,
+                    self.prepared.as_ref().unwrap(),
+                    output,
+                    rows,
+                    OUT,
+                    IN,
+                    0.125,
+                    &self.stream,
+                )
+                .unwrap();
+            return;
+        }
         if mode == 3 {
             self.gemm
                 .run_calibrated_fp8_on_stream(
@@ -140,6 +156,7 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> Dense<OUT, IN, ROWS> 
 impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dense<OUT, IN, ROWS> {
     fn prepare(_: usize) -> Self {
         let mut case = Self {
+            prepared: None,
             gemm: F32DenseGemm::new(ROWS, OUT.max(IN), OUT * IN).unwrap(),
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
@@ -182,8 +199,11 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dens
             .unwrap(),
             output: DeviceBuffer::zeroed(ROWS * OUT).unwrap(),
         };
+        case.prepared = Some(
+            F32DenseGemm::prepare_nvfp4_weights(&case.fp4, &case.scales, &case.stream).unwrap(),
+        );
         for format in 0..4 {
-            for rows in [1, 7, 17, ROWS] {
+            for rows in [1, 7, 17, ROWS].into_iter().filter(|&n| n <= ROWS) {
                 case.run(format, 0, rows);
                 let reference = case.output.copy_to_host(&case.stream).unwrap().to_vec();
                 for mode in [1, 2] {
@@ -196,6 +216,17 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dens
                             "format={format} rows={rows} index={i}: {a} vs {b}"
                         );
                     }
+                }
+                if format == 3 {
+                    case.run(format, 2, rows);
+                    let expected = case.output.copy_to_host(&case.stream).unwrap().into_vec();
+                    case.run(format, 4, rows);
+                    let actual = case.output.copy_to_host(&case.stream).unwrap();
+                    assert_eq!(
+                        &actual[..rows * OUT],
+                        &expected[..rows * OUT],
+                        "prepared NVFP4 rows={rows}"
+                    );
                 }
             }
         }
@@ -277,6 +308,16 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Dense<5376, 4096, 8>>("Shared up prepared 8 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("including expansion", sample::<5376, 4096, 3, 2, 8>);
+                g.bench_sample("prepared weights", sample::<5376, 4096, 3, 4, 8>);
+            });
+            runner.group::<Dense<4096, 5376, 8>>("Shared down prepared 8 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("including expansion", sample::<4096, 5376, 3, 2, 8>);
+                g.bench_sample("prepared weights", sample::<4096, 5376, 3, 4, 8>);
+            });
             runner.group::<Dense<18560, 4096, 128>>("Mamba input 128 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("FP8 SIMT", sample::<18560, 4096, 1, 0, 128>);

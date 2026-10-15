@@ -217,8 +217,8 @@ mod device {
         }
         thread::sync_threads();
 
-        let sequence_end = context_end + rows;
-        let first_key = sequence_end.saturating_sub(window);
+        let query_end = context_end + query_row + 1;
+        let first_key = query_end.saturating_sub(window);
         let retained_start = context_end - context_len;
         let context_start = retained_start.max(first_key);
         let context_rows = context_end - context_start;
@@ -270,6 +270,8 @@ mod device {
                 stride /= 2;
             }
             let tile_max = unsafe { *reduction };
+            // All warps must read the maximum before reduction storage is reused.
+            thread::sync_threads();
             let weight = if key_index < key_count {
                 (score - tile_max).exp()
             } else {

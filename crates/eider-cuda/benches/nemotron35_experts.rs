@@ -169,7 +169,10 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
         };
         // Compare every output, including one-route groups, short batches and a
         // populated workspace reused at a smaller active length.
-        for routes in [ROUTES, 1, 7, 9, 67, ROUTES] {
+        for routes in [ROUTES, 1, 7, 9, 67, ROUTES]
+            .into_iter()
+            .filter(|&routes| routes <= ROUTES)
+        {
             context.routes.set_routes(routes).expect("active routes");
             context.enqueue(0);
             let reference = context
@@ -254,6 +257,29 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            macro_rules! verification {
+                ($routes:literal, $up:literal, $down:literal) => {
+                    runner.group::<Experts<2688, 1024, $routes>>($up, |group| {
+                        let group = group.measurement_domain(MeasurementDomain::Gpu);
+                        group.bench_sample("SIMT", sample::<2688, 1024, 0, $routes>);
+                        group.bench_sample(
+                            "tensor including sort",
+                            sample::<2688, 1024, 2, $routes>,
+                        );
+                    });
+                    runner.group::<Experts<1024, 2688, $routes>>($down, |group| {
+                        let group = group.measurement_domain(MeasurementDomain::Gpu);
+                        group.bench_sample("SIMT", sample::<1024, 2688, 0, $routes>);
+                        group.bench_sample(
+                            "tensor including sort",
+                            sample::<1024, 2688, 2, $routes>,
+                        );
+                    });
+                };
+            }
+            verification!(44, "verification up 2 x 22", "verification down 2 x 22");
+            verification!(88, "verification up 4 x 22", "verification down 4 x 22");
+            verification!(176, "verification up 8 x 22", "verification down 8 x 22");
             runner.group::<Experts<2688, 1024, 2816>>("Nemotron 3.5 up 128 tokens x 22", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample("SIMT", sample::<2688, 1024, 0, 2816>);

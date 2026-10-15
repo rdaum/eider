@@ -121,6 +121,7 @@ pub fn with_loaded_engine<R>(
         artifact_dir,
         dflash_gguf,
         dflash2_dir,
+        lilicorr_dir,
         scheduler,
         sequence_cache,
         qwen_bf16_storage,
@@ -134,6 +135,11 @@ pub fn with_loaded_engine<R>(
         ..
     } = config;
     let architecture = checkpoint_architecture(&model_dir)?;
+    if lilicorr_dir.is_some() && architecture != CheckpointArchitecture::Nemotron3 {
+        return Err(InferenceError::Deployment(
+            "LiLiCorr requires a Nemotron target checkpoint".into(),
+        ));
+    }
     info!(
         model_dir = %model_dir.display(),
         architecture = ?architecture,
@@ -282,7 +288,10 @@ pub fn with_loaded_engine<R>(
         CheckpointArchitecture::Nemotron3 => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;
-            let model = Nemotron3Model::load_with_storage(&model_dir, nemotron_storage)?;
+            let mut model = Nemotron3Model::load_with_storage(&model_dir, nemotron_storage)?;
+            if let Some(directory) = lilicorr_dir {
+                model.enable_lilicorr(directory)?;
+            }
             let mut service = Nemotron3ChatService::new_with_cache_config(
                 &model,
                 &template,

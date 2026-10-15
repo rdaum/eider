@@ -1,5 +1,6 @@
 //! Structured multi-session chat serving for Nemotron 3.
 
+use crate::nemotron3::lilicorr::LiLiCorrWorkspace;
 use crate::nemotron3::{
     Nemotron3BlockWorkspace, Nemotron3CacheContext, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3SequenceId, Nemotron3SequencePool,
@@ -14,7 +15,7 @@ use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
     EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
     EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick,
+    EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -119,6 +120,8 @@ pub(crate) struct Nemotron3ChatService<'model, 'template> {
     sequence_cache: Nemotron3SequenceCache,
     retain_prefixes: bool,
     mtp_token_workspace: Option<Nemotron3MtpWorkspace>,
+    lilicorr_workspace: Option<LiLiCorrWorkspace>,
+    lilicorr_verification: BTreeMap<usize, Nemotron3BlockWorkspace>,
     prefill_workspaces: BTreeMap<(usize, usize, usize, usize), Nemotron3PrefillWorkspace>,
     speculative_workspaces: BTreeMap<usize, Nemotron3SpeculativeCycleWorkspace>,
 }
@@ -132,7 +135,11 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
-        validate_mtp_drafts(config.speculative_drafts)?;
+        if model.lilicorr().is_some() {
+            validate_lilicorr_drafts(config.speculative_drafts)?;
+        } else {
+            validate_mtp_drafts(config.speculative_drafts)?;
+        }
         let sequence_cache = new_nemotron3_sequence_cache_with_budget(
             model,
             config.max_active_sequences,
@@ -150,9 +157,16 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             sequences: Nemotron3SequencePool::new(),
             sequence_cache,
             retain_prefixes,
-            mtp_token_workspace: (model.has_mtp() && config.speculative_drafts != 0)
+            mtp_token_workspace: (model.lilicorr().is_none()
+                && model.has_mtp()
+                && config.speculative_drafts != 0)
                 .then(|| model.mtp_workspace(1, 1))
                 .transpose()?,
+            lilicorr_workspace: model
+                .lilicorr()
+                .map(|draft| draft.new_workspace())
+                .transpose()?,
+            lilicorr_verification: BTreeMap::new(),
             prefill_workspaces: BTreeMap::new(),
             speculative_workspaces: BTreeMap::new(),
         })
@@ -271,6 +285,17 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 .generation
                 .max_new_tokens
                 .saturating_sub(request.generated_tokens);
+            if self.lilicorr_workspace.is_some()
+                && self.config.speculative_drafts != 0
+                && request.last_token.is_some()
+                && remaining >= 2
+            {
+                let drafts = self.config.speculative_drafts.min(remaining - 1);
+                if let Some(reason) = self.generate_lilicorr(id, drafts, &mut tick)? {
+                    terminal.insert(id, reason);
+                }
+                continue;
+            }
             if self.mtp_token_workspace.is_some()
                 && request.sampler.config().uses_fast_argmax()
                 && request.last_token.is_some()
@@ -524,6 +549,19 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 &mut workspace.target,
                 &mut self.sequence_cache,
             )?;
+            if let Some(draft_workspace) = &mut self.lilicorr_workspace {
+                let mut offset = 0;
+                for (sequence, chunk) in states.iter_mut().zip(&chunks) {
+                    self.model.append_lilicorr_block_context(
+                        sequence,
+                        &workspace.target,
+                        offset,
+                        chunk.len(),
+                        draft_workspace,
+                    )?;
+                    offset += chunk.len();
+                }
+            }
             if let (Some(mtp), Some(mtp_hidden)) = (&mut workspace.mtp, &mut workspace.mtp_hidden) {
                 let offsets = selected
                     .iter()
@@ -628,6 +666,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         }
         self.model
             .forward_one(sequence, &mut self.sequence_cache, input)?;
+        if let Some(workspace) = &mut self.lilicorr_workspace {
+            self.model
+                .append_lilicorr_decode_context(sequence, workspace)?;
+        }
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(sequence)?;
             eider_runtime::sampling::SampledToken {
@@ -639,23 +681,74 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             let logits = self.model.logits_to_host(sequence)?;
             request.sampler.sample(&logits, &request.history)?
         };
+        Self::emit_token(id, request, sampled.id, tick)
+    }
+
+    fn emit_token(
+        id: Nemotron3RequestId,
+        request: &mut ActiveRequest<'template>,
+        token: u32,
+        tick: &mut EngineTick,
+    ) -> Result<Option<ChatFinishReason>> {
         request.generated_tokens += 1;
-        request.last_token = Some(sampled.id);
-        request.history.push(sampled.id);
+        request.last_token = Some(token);
+        request.history.push(token);
         request.usage.completion_tokens += 1;
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
         tick.generated.push(EngineRequestId::new(id.get()));
-        let events = request.output.push_token(sampled.id)?;
+        let events = request.output.push_token(token)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
         }
-        if request.generation.eos_token_ids.contains(&sampled.id) {
+        if request.generation.eos_token_ids.contains(&token) {
             return Ok(Some(ChatFinishReason::Eos));
         }
         if request.generated_tokens == request.generation.max_new_tokens {
             return Ok(Some(ChatFinishReason::Length));
+        }
+        Ok(None)
+    }
+
+    fn generate_lilicorr(
+        &mut self,
+        id: Nemotron3RequestId,
+        drafts: usize,
+        tick: &mut EngineTick,
+    ) -> Result<Option<ChatFinishReason>> {
+        if !self.lilicorr_verification.contains_key(&drafts) {
+            // Retain the full block and one current tail; recurrent snapshots are large.
+            self.lilicorr_verification
+                .retain(|&size, _| size == self.config.speculative_drafts);
+            self.lilicorr_verification
+                .insert(drafts, self.model.speculative_workspace(1, drafts + 1)?);
+        }
+        let request = self.requests.get_mut(&id).expect("decode request exists");
+        let mut sequence = self
+            .sequences
+            .lease(request.sequence_id.expect("admitted request has sequence"))?;
+        let result = self.model.lilicorr_cycle(
+            sequence.sequence_mut(),
+            request.last_token.expect("speculative request has anchor"),
+            drafts,
+            self.lilicorr_workspace.as_mut().expect("companion enabled"),
+            self.lilicorr_verification
+                .get_mut(&drafts)
+                .expect("verification workspace inserted"),
+            &mut request.sampler,
+            &request.history,
+            &mut self.sequence_cache,
+        )?;
+        tick.verification.push(EngineVerificationProgress {
+            request_id: EngineRequestId::new(id.get()),
+            cycles: 1,
+            accepted_drafts: result.accepted_counts()[0] as usize,
+        });
+        for token in result.emitted_tokens(0)? {
+            if let Some(reason) = Self::emit_token(id, request, token, tick)? {
+                return Ok(Some(reason));
+            }
         }
         Ok(None)
     }
@@ -722,26 +815,14 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         };
         for (sequence, (id, mut request)) in selected.into_iter().enumerate() {
             let emitted = result.emitted_tokens(sequence)?;
-            request.last_token = emitted.last().copied();
+            tick.verification.push(EngineVerificationProgress {
+                request_id: EngineRequestId::new(id.get()),
+                cycles: 1,
+                accepted_drafts: result.accepted_counts()[sequence] as usize,
+            });
             for token in emitted {
-                request.generated_tokens += 1;
-                request.history.push(token);
-                request.usage.completion_tokens += 1;
-                if request.output.is_reasoning() {
-                    request.usage.reasoning_tokens += 1;
-                }
-                tick.generated.push(EngineRequestId::new(id.get()));
-                let events = request.output.push_token(token)?;
-                if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
+                if let Some(reason) = Self::emit_token(id, &mut request, token, tick)? {
                     terminal.insert(id, reason);
-                    break;
-                }
-                if request.generation.eos_token_ids.contains(&token) {
-                    terminal.insert(id, ChatFinishReason::Eos);
-                    break;
-                }
-                if request.generated_tokens == request.generation.max_new_tokens {
-                    terminal.insert(id, ChatFinishReason::Length);
                     break;
                 }
             }
@@ -797,6 +878,17 @@ fn validate_mtp_drafts(drafts: usize) -> Result<()> {
     Err(eider_cuda::Error::Shape {
         label: "Nemotron 3 speculative drafts",
         expected: "0 (disabled) or 3 MTP drafts".to_string(),
+        actual: drafts.to_string(),
+    })
+}
+
+fn validate_lilicorr_drafts(drafts: usize) -> Result<()> {
+    if drafts <= 7 {
+        return Ok(());
+    }
+    Err(Error::Shape {
+        label: "Nemotron LiLiCorr drafts",
+        expected: "0 (disabled) or 1..=7 LiLiCorr drafts".into(),
         actual: drafts.to_string(),
     })
 }
@@ -931,6 +1023,158 @@ impl ResponseFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eider_runtime::chat::ChatMessage;
+    use eider_runtime::sampling::SamplingConfig;
+
+    fn run_checkpoint_request(
+        service: &mut Nemotron3ChatService<'_, '_>,
+        request: ChatRequest,
+    ) -> (String, serde_json::Value) {
+        let admission = service.add_request(request).unwrap();
+        let started = Instant::now();
+        let mut first = None;
+        let mut cycles = 0;
+        let mut accepted = 0;
+        let mut output = String::new();
+        loop {
+            let tick = service.tick_with_lifecycle(&mut |_| {}).unwrap();
+            if !tick.generated.is_empty() && first.is_none() {
+                first = Some(Instant::now());
+            }
+            for progress in tick.verification {
+                cycles += progress.cycles;
+                accepted += progress.accepted_drafts;
+            }
+            for delta in tick.output {
+                output.push_str(&format!("{:?}\n", delta.event));
+            }
+            if let Some(finished) = tick.finished.first() {
+                let first = first.expect("request generated output");
+                let decode_seconds = first.elapsed().as_secs_f64();
+                assert_eq!(service.active_sequence_count(), 0);
+                return (
+                    output,
+                    serde_json::json!({
+                        "prompt_tokens": admission.prompt_tokens,
+                        "cached_tokens": finished.usage.cached_prompt_tokens,
+                        "output_tokens": finished.usage.completion_tokens,
+                        "ttft_ms": first.duration_since(started).as_secs_f64() * 1000.,
+                        "total_ms": started.elapsed().as_secs_f64() * 1000.,
+                        "decode_tok_s": finished.usage.completion_tokens.saturating_sub(1) as f64 / decode_seconds,
+                        "cycles": cycles, "accepted_drafts": accepted,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "loads the full target and companion; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_serving_restores_prefix_and_preserves_request_policies() {
+        let root = std::env::var("NEMOTRON_MODEL_DIR").unwrap();
+        let template = CheckpointChatTemplate::from_model_dir(&root).unwrap();
+        let content = std::env::var("LILICORR_PROMPT").ok()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(|| format!("Review this Rust code for correctness, then explain the three most important issues.\n{}", include_str!("nemotron3_serving.rs")));
+        let request = ChatRequest::new(
+            vec![ChatMessage::user(content)],
+            RequestConfig {
+                max_new_tokens: 128,
+                sampling: SamplingConfig {
+                    temperature: 0.,
+                    ..SamplingConfig::default()
+                },
+                ..RequestConfig::default()
+            },
+        );
+        let scheduler = SchedulerConfig {
+            max_active_sequences: 1,
+            decode_capacity: 1,
+            prefill_sequence_capacity: 1,
+            prefill_token_capacity: 1024,
+            max_context_tokens: 32768,
+            ..SchedulerConfig::default()
+        };
+        let mut model = Nemotron3Model::load(&root).unwrap();
+        let mut baseline = Nemotron3ChatService::new_with_cache_config(
+            &model,
+            &template,
+            scheduler,
+            SequenceCacheConfig::default(),
+        )
+        .unwrap();
+        let (_, serial_cold) = run_checkpoint_request(&mut baseline, request.clone());
+        let (_, serial_cached) = run_checkpoint_request(&mut baseline, request.clone());
+        drop(baseline);
+        model
+            .enable_lilicorr(std::env::var("LILICORR_DIR").unwrap())
+            .unwrap();
+        let speculative_drafts = std::env::var("LILICORR_TEST_DRAFTS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(7);
+        let mut service = Nemotron3ChatService::new_with_cache_config(
+            &model,
+            &template,
+            SchedulerConfig {
+                speculative_drafts,
+                ..scheduler
+            },
+            SequenceCacheConfig::default(),
+        )
+        .unwrap();
+        let (cold_output, cold) = run_checkpoint_request(&mut service, request.clone());
+        let (cached_output, cached) = run_checkpoint_request(&mut service, request.clone());
+        assert_eq!(
+            cold_output, cached_output,
+            "restored target and draft context must reproduce the uncached request"
+        );
+        assert!(cached["cached_tokens"].as_u64().unwrap() > 0);
+        assert!(cached["cycles"].as_u64().unwrap() > 0);
+        let mut sampled = request.clone();
+        sampled.generation.max_new_tokens = 17;
+        sampled.generation.sampling = SamplingConfig {
+            temperature: 0.7,
+            top_k: 20,
+            top_p: 0.95,
+            presence_penalty: 0.2,
+            frequency_penalty: 0.1,
+            seed: Some(72),
+        };
+        let (sampled_output, sampled_report) =
+            run_checkpoint_request(&mut service, sampled.clone());
+        let (repeated_output, _) = run_checkpoint_request(&mut service, sampled);
+        assert_eq!(
+            sampled_output, repeated_output,
+            "seeded speculative sampling must be repeatable"
+        );
+        assert!(sampled_report["cycles"].as_u64().unwrap() > 0);
+        assert!(sampled_report["output_tokens"].as_u64().unwrap() <= 17);
+        let queued = service.add_request(request.clone()).unwrap();
+        assert!(matches!(
+            service.cancel_request(queued.request_id),
+            Nemotron3CancelOutcome::Cancelled {
+                released_sequence_device_bytes: 0
+            }
+        ));
+        let active = service.add_request(request).unwrap();
+        service.tick_with_lifecycle(&mut |_| {}).unwrap();
+        assert!(
+            matches!(service.cancel_request(active.request_id), Nemotron3CancelOutcome::Cancelled {released_sequence_device_bytes} if released_sequence_device_bytes > 0)
+        );
+        assert_eq!(service.active_sequence_count(), 0);
+        if let Ok(path) = std::env::var("LILICORR_SERVING_REPORT") {
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "drafts": speculative_drafts,
+                    "serial_cold": serial_cold, "serial_cached": serial_cached,
+                    "lilicorr_cold": cold, "lilicorr_cached": cached, "sampled": sampled_report,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
 
     #[test]
     fn mtp_requires_the_supported_draft_count() {
@@ -938,6 +1182,16 @@ mod tests {
         assert!(validate_mtp_drafts(3).is_ok());
         for drafts in [1, 2, 4, usize::MAX] {
             assert!(validate_mtp_drafts(drafts).is_err());
+        }
+    }
+
+    #[test]
+    fn lilicorr_accepts_full_and_shortened_blocks() {
+        for drafts in 0..=7 {
+            assert!(validate_lilicorr_drafts(drafts).is_ok());
+        }
+        for drafts in [8, usize::MAX] {
+            assert!(validate_lilicorr_drafts(drafts).is_err());
         }
     }
 

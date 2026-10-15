@@ -5980,8 +5980,10 @@ __global__ void infer_dflash2_noncausal_attention_f32_kernel(
     }
     __syncthreads();
 
-    const std::uint32_t sequence_end = context_end + rows;
-    const std::uint32_t first_key = sequence_end > window ? sequence_end - window : 0;
+    // Non-causal sliding attention uses a window around each query position.
+    // Future proposal rows remain visible; the left edge advances per query.
+    const std::uint32_t query_end = context_end + query_row + 1;
+    const std::uint32_t first_key = query_end > window ? query_end - window : 0;
     const std::uint32_t retained_start = context_end - context_len;
     const std::uint32_t context_start = max(retained_start, first_key);
     const std::uint32_t context_rows = context_end - context_start;
@@ -6018,6 +6020,8 @@ __global__ void infer_dflash2_noncausal_attention_f32_kernel(
         }
         const float tile_max = reduction[0];
         const float weight = key_index < key_count ? expf(score - tile_max) : 0.0f;
+        // Every warp must read the maximum before warp zero reuses reduction[0].
+        __syncthreads();
         scores[tid] = weight;
         reduction[tid] = weight;
         __syncthreads();
@@ -7376,7 +7380,7 @@ extern "C" cudaError_t infer_speculative_accept_argmax_f32_on_stream(
     if (previous_logits == nullptr || verification_logits == nullptr ||
         drafted_tokens == nullptr || accepted_counts == nullptr ||
         next_tokens == nullptr || sequence_count == 0 || draft_count == 0 ||
-        draft_count > 4 || vocab_size == 0) {
+        draft_count > 8 || vocab_size == 0) {
         return cudaErrorInvalidValue;
     }
     constexpr int kThreads = 256;

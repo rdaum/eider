@@ -225,8 +225,8 @@ existing `chunks_exact` suggestions. The full workspace test suite was not run.
 - Assess Bolt separately if its weights become available. Native 2-bit support
   requires its own format and kernel assessment.
 
-The released LiLiCorr drafter requires a separate integration. See
-[the format and implementation assessment](nemotron-lilicorr.md).
+The released LiLiCorr companion is available through `EIDER_LILICORR=1` in the
+launcher. See [LiLiCorr configuration, validation, and measurements](nemotron-lilicorr.md).
 
 Vision and video execution remain unimplemented. The upstream work includes a
 RADIO encoder, a projector, position-table interpolation, and a separate temporal
