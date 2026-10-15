@@ -5,10 +5,11 @@ use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::execution::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace,
-    Sm12xKvCache, add_f32_into_on_stream, append_ragged_kv_f32_into_on_stream,
-    append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
-    ragged_paged_gqa_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
+    append_ragged_kv_f32_into_on_stream, append_ragged_paged_kv_f32_into_on_stream,
+    ragged_gqa_attention_f32_into_on_stream, ragged_paged_gqa_attention_f32_into_on_stream,
+    rms_norm_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use seqcache::AppendReservations;
@@ -203,6 +204,10 @@ impl Nemotron3AttentionLayer {
 
     /// Allocates the one-token scratch buffers used by this layer.
     /// Allocates standalone one-token scratch.
+    pub(super) fn dense_linears(&self) -> [&Nemotron3Linear; 4] {
+        [&self.query, &self.key, &self.value, &self.output]
+    }
+
     pub fn workspace(&self) -> Result<Nemotron3AttentionWorkspace> {
         Nemotron3AttentionWorkspace::new(&self.manifest)
     }
@@ -409,6 +414,7 @@ impl Nemotron3AttentionLayer {
         start_positions: &DeviceBuffer<u32>,
         sequence_count: usize,
         rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -429,11 +435,11 @@ impl Nemotron3AttentionLayer {
             stream,
         )?;
         self.query
-            .run_rows(&workspace.normed, &mut workspace.query, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.query, rows, gemm, stream)?;
         self.key
-            .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.key, rows, gemm, stream)?;
         self.value
-            .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.value, rows, gemm, stream)?;
         append_ragged_kv_f32_into_on_stream(
             &workspace.key,
             &workspace.value,
@@ -468,6 +474,7 @@ impl Nemotron3AttentionLayer {
             &workspace.attended,
             &mut workspace.projected_output,
             rows,
+            gemm,
             stream,
         )?;
         add_f32_into_on_stream(
@@ -496,6 +503,7 @@ impl Nemotron3AttentionLayer {
         sequence_count: usize,
         rows: usize,
         compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         workspace.require_manifest(&self.manifest, rows)?;
@@ -509,11 +517,11 @@ impl Nemotron3AttentionLayer {
             stream,
         )?;
         self.query
-            .run_rows(&workspace.normed, &mut workspace.query, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.query, rows, gemm, stream)?;
         self.key
-            .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.key, rows, gemm, stream)?;
         self.value
-            .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.value, rows, gemm, stream)?;
         match backend.storage() {
             super::Nemotron3KvCacheStorage::F32 => {
                 let pool = backend.f32_pool_mut(self.layer)?;
@@ -626,6 +634,7 @@ impl Nemotron3AttentionLayer {
             &workspace.attended,
             &mut workspace.projected_output,
             rows,
+            gemm,
             stream,
         )?;
         add_f32_into_on_stream(
@@ -650,6 +659,7 @@ impl Nemotron3AttentionLayer {
         start_positions: &DeviceBuffer<u32>,
         sequence_count: usize,
         rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -670,9 +680,9 @@ impl Nemotron3AttentionLayer {
             stream,
         )?;
         self.key
-            .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.key, rows, gemm, stream)?;
         self.value
-            .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.value, rows, gemm, stream)?;
         append_ragged_kv_f32_into_on_stream(
             &workspace.key,
             &workspace.value,

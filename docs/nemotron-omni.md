@@ -81,8 +81,8 @@ recurrence. They also check zero, partial, and full-acceptance state restoration
 in both supported precisions. The inspection command reports actual state bytes,
 including BF16 convolution storage.
 
-The complete released checkpoint passed topology validation and loaded all 88
-text layers plus MTP. The loader reported 68.17 GiB of device weights. A local
+The initial full-checkpoint smoke test loaded all 88 text layers plus MTP.
+At that point, the loader reported 68.17 GiB of device weights. A local
 server used a 4,096-token context limit and one active sequence. It requested
 `--speculative-drafts 0`, but the scheduler ignored that setting for Nemotron.
 Storage flags preserved the checkpoint's dense-weight precision:
@@ -102,82 +102,116 @@ representative throughput or validate the default storage settings.
 
 ## Prefill and decode performance
 
-The performance path preserves checkpoint weight precision and FP32 selective
-state. Dense FP8 and NVFP4 projections decode weights into BF16 tensor operands.
-Three BF16 components represent each FP32 activation. This changes accumulation
-order without applying another low-bit quantizer to the activations.
+Prefill uses the checkpoint's calibrated activation scales for native FP8 dense
+GEMMs and grouped NVFP4 expert GEMMs. Dense BF16 weights remain BF16. Their
+projections use three BF16 components per FP32 activation, including the router.
+Uncalibrated or unsupported projections retain the FP32-activation path.
+Small expert batches retain the W4A16 path.
 
-Prefill groups routes by expert and reuses the pipelined expert GEMM. The LM head
-computes only the final row for each sequence. Speculative verification still
-retains all row logits. Final hidden states remain available for MTP.
+The expert up projection applies each expert's combined input and weight scale
+before ReLU squared. The down projection uses its own calibrated input scale.
+Packed weights remain shared with decode. Prepared weight-scale layouts add
+about 6.73 GiB, bringing resident text weights and MTP weights to about 74.9 GiB.
 
-Decode captures consecutive Mamba and MoE layers in CUDA graphs. Attention runs
-outside those graphs because its page and position metadata change each token.
-The scheduler now honours `--speculative-drafts 0`; `3` enables the existing MTP
-path. Other nonzero draft counts fail with a configuration error.
+Temporary activation buffers are shared between layers with matching shapes.
+The service retains full-chunk workspaces and the current tail workspace. It no
+longer retains a workspace for every prompt remainder. Grouped activation scales
+reserve tiles for actual routes plus padding per expert. At 1,024 tokens, the two
+expert scale buffers need about 62 MiB instead of 2.5 GiB.
 
-Repeated prefill exposed a metadata-upload race on the non-blocking stream.
-Pinned batch metadata and page tables now wait for their previous uploads before
-host reuse. The failing third HTTP request now completes. Compute Sanitizer
-reports zero errors for the focused workspace-reuse regressions.
+Attention with 128-element heads splits the context across eight warps and merges
+their online softmax results. Mamba keeps each lane's recurrent state in registers
+through a chunk. It preserves the configured FP32 or BF16 state rounding. Prefix
+checkpoints and speculative rollback still include convolution and recurrent state.
 
-The following CUDA-event medians include route sorting for expert GEMMs.
-Each benchmark compares every output against the existing SIMT reference before
-timing. Expert cases use 512 experts and 128 tokens with 22 routes each.
+The LM head computes only each sequence's final prefill row. Speculative
+verification retains all row logits. Decode captures consecutive Mamba and MoE
+layers in CUDA graphs. Attention runs outside those graphs because its page and
+position metadata change each token. `--speculative-drafts 0` disables MTP;
+`3` enables the existing path.
 
-| Projection | Output × input | SIMT | Tensor cores |
-| --- | ---: | ---: | ---: |
-| FP8 Mamba input, 128 rows | 18,560 × 4,096 | 40.24 ms | 8.32 ms |
-| NVFP4 Mamba input, 128 rows | 18,560 × 4,096 | 30.33 ms | 5.63 ms |
-| FP8 Mamba output, 128 rows | 4,096 × 8,192 | 16.73 ms | 1.51 ms |
-| NVFP4 routed up | 2,688 × 1,024 | 19.94 ms | 6.51 ms |
-| NVFP4 routed down | 1,024 × 2,688 | 18.74 ms | 7.47 ms |
+### Focused measurements
 
-Run the focused checks with:
+CUDA-event medians below include quantization, conversion, and routing preparation
+where the measured path requires them. Each benchmark checks correctness before
+timing. Expert shapes use 512 experts, top-22 routing, latent width 1,024, and
+intermediate width 2,688.
+
+| Operation | Previous path | Current path |
+| --- | ---: | ---: |
+| FP8 Mamba input, 1,024 rows | 7.80 ms, expanded BF16 GEMM | 1.17 ms, calibrated FP8 |
+| FP8 Mamba output, 1,024 rows | 3.62 ms, expanded BF16 GEMM | 0.61 ms, calibrated FP8 |
+| BF16 router, 1,024 rows | 2.51 ms, SIMT | 0.35 ms, cuBLAS |
+| Routed up, 1,024 tokens | 14.78 ms, W4A16 | 5.11 ms, W4A4 |
+| Routed down, 1,024 tokens | 13.86 ms, W4A16 | 6.18 ms, W4A4 |
+| Mamba recurrence, 1,024 tokens | 11.70 ms, generic snapshot kernel | 4.94 ms, register state |
+
+The Mamba reference includes one initial state snapshot. Its optimized outputs
+and final state match exactly in both supported state precisions. Attention is
+about six times faster in the focused 128-row, 4K/16K-context cases. The attention
+benchmark checks all outputs against the previous path and selected outputs
+against an FP64 CPU reference.
+
+Run these checks with:
 
 ```sh
 cargo bench -p eider-cuda --bench nemotron35_dense
 cargo bench -p eider-cuda --bench nemotron35_experts
+cargo bench -p eider-cuda --bench nemotron35_nvfp4
+cargo bench -p eider-cuda --bench nemotron35_attention
+cargo bench -p eider-cuda --bench nemotron35_mamba
 ```
 
-A full-model HTTP replay compared commit `ae38fa7` with this performance path.
-Both used the pinned checkpoint above, native dense precision, a 4,096-token
-context limit, 128-token prefill chunks, and one active sequence. Prefix retention
-was 1 GiB. Each request used temperature zero and a 128-token output limit.
+### Full-model replay
 
-| Request | Previous prefill | Current prefill | Previous whole request | Current whole request |
+A controlled replay compared commit `4111ddd` with the new prefill path on GB10.
+Both used the pinned checkpoint, native dense-weight storage, temperature zero,
+MTP disabled, one active sequence, an 8,192-token context limit, and no prefix
+retention. Nsight Systems traced CUDA execution in both runs. The previous path
+used 128-token chunks; the new path used 1,024-token chunks.
+
+| Request | Previous prefill | New prefill | Previous whole request | New whole request |
 | --- | ---: | ---: | ---: | ---: |
-| Tool call, 308 prompt tokens | 11.988 s | 2.990 s | 13.906 s | 5.253 s |
-| Same tool call, 256 cached tokens | 1.980 s | 0.678 s | 3.466 s | 2.455 s |
-| Unrelated prose, 546 prompt tokens | CUDA error 700 | 4.707 s | Failed | 8.415 s |
+| Colour retrieval, 5,069 prompt tokens | 45.235 s / 112.0 tok/s | 6.850 s / 739.8 tok/s | 45.727 s | 7.160 s |
+| Repository notes and tool call, 3,419 prompt tokens | Not measured | 4.707 s / 726.1 tok/s | Not measured | 6.516 s |
 
-The tool request asked for `multiply(a=6, b=7)`. Both versions returned the same
-arguments and 31 output tokens. The prose request repeated blue-key/small-door
-and red-key/large-door notes 32 times, then requested eight explanatory sentences.
-The current path returned a coherent 62-token answer.
+The retrieval prompt repeats blue-key/small-door and red-key/large-door notes
+315 times, then asks which key opens the small door. Both paths returned `blue`.
+The tool request includes the repository's `AGENTS.md` and asks for
+`multiply(a=6, b=7)`. The new path returned those arguments and 31 output tokens.
+Its decode rate was 17.1 tok/s.
 
-Cold tool prefill improved from 25.6 to 102.7 tok/s. The longer prose request
-reached 115.8 tok/s. These are short, single-run measurements with 128-token
-chunks; larger batches and longer contexts need separate measurement.
+These single-request measurements establish a 6.6-fold prefill improvement for
+the matched retrieval prompt. They are separate from the user's Pi trace, which
+reported 93.1 tok/s on a different 5,105-token prompt. Independent reference
+logit parity and broader model-quality evaluation remain pending.
 
-The previous server decoded the tool output at 19.8–20.6 tok/s, but could run
-MTP despite the zero-draft setting. A separate build disabled graph capture while
-retaining all other changes. Both current builds kept MTP disabled:
+The final launcher comparison included the router GEMM change, a 1,048,576-token
+context limit, and 1 GiB of prefix retention. Actual prompts remained 3.4K–5.1K
+tokens; this does not test generation at a million-token context length.
 
-| Request | Eager decode | Graph decode |
+| Request | 1,024-token chunks: prefill / whole request | 4,096-token chunks: prefill / whole request |
 | --- | ---: | ---: |
-| Cold tool call | 16.74 tok/s | 17.31 tok/s |
-| Cached tool call | 16.64 tok/s | 17.18 tok/s |
-| Prose | 16.07 tok/s | 16.59 tok/s |
+| Cold colour retrieval, 5,069 tokens | 741 tok/s / 7.035 s | 763 tok/s / 8.840 s |
+| Cold tool call, 3,419 tokens | 706 tok/s / 6.632 s | 778 tok/s / 7.416 s |
+| Tool call, 3,328 cached tokens | 0.670 s TTFT / 2.416 s | 0.673 s TTFT / 2.440 s |
+| Uncached prose, 5,077 tokens | 778 tok/s / 7.165 s | 850 tok/s / 6.620 s |
 
-Outputs matched exactly between those builds. The measured graph gain was about
-3%, with capture cost on the first token. Decode remains the next performance
-target. The older MTP-enabled result is not a direct graph comparison.
+Both chunk sizes returned the expected colour, explanation, and tool arguments.
+The 4,096-token buffers added about two seconds before the first prefill started.
+The launcher therefore defaults to 1,024 tokens. Its context limit remains
+1,048,576 tokens. `EIDER_PREFILL_TOKEN_CAPACITY` or `--prefill-token-capacity`
+can override the chunk size. Decode on the tool requests was about 17 tok/s.
+Very short uncached suffixes still use W4A16 experts and have lower throughput:
+the cached tool request processed its remaining 90 prefill tokens at 141 tok/s.
 
-Validation includes the Nemotron unit and GPU tests, shared page-table tests,
-both focused benchmarks, and the HTTP replay above. Formatting, the release
-server build, and Clippy pass. Clippy still reports existing `chunks_exact`
-suggestions outside this change. The full workspace test suite was not run.
+Validation covers Nemotron unit and GPU tests, serial versus batched state,
+following-token decode, variable expert routers, packed activation bytes,
+ragged paged attention, and the five focused benchmarks. Compute Sanitizer
+reports zero errors for quantization, shared prefill scratch, and attention.
+The shared grouped-scale layout also passes the existing RMS/gather quantization
+regression. Formatting, the release server build, and Clippy pass; Clippy reports
+existing `chunks_exact` suggestions. The full workspace test suite was not run.
 
 ## Remaining checkpoint work
 

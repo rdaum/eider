@@ -1,12 +1,12 @@
 //! Nemotron 3 dense-linear storage choices and device operations.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, F32DenseGemm, Result,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    fp8_linear_channel_scaled_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
-    fp8_linear_f32_into_on_stream, lfm2_dense_gemm_into_on_stream,
-    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream, quantized_dense_gemm_f32_into_on_stream,
+    fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
@@ -115,11 +115,30 @@ impl Nemotron3Linear {
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
         batch_rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if batch_rows >= 8 {
+            if let Self::Fp8(linear) = self
+                && let Some(input_scale) = linear.input_scale
+                && linear.channel_weight_scale.is_none()
+                && linear.rows.is_multiple_of(16)
+                && linear.cols.is_multiple_of(16)
+            {
+                return gemm.run_calibrated_fp8_on_stream(
+                    input,
+                    &linear.weight,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    linear.weight_scale,
+                    input_scale,
+                    stream,
+                );
+            }
             return match self {
-                Self::Bf16(linear) => lfm2_dense_gemm_into_on_stream(
+                Self::Bf16(linear) => gemm.run_on_stream(
                     input,
                     &linear.weight,
                     output.output(),
@@ -128,7 +147,7 @@ impl Nemotron3Linear {
                     linear.cols,
                     stream,
                 ),
-                Self::Fp8(linear) => quantized_dense_gemm_f32_into_on_stream(
+                Self::Fp8(linear) => gemm.run_quantized_on_stream(
                     input,
                     &linear.weight,
                     None,
@@ -140,7 +159,7 @@ impl Nemotron3Linear {
                     linear.cols,
                     stream,
                 ),
-                Self::Nvfp4(linear) => quantized_dense_gemm_f32_into_on_stream(
+                Self::Nvfp4(linear) => gemm.run_quantized_on_stream(
                     input,
                     &linear.packed_weight,
                     Some(&linear.weight_scale),
@@ -202,6 +221,36 @@ impl Nemotron3Linear {
         }
     }
 
+    pub(super) fn dense_workspace<'a>(
+        rows: usize,
+        weights: impl Iterator<Item = &'a Self>,
+    ) -> Result<F32DenseGemm> {
+        if rows < 8 {
+            return F32DenseGemm::new(1, 1, 0);
+        }
+        let mut features = 1;
+        let mut elements = 0;
+        for weight in weights {
+            let (out, cols, quantized) = match weight {
+                Self::Bf16(w) => (w.rows, w.cols, false),
+                Self::Fp8(w) => (
+                    w.rows,
+                    w.cols,
+                    w.input_scale.is_none()
+                        || w.channel_weight_scale.is_some()
+                        || !w.rows.is_multiple_of(16)
+                        || !w.cols.is_multiple_of(16),
+                ),
+                Self::Nvfp4(w) => (w.rows, w.cols, true),
+            };
+            features = features.max(out).max(cols);
+            if quantized {
+                elements = elements.max(out * cols);
+            }
+        }
+        F32DenseGemm::new(rows, features, elements)
+    }
+
     pub(super) fn device_bytes(&self) -> usize {
         match self {
             Self::Bf16(linear) => linear.device_bytes(),
@@ -212,6 +261,7 @@ impl Nemotron3Linear {
 }
 
 pub(super) struct Nemotron3Fp8Linear {
+    input_scale: Option<f32>,
     weight: DeviceBuffer<u8>,
     channel_weight_scale: Option<DeviceBuffer<f32>>,
     rows: usize,
@@ -393,6 +443,7 @@ impl Nemotron3Fp8Linear {
     fn from_host(host: ModelOptFp8Linear) -> Result<Self> {
         Ok(Self {
             weight: DeviceBuffer::from_host(&host.weight)?,
+            input_scale: host.input_scale,
             channel_weight_scale: host
                 .channel_weight_scale
                 .as_deref()
@@ -437,6 +488,7 @@ impl Nemotron3Fp8Linear {
         stream.synchronize()?;
         Ok(Self {
             weight,
+            input_scale: None,
             channel_weight_scale: Some(scales),
             rows,
             cols,

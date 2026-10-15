@@ -176,3 +176,15 @@ harness = false
 [[bench]]
 name = "lfm2_experts"
 harness = false
+
+[[bench]]
+name = "nemotron35_attention"
+harness = false
+
+[[bench]]
+name = "nemotron35_mamba"
+harness = false
+
+[[bench]]
+name = "nemotron35_nvfp4"
+harness = false

@@ -25,7 +25,7 @@ add_default --max-context-tokens "${EIDER_MAX_CONTEXT_TOKENS:-1048576}"
 add_default --max-active-sequences 1
 add_default --decode-capacity 1
 add_default --prefill-sequence-capacity 1
-add_default --prefill-token-capacity "${EIDER_PREFILL_TOKEN_CAPACITY:-128}"
+add_default --prefill-token-capacity "${EIDER_PREFILL_TOKEN_CAPACITY:-1024}"
 add_default --retained-prefix-gib 1
 add_default --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-0}"
 add_default --nemotron-bf16-storage bf16

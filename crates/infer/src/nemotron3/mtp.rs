@@ -8,9 +8,10 @@ use super::{
 };
 use crate::execution::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, argmax_f32_batch_into_on_stream,
-    concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    increment_u32_in_place_on_stream, rms_norm_f32_into_on_stream, store_u32_column_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, Result,
+    argmax_f32_batch_into_on_stream, concat_f32_rows_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, increment_u32_in_place_on_stream,
+    rms_norm_f32_into_on_stream, store_u32_column_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 
@@ -91,10 +92,11 @@ impl Nemotron3Mtp {
 
     pub(super) fn workspace(
         &self,
+        lm_head: &Nemotron3Linear,
         sequence_count: usize,
         rows: usize,
     ) -> Result<Nemotron3MtpWorkspace> {
-        Nemotron3MtpWorkspace::new(self, sequence_count, rows)
+        Nemotron3MtpWorkspace::new(self, lm_head, sequence_count, rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -139,6 +141,7 @@ impl Nemotron3Mtp {
             &workspace.start_positions,
             workspace.sequence_count,
             workspace.rows,
+            &mut workspace.dense_gemm,
             stream,
         )?;
         for (cache, length) in caches.iter_mut().zip(lengths) {
@@ -421,8 +424,13 @@ impl Nemotron3Mtp {
             workspace.fused.output(),
             stream,
         )?;
-        self.fusion
-            .run_rows(&workspace.fused, &mut workspace.projected, rows, stream)
+        self.fusion.run_rows(
+            &workspace.fused,
+            &mut workspace.projected,
+            rows,
+            &mut workspace.dense_gemm,
+            stream,
+        )
     }
 
     fn execute_after_projection(
@@ -443,12 +451,14 @@ impl Nemotron3Mtp {
             &workspace.start_positions,
             workspace.sequence_count,
             rows,
+            &mut workspace.dense_gemm,
             stream,
         )?;
         self.moe.run_rows(
             workspace.attention.output(),
             &mut workspace.moe,
             rows,
+            &mut workspace.dense_gemm,
             stream,
         )?;
         rms_norm_f32_into_on_stream(
@@ -460,7 +470,13 @@ impl Nemotron3Mtp {
             self.manifest.norm_epsilon,
             stream,
         )?;
-        lm_head.run_rows(&workspace.final_hidden, &mut workspace.logits, rows, stream)
+        lm_head.run_rows(
+            &workspace.final_hidden,
+            &mut workspace.logits,
+            rows,
+            &mut workspace.dense_gemm,
+            stream,
+        )
     }
 
     fn require_target_hidden(&self, target_hidden: &DeviceBuffer<f32>, rows: usize) -> Result<()> {
@@ -497,6 +513,7 @@ impl Nemotron3MtpState {
 
 /// Exact-shape scratch and metadata for flattened MTP execution.
 pub struct Nemotron3MtpWorkspace {
+    dense_gemm: F32DenseGemm,
     tokens: DeviceBuffer<u32>,
     next_tokens: DeviceBuffer<u32>,
     next_values: DeviceBuffer<f32>,
@@ -523,7 +540,12 @@ pub struct Nemotron3MtpWorkspace {
 }
 
 impl Nemotron3MtpWorkspace {
-    fn new(mtp: &Nemotron3Mtp, sequence_count: usize, rows: usize) -> Result<Self> {
+    fn new(
+        mtp: &Nemotron3Mtp,
+        lm_head: &Nemotron3Linear,
+        sequence_count: usize,
+        rows: usize,
+    ) -> Result<Self> {
         if sequence_count == 0 || rows < sequence_count {
             return Err(Error::Shape {
                 label: "Nemotron 3 MTP workspace",
@@ -532,7 +554,12 @@ impl Nemotron3MtpWorkspace {
             });
         }
         let hidden = mtp.manifest.hidden_size;
+        let weights = [&mtp.fusion, lm_head]
+            .into_iter()
+            .chain(mtp.attention.dense_linears())
+            .chain(mtp.moe.dense_linears());
         Ok(Self {
+            dense_gemm: Nemotron3Linear::dense_workspace(rows, weights)?,
             tokens: DeviceBuffer::zeroed(rows)?,
             next_tokens: DeviceBuffer::zeroed(rows)?,
             next_values: DeviceBuffer::zeroed(rows)?,
@@ -594,7 +621,8 @@ impl Nemotron3MtpWorkspace {
 
     /// Returns bytes owned by MTP scratch and metadata.
     pub fn device_bytes(&self) -> usize {
-        self.tokens.device_bytes()
+        self.dense_gemm.device_bytes()
+            + self.tokens.device_bytes()
             + self.next_tokens.device_bytes()
             + self.next_values.device_bytes()
             + self.drafted_tokens.device_bytes()

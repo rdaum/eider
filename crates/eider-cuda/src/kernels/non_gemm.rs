@@ -2260,7 +2260,7 @@ pub struct MoeSortedNvfp4Rows {
     experts: usize,
     routes_per_row: usize,
     in_features: usize,
-    scale_stride: usize,
+    scale_tile_bytes: usize,
     packed: DeviceBuffer<u8>,
     scales: DeviceBuffer<u8>,
     source_packed: DeviceBuffer<u8>,
@@ -2297,7 +2297,7 @@ impl MoeSortedNvfp4Rows {
                 ),
             });
         }
-        let scale_stride = format::ue4m3_scale_layout_len(routes, in_features);
+        let scale_tile_bytes = format::ue4m3_scale_layout_len(128, in_features);
         let rows = routes / routes_per_row;
         Ok(Self {
             capacity_routes: routes,
@@ -2305,9 +2305,9 @@ impl MoeSortedNvfp4Rows {
             experts,
             routes_per_row,
             in_features,
-            scale_stride,
+            scale_tile_bytes,
             packed: DeviceBuffer::zeroed(routes * in_features / 2)?,
-            scales: DeviceBuffer::zeroed(experts * scale_stride)?,
+            scales: DeviceBuffer::zeroed((routes.div_ceil(128) + experts) * scale_tile_bytes)?,
             source_packed: DeviceBuffer::zeroed(rows * in_features / 2)?,
             source_scales: DeviceBuffer::zeroed(rows * in_features / 16)?,
             packed_table: DeviceBuffer::zeroed(experts)?,
@@ -2385,8 +2385,91 @@ impl MoeSortedNvfp4Rows {
                     self.routes as u32,
                     self.routes_per_row as u32,
                     self.in_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     eps,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Gathers F32 token rows and applies each expert's calibrated input scale.
+    pub fn gather_scaled_quantize_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        routes: &MoeSortedRoutes,
+        input_scales: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.calibrated_quantize(
+            input.ptr.cast(),
+            input.len(),
+            false,
+            routes,
+            input_scales,
+            stream,
+        )
+    }
+
+    /// Applies ReLU squared to sorted BF16 expert rows and quantizes with their calibrated scales.
+    pub fn relu_squared_scaled_quantize_sorted_on_stream(
+        &mut self,
+        input: &DeviceBuffer<u16>,
+        routes: &MoeSortedRoutes,
+        input_scales: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.calibrated_quantize(
+            input.ptr.cast(),
+            input.len(),
+            true,
+            routes,
+            input_scales,
+            stream,
+        )
+    }
+
+    fn calibrated_quantize(
+        &mut self,
+        input: *const std::ffi::c_void,
+        len: usize,
+        relu_squared: bool,
+        routes: &MoeSortedRoutes,
+        input_scales: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let rows = if relu_squared {
+            self.routes
+        } else {
+            self.routes / self.routes_per_row
+        };
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || input_scales.len() != self.experts
+            || len < rows * self.in_features
+            || self.scale_tile_bytes > u32::MAX as usize
+        {
+            return Err(Error::Format {
+                label: "calibrated sorted NVFP4 activations",
+                detail: "expected matching routes, expert scales, and input rows".into(),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_calibrated_quantize_on_stream",
+                ffi::infer_moe_calibrated_quantize_on_stream(
+                    input,
+                    input_scales.ptr,
+                    routes.sorted_routes.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    self.routes as u32,
+                    self.routes_per_row as u32,
+                    self.in_features as u32,
+                    self.scale_tile_bytes as u32,
+                    i32::from(relu_squared),
                     stream.as_raw(),
                 ),
             )
@@ -2444,7 +2527,7 @@ impl MoeSortedNvfp4Rows {
                     self.scales.ptr,
                     self.routes as u32,
                     self.in_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     stream.as_raw(),
                 ),
             )
@@ -2486,7 +2569,7 @@ impl MoeSortedNvfp4Rows {
                     self.scales.ptr,
                     self.routes as u32,
                     self.in_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     stream.as_raw(),
                 ),
             )
@@ -2537,7 +2620,7 @@ impl MoeSortedNvfp4Rows {
                     self.routes as u32,
                     self.routes_per_row as u32,
                     self.in_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     stream.as_raw(),
                 ),
             )
@@ -2585,7 +2668,7 @@ impl MoeSortedNvfp4Rows {
                     self.routes as u32,
                     self.routes_per_row as u32,
                     self.in_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     i32::from(gather_rows),
                     stream.as_raw(),
                 ),
@@ -2640,7 +2723,7 @@ impl MoeSortedNvfp4Rows {
                     self.experts as u32,
                     self.in_features as u32,
                     out_features as u32,
-                    self.scale_stride as u32,
+                    self.scale_tile_bytes as u32,
                     stream.as_raw(),
                 ),
             )
@@ -14918,6 +15001,91 @@ mod tests {
 
     #[serial]
     #[test]
+    fn calibrated_expert_quantization_matches_cpu_blocks_and_relu_squared() {
+        const ROWS: usize = 7;
+        const TOP: usize = 3;
+        const EXPERTS: usize = 5;
+        const K: usize = 80;
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let indices = (0..ROWS * TOP)
+            .map(|i| [0, 4, 1, 0, 1, 4, 3][i % 7])
+            .collect::<Vec<u32>>();
+        let scales = [0.125, 0.25, 1.0, 2.0, 0.5];
+        let values = (0..ROWS * K)
+            .map(|i| (i % 29) as f32 / 16. - 0.75)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&values).unwrap();
+        let input_scales = DeviceBuffer::from_host(&scales).unwrap();
+        let mut routes = MoeSortedRoutes::new(ROWS * TOP, EXPERTS).unwrap();
+        routes
+            .sort_on_stream(&DeviceBuffer::from_host(&indices).unwrap(), &stream)
+            .unwrap();
+        let order = routes.sorted_routes.copy_to_host(&stream).unwrap().to_vec();
+        let offsets = routes
+            .expert_offsets
+            .copy_to_host(&stream)
+            .unwrap()
+            .to_vec();
+        let sorted_bf16 = (0..ROWS * TOP * K)
+            .map(|i| f32_to_bf16((i % 37) as f32 / 16. - 1.))
+            .collect::<Vec<_>>();
+        let bf16 = DeviceBuffer::from_host(&sorted_bf16).unwrap();
+        let mut quantized = MoeSortedNvfp4Rows::new(ROWS, TOP, EXPERTS, K).unwrap();
+        for relu in [false, true] {
+            if relu {
+                quantized
+                    .relu_squared_scaled_quantize_sorted_on_stream(
+                        &bf16,
+                        &routes,
+                        &input_scales,
+                        &stream,
+                    )
+                    .unwrap();
+            } else {
+                quantized
+                    .gather_scaled_quantize_on_stream(&input, &routes, &input_scales, &stream)
+                    .unwrap();
+            }
+            let packed = quantized.packed.copy_to_host(&stream).unwrap();
+            let actual_scales = quantized.scales.copy_to_host(&stream).unwrap();
+            for (sorted, &route) in order.iter().enumerate() {
+                let expert = indices[route as usize] as usize;
+                let source = (0..K)
+                    .map(|col| {
+                        let value = if relu {
+                            let x = bf16_to_f32(sorted_bf16[sorted * K + col]).max(0.);
+                            x * x
+                        } else {
+                            values[route as usize / TOP * K + col]
+                        };
+                        value / scales[expert]
+                    })
+                    .collect::<Vec<_>>();
+                let expected = crate::format::quantize_nvfp4_col_major(K, 1, &source);
+                assert_eq!(
+                    &packed[sorted * K / 2..(sorted + 1) * K / 2],
+                    &expected.packed_values
+                );
+                for block in 0..K / 16 {
+                    let actual = ((offsets[expert] as usize).div_ceil(128) + expert)
+                        * quantized.scale_tile_bytes
+                        + crate::format::ue4m3_tiled_scale_offset(
+                            sorted - offsets[expert] as usize,
+                            block,
+                            K,
+                        );
+                    let reference = crate::format::ue4m3_tiled_scale_offset(0, block, K);
+                    assert_eq!(
+                        actual_scales[actual], expected.scales[reference],
+                        "expert={expert} block={block} relu={relu}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[serial]
+    #[test]
     fn causal_window_softmaxes_are_correct_and_repeatable() {
         const HEADS: usize = 8;
         const QUERY_TOKENS: usize = 9;
@@ -20323,227 +20491,229 @@ mod tests {
         const TOKENS: usize = 5;
         const Q_HEADS: usize = 4;
         const KV_HEADS: usize = 2;
-        const HEAD_DIM: usize = 8;
         const MAX_TOKENS: usize = 6;
         const PAGE_TOKENS: usize = 4;
-        const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
-        const QUERY_WIDTH: usize = Q_HEADS * HEAD_DIM;
-        let offsets = [0u32, 2];
-        let lengths = [2u32, 3];
-        let starts = [3u32, 3];
-        let query = (0..TOKENS * QUERY_WIDTH)
-            .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.0234375)
-            .collect::<Vec<_>>();
-        let key = (0..TOKENS * KV_WIDTH)
-            .map(|index| ((index * 17 % 53) as f32 - 26.0) * 0.01953125)
-            .collect::<Vec<_>>();
-        let value = (0..TOKENS * KV_WIDTH)
-            .map(|index| ((index * 19 % 59) as f32 - 29.0) * 0.015625)
-            .collect::<Vec<_>>();
-        let mut expected_keys = (0..SEQUENCES)
-            .map(|sequence| {
-                (0..MAX_TOKENS * KV_WIDTH)
-                    .map(|index| {
-                        if index < starts[sequence] as usize * KV_WIDTH {
-                            (((index + sequence * 7) * 11 % 43) as f32 - 21.0) * 0.02734375
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut expected_values = (0..SEQUENCES)
-            .map(|sequence| {
-                (0..MAX_TOKENS * KV_WIDTH)
-                    .map(|index| {
-                        if index < starts[sequence] as usize * KV_WIDTH {
-                            (((index + sequence * 5) * 7 % 41) as f32 - 20.0) * 0.03125
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let initial_keys = expected_keys.clone();
-        let initial_values = expected_values.clone();
-        for sequence in 0..SEQUENCES {
-            let begin = offsets[sequence] as usize;
-            for local in 0..lengths[sequence] as usize {
-                let source = (begin + local) * KV_WIDTH;
-                let destination = (starts[sequence] as usize + local) * KV_WIDTH;
-                expected_keys[sequence][destination..destination + KV_WIDTH]
-                    .copy_from_slice(&key[source..source + KV_WIDTH]);
-                expected_values[sequence][destination..destination + KV_WIDTH]
-                    .copy_from_slice(&value[source..source + KV_WIDTH]);
+        for head_dim in [8, 128] {
+            let kv_width = KV_HEADS * head_dim;
+            let query_width = Q_HEADS * head_dim;
+            let offsets = [0u32, 2];
+            let lengths = [2u32, 3];
+            let starts = [3u32, 3];
+            let query = (0..TOKENS * query_width)
+                .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.0234375)
+                .collect::<Vec<_>>();
+            let key = (0..TOKENS * kv_width)
+                .map(|index| ((index * 17 % 53) as f32 - 26.0) * 0.01953125)
+                .collect::<Vec<_>>();
+            let value = (0..TOKENS * kv_width)
+                .map(|index| ((index * 19 % 59) as f32 - 29.0) * 0.015625)
+                .collect::<Vec<_>>();
+            let mut expected_keys = (0..SEQUENCES)
+                .map(|sequence| {
+                    (0..MAX_TOKENS * kv_width)
+                        .map(|index| {
+                            if index < starts[sequence] as usize * kv_width {
+                                (((index + sequence * 7) * 11 % 43) as f32 - 21.0) * 0.02734375
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut expected_values = (0..SEQUENCES)
+                .map(|sequence| {
+                    (0..MAX_TOKENS * kv_width)
+                        .map(|index| {
+                            if index < starts[sequence] as usize * kv_width {
+                                (((index + sequence * 5) * 7 % 41) as f32 - 20.0) * 0.03125
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let initial_keys = expected_keys.clone();
+            let initial_values = expected_values.clone();
+            for sequence in 0..SEQUENCES {
+                let begin = offsets[sequence] as usize;
+                for local in 0..lengths[sequence] as usize {
+                    let source = (begin + local) * kv_width;
+                    let destination = (starts[sequence] as usize + local) * kv_width;
+                    expected_keys[sequence][destination..destination + kv_width]
+                        .copy_from_slice(&key[source..source + kv_width]);
+                    expected_values[sequence][destination..destination + kv_width]
+                        .copy_from_slice(&value[source..source + kv_width]);
+                }
             }
-        }
 
-        let stream = CudaStream::new_non_blocking().expect("stream");
-        let query_device = DeviceBuffer::from_host(&query).expect("query");
-        let key_device = DeviceBuffer::from_host(&key).expect("key");
-        let value_device = DeviceBuffer::from_host(&value).expect("value");
-        let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
-        let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
-        let starts_device = DeviceBuffer::from_host(&starts).expect("starts");
-        let key_caches = initial_keys
-            .iter()
-            .map(|cache| DeviceBuffer::from_host(cache).expect("key cache"))
-            .collect::<Vec<_>>();
-        let value_caches = initial_values
-            .iter()
-            .map(|cache| DeviceBuffer::from_host(cache).expect("value cache"))
-            .collect::<Vec<_>>();
-        let key_table = DeviceBuffer::from_host(
-            &key_caches
+            let stream = CudaStream::new_non_blocking().expect("stream");
+            let query_device = DeviceBuffer::from_host(&query).expect("query");
+            let key_device = DeviceBuffer::from_host(&key).expect("key");
+            let value_device = DeviceBuffer::from_host(&value).expect("value");
+            let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
+            let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
+            let starts_device = DeviceBuffer::from_host(&starts).expect("starts");
+            let key_caches = initial_keys
                 .iter()
-                .map(DeviceBuffer::cuda_address)
-                .collect::<Vec<_>>(),
-        )
-        .expect("key table");
-        let value_table = DeviceBuffer::from_host(
-            &value_caches
+                .map(|cache| DeviceBuffer::from_host(cache).expect("key cache"))
+                .collect::<Vec<_>>();
+            let value_caches = initial_values
                 .iter()
-                .map(DeviceBuffer::cuda_address)
-                .collect::<Vec<_>>(),
-        )
-        .expect("value table");
-        append_ragged_kv_f32_into_on_stream(
-            &key_device,
-            &value_device,
-            &key_table,
-            &value_table,
-            0,
-            &offsets_device,
-            &lengths_device,
-            &starts_device,
-            SEQUENCES,
-            TOKENS,
-            KV_WIDTH,
-            &stream,
-        )
-        .expect("ragged KV append");
-        let mut actual = DeviceBuffer::zeroed(TOKENS * QUERY_WIDTH).expect("output");
-        ragged_gqa_attention_f32_into_on_stream(
-            &query_device,
-            &key_table,
-            &value_table,
-            0,
-            &offsets_device,
-            &lengths_device,
-            &starts_device,
-            actual.output(),
-            SEQUENCES,
-            TOKENS,
-            Q_HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            &stream,
-        )
-        .expect("ragged GQA");
+                .map(|cache| DeviceBuffer::from_host(cache).expect("value cache"))
+                .collect::<Vec<_>>();
+            let key_table = DeviceBuffer::from_host(
+                &key_caches
+                    .iter()
+                    .map(DeviceBuffer::cuda_address)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("key table");
+            let value_table = DeviceBuffer::from_host(
+                &value_caches
+                    .iter()
+                    .map(DeviceBuffer::cuda_address)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("value table");
+            append_ragged_kv_f32_into_on_stream(
+                &key_device,
+                &value_device,
+                &key_table,
+                &value_table,
+                0,
+                &offsets_device,
+                &lengths_device,
+                &starts_device,
+                SEQUENCES,
+                TOKENS,
+                kv_width,
+                &stream,
+            )
+            .expect("ragged KV append");
+            let mut actual = DeviceBuffer::zeroed(TOKENS * query_width).expect("output");
+            ragged_gqa_attention_f32_into_on_stream(
+                &query_device,
+                &key_table,
+                &value_table,
+                0,
+                &offsets_device,
+                &lengths_device,
+                &starts_device,
+                actual.output(),
+                SEQUENCES,
+                TOKENS,
+                Q_HEADS,
+                KV_HEADS,
+                head_dim,
+                &stream,
+            )
+            .expect("ragged GQA");
 
-        for sequence in 0..SEQUENCES {
-            assert_eq!(
-                key_caches[sequence]
-                    .copy_to_host(&stream)
-                    .expect("key cache download"),
-                expected_keys[sequence],
-            );
-            assert_eq!(
-                value_caches[sequence]
-                    .copy_to_host(&stream)
-                    .expect("value cache download"),
-                expected_values[sequence],
-            );
-        }
-        let actual = actual.copy_to_host(&stream).expect("output download");
-        let mut expected = Vec::with_capacity(actual.len());
-        for sequence in 0..SEQUENCES {
-            let begin = offsets[sequence] as usize;
-            for local in 0..lengths[sequence] as usize {
-                let row = begin + local;
-                expected.extend(cpu_cached_gqa_attention(
-                    &query[row * QUERY_WIDTH..(row + 1) * QUERY_WIDTH],
-                    &expected_keys[sequence],
-                    &expected_values[sequence],
-                    starts[sequence] as usize + local + 1,
-                    Q_HEADS,
-                    KV_HEADS,
-                    HEAD_DIM,
-                ));
+            for sequence in 0..SEQUENCES {
+                assert_eq!(
+                    key_caches[sequence]
+                        .copy_to_host(&stream)
+                        .expect("key cache download"),
+                    expected_keys[sequence],
+                );
+                assert_eq!(
+                    value_caches[sequence]
+                        .copy_to_host(&stream)
+                        .expect("value cache download"),
+                    expected_values[sequence],
+                );
             }
-        }
-        assert_close(&actual, &expected, 2.0e-6, "ragged GQA");
-
-        let page_slots = 4;
-        let page_table_rows = [[2u32, 0], [3u32, 1]];
-        let page_tables = page_table_rows
-            .iter()
-            .map(|table| DeviceBuffer::from_host(table).expect("page table"))
-            .collect::<Vec<_>>();
-        let page_table_ptrs = DeviceBuffer::from_host(
-            &page_tables
-                .iter()
-                .map(DeviceBuffer::cuda_address)
-                .collect::<Vec<_>>(),
-        )
-        .expect("page table pointers");
-        let mut paged_keys = vec![0.0; page_slots * PAGE_TOKENS * KV_WIDTH];
-        let mut paged_values = vec![0.0; page_slots * PAGE_TOKENS * KV_WIDTH];
-        for sequence in 0..SEQUENCES {
-            for logical_row in 0..MAX_TOKENS {
-                let slot = page_table_rows[sequence][logical_row / PAGE_TOKENS] as usize;
-                let physical_row = slot * PAGE_TOKENS + logical_row % PAGE_TOKENS;
-                let source = logical_row * KV_WIDTH;
-                let destination = physical_row * KV_WIDTH;
-                paged_keys[destination..destination + KV_WIDTH]
-                    .copy_from_slice(&initial_keys[sequence][source..source + KV_WIDTH]);
-                paged_values[destination..destination + KV_WIDTH]
-                    .copy_from_slice(&initial_values[sequence][source..source + KV_WIDTH]);
+            let actual = actual.copy_to_host(&stream).expect("output download");
+            let mut expected = Vec::with_capacity(actual.len());
+            for sequence in 0..SEQUENCES {
+                let begin = offsets[sequence] as usize;
+                for local in 0..lengths[sequence] as usize {
+                    let row = begin + local;
+                    expected.extend(cpu_cached_gqa_attention(
+                        &query[row * query_width..(row + 1) * query_width],
+                        &expected_keys[sequence],
+                        &expected_values[sequence],
+                        starts[sequence] as usize + local + 1,
+                        Q_HEADS,
+                        KV_HEADS,
+                        head_dim,
+                    ));
+                }
             }
+            assert_close(&actual, &expected, 2.0e-6, "ragged GQA");
+
+            let page_slots = 4;
+            let page_table_rows = [[2u32, 0], [3u32, 1]];
+            let page_tables = page_table_rows
+                .iter()
+                .map(|table| DeviceBuffer::from_host(table).expect("page table"))
+                .collect::<Vec<_>>();
+            let page_table_ptrs = DeviceBuffer::from_host(
+                &page_tables
+                    .iter()
+                    .map(DeviceBuffer::cuda_address)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("page table pointers");
+            let mut paged_keys = vec![0.0; page_slots * PAGE_TOKENS * kv_width];
+            let mut paged_values = vec![0.0; page_slots * PAGE_TOKENS * kv_width];
+            for sequence in 0..SEQUENCES {
+                for logical_row in 0..MAX_TOKENS {
+                    let slot = page_table_rows[sequence][logical_row / PAGE_TOKENS] as usize;
+                    let physical_row = slot * PAGE_TOKENS + logical_row % PAGE_TOKENS;
+                    let source = logical_row * kv_width;
+                    let destination = physical_row * kv_width;
+                    paged_keys[destination..destination + kv_width]
+                        .copy_from_slice(&initial_keys[sequence][source..source + kv_width]);
+                    paged_values[destination..destination + kv_width]
+                        .copy_from_slice(&initial_values[sequence][source..source + kv_width]);
+                }
+            }
+            let mut paged_keys = DeviceBuffer::from_host(&paged_keys).expect("paged keys");
+            let mut paged_values = DeviceBuffer::from_host(&paged_values).expect("paged values");
+            append_ragged_paged_kv_f32_into_on_stream(
+                &key_device,
+                &value_device,
+                &mut paged_keys,
+                &mut paged_values,
+                &page_table_ptrs,
+                &offsets_device,
+                &lengths_device,
+                &starts_device,
+                SEQUENCES,
+                TOKENS,
+                PAGE_TOKENS,
+                kv_width,
+                &stream,
+            )
+            .expect("ragged paged KV append");
+            let mut paged_output =
+                DeviceBuffer::zeroed(TOKENS * query_width).expect("paged output");
+            ragged_paged_gqa_attention_f32_into_on_stream(
+                &query_device,
+                &paged_keys,
+                &paged_values,
+                &page_table_ptrs,
+                &offsets_device,
+                &lengths_device,
+                &starts_device,
+                paged_output.output(),
+                SEQUENCES,
+                TOKENS,
+                PAGE_TOKENS,
+                Q_HEADS,
+                KV_HEADS,
+                head_dim,
+                &stream,
+            )
+            .expect("ragged paged GQA");
+            let paged_output = paged_output
+                .copy_to_host(&stream)
+                .expect("paged output download");
+            assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
         }
-        let mut paged_keys = DeviceBuffer::from_host(&paged_keys).expect("paged keys");
-        let mut paged_values = DeviceBuffer::from_host(&paged_values).expect("paged values");
-        append_ragged_paged_kv_f32_into_on_stream(
-            &key_device,
-            &value_device,
-            &mut paged_keys,
-            &mut paged_values,
-            &page_table_ptrs,
-            &offsets_device,
-            &lengths_device,
-            &starts_device,
-            SEQUENCES,
-            TOKENS,
-            PAGE_TOKENS,
-            KV_WIDTH,
-            &stream,
-        )
-        .expect("ragged paged KV append");
-        let mut paged_output = DeviceBuffer::zeroed(TOKENS * QUERY_WIDTH).expect("paged output");
-        ragged_paged_gqa_attention_f32_into_on_stream(
-            &query_device,
-            &paged_keys,
-            &paged_values,
-            &page_table_ptrs,
-            &offsets_device,
-            &lengths_device,
-            &starts_device,
-            paged_output.output(),
-            SEQUENCES,
-            TOKENS,
-            PAGE_TOKENS,
-            Q_HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            &stream,
-        )
-        .expect("ragged paged GQA");
-        let paged_output = paged_output
-            .copy_to_host(&stream)
-            .expect("paged output download");
-        assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
     }
 
     #[serial]

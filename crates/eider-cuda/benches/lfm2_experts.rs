@@ -1,5 +1,5 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Lfm2DenseGemm, MoeSortedRoutes,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, F32DenseGemm, MoeSortedRoutes,
     bf16_linear_logits_f32_batch_into_on_stream, lfm2_dense_gemm_into_on_stream,
     lfm2_expert_gemm_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
@@ -233,7 +233,7 @@ fn sample<const OUT: usize, const IN: usize, const MODE: usize, const ROUTES: us
     ))
 }
 struct Dense<const OUT: usize, const IN: usize> {
-    gemm: Lfm2DenseGemm,
+    gemm: F32DenseGemm,
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -277,7 +277,7 @@ impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
 impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
     fn prepare(_: usize) -> Self {
         let mut context = Self {
-            gemm: Lfm2DenseGemm::new(256, OUT.max(IN)).unwrap(),
+            gemm: F32DenseGemm::new(256, OUT.max(IN), 0).unwrap(),
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
             stop: CudaEvent::new().unwrap(),

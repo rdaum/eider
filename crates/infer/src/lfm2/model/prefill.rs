@@ -2,7 +2,7 @@
 
 use super::*;
 use eider_cuda::{
-    CudaEvent, Lfm2DenseGemm, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
+    CudaEvent, F32DenseGemm, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, lfm2_dense_gemm_into_on_stream,
     lfm2_expert_gemm_pipelined_into_on_stream, lfm2_router_batch_into_on_stream,
     lfm2_short_conv_batch_into_on_stream,
@@ -13,7 +13,7 @@ use eider_cuda::{
 pub struct Lfm2PrefillWorkspace<'model> {
     model: &'model Lfm2Model,
     capacity: usize,
-    dense_gemm: Lfm2DenseGemm,
+    dense_gemm: F32DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
     upload_done: CudaEvent,
@@ -53,7 +53,7 @@ impl Bf16Linear {
         output: &mut DeviceBuffer<f32>,
         rows: usize,
         stream: &CudaStream,
-        gemm: &mut Lfm2DenseGemm,
+        gemm: &mut F32DenseGemm,
     ) -> Result<()> {
         // Long reductions retain four high-component accumulators.
         if rows >= 16 && self.rows >= 512 && self.cols <= 4096 {
@@ -119,7 +119,7 @@ impl Lfm2Model {
         Ok(Lfm2PrefillWorkspace {
             model: self,
             capacity,
-            dense_gemm: Lfm2DenseGemm::new(capacity, (h * 3).max(c.intermediate_size))?,
+            dense_gemm: F32DenseGemm::new(capacity, (h * 3).max(c.intermediate_size), 0)?,
             host_tokens: PinnedHostBuffer::zeroed(capacity)?,
             tokens: DeviceBuffer::zeroed(capacity)?,
             upload_done: CudaEvent::new()?,

@@ -1,6 +1,6 @@
 use super::{NEMOTRON_OMNI_ARCHITECTURE, Nemotron3Manifest, Nemotron3Model, Nemotron3Router};
 use crate::{CheckpointArchitecture, checkpoint_architecture};
-use eider_cuda::{CudaStream, DeviceBuffer, MambaSsmDtype};
+use eider_cuda::{CudaStream, DeviceBuffer, F32DenseGemm, MambaSsmDtype};
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use serde_json::{Value, json};
 use std::fs;
@@ -211,7 +211,8 @@ fn prefill_retains_last_logits_and_recurrent_state_for_ragged_sequences() {
         )
         .unwrap();
     assert!(prefill.logits().is_empty());
-    assert_eq!(all.device_bytes() - prefill.device_bytes(), 8 * 128 * 4);
+    // All-row logits also retain a separate cuBLAS plan for the LM head.
+    assert!(all.device_bytes() - prefill.device_bytes() >= 8 * 128 * 4);
     for (reference, candidate) in reference.iter_mut().zip(candidate) {
         for next in [None, Some(9)] {
             if let Some(token) = next {
@@ -227,6 +228,39 @@ fn prefill_retains_last_logits_and_recurrent_state_for_ragged_sequences() {
                     "{a} vs {b}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn shared_prefill_scratch_matches_serial_layers_and_following_decode() {
+    // Both MoE layers use the same scratch shape, including their route tables.
+    let fixture = Fixture::new(true, 3);
+    let model = Nemotron3Model::load(&fixture.root).unwrap();
+    let mut cache = super::new_nemotron3_sequence_cache(&model, 2, 64).unwrap();
+    let mut serial = super::Nemotron3Sequence::admit(&model, &mut cache, 64).unwrap();
+    let mut batched = super::Nemotron3Sequence::admit(&model, &mut cache, 64).unwrap();
+    let tokens = (1..=31).collect::<Vec<_>>();
+    let mut workspace = model.prefill_workspace(1, tokens.len()).unwrap();
+    for &token in &tokens {
+        model.forward_one(&mut serial, &mut cache, token).unwrap();
+    }
+    model
+        .forward_block(&mut [&mut batched], &[&tokens], &mut workspace, &mut cache)
+        .unwrap();
+    for next in [None, Some(32), Some(33)] {
+        if let Some(token) = next {
+            model.forward_one(&mut serial, &mut cache, token).unwrap();
+            model.forward_one(&mut batched, &mut cache, token).unwrap();
+        }
+        assert_eq!(serial.position(), batched.position());
+        let expected = model.logits_to_host(&serial).unwrap();
+        let actual = model.logits_to_host(&batched).unwrap();
+        for (&a, &b) in actual.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && (a - b).abs() < 1e-4 + b.abs() * 1e-5,
+                "{a} vs {b}"
+            );
         }
     }
 }
@@ -295,15 +329,18 @@ fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
     let stream = CudaStream::new_non_blocking().unwrap();
     let input = vec![1.0_f32; 128];
     let single = DeviceBuffer::from_host(&input).unwrap();
-    let batched = DeviceBuffer::from_host(&input.repeat(3)).unwrap();
+    let mut gemm = F32DenseGemm::new(17, 128, 0).unwrap();
+    let batched = DeviceBuffer::from_host(&input.repeat(17)).unwrap();
     for (layer, experts) in [(1, 4), (3, 3)] {
         let router = Nemotron3Router::load(&checkpoint, &manifest, layer).unwrap();
         let mut one = router.workspace().unwrap();
-        let mut rows = router.rows_workspace(3).unwrap();
+        let mut rows = router.rows_workspace(17).unwrap();
         router.run(&single, &mut one, &stream).unwrap();
-        router.run_rows(&batched, &mut rows, 3, &stream).unwrap();
+        router
+            .run_rows(&batched, &mut rows, 17, &mut gemm, &stream)
+            .unwrap();
         assert_eq!(one.logits().len(), experts);
-        assert_eq!(rows.logits().len(), 3 * experts);
+        assert_eq!(rows.logits().len(), 17 * experts);
         let expected_ids = [(experts - 1) as u32, (experts - 2) as u32];
         let probabilities = expected_ids.map(|id| 1.0 / (1.0 + (-(id as f32 + 1.0) / 8.0).exp()));
         let expected_weights = probabilities.map(|p| 2.0 * p / probabilities.iter().sum::<f32>());
@@ -313,7 +350,7 @@ fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
         );
         assert_eq!(
             &*rows.indices().copy_to_host(&stream).unwrap(),
-            &expected_ids.repeat(3)
+            &expected_ids.repeat(17)
         );
         for weights in [
             one.weights().copy_to_host(&stream).unwrap().to_vec(),
@@ -333,7 +370,13 @@ fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
     );
     assert!(
         three
-            .run_rows(&batched, &mut four.rows_workspace(3).unwrap(), 3, &stream)
+            .run_rows(
+                &batched,
+                &mut four.rows_workspace(17).unwrap(),
+                17,
+                &mut gemm,
+                &stream
+            )
             .is_err()
     );
 }

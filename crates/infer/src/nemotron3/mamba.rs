@@ -3,7 +3,7 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, Result, add_f32_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
@@ -115,6 +115,10 @@ impl Nemotron3MambaLayer {
     }
 
     /// Allocates the scratch buffers used for one-token execution.
+    pub(super) fn dense_linears(&self) -> [&Nemotron3Linear; 2] {
+        [&self.in_proj, &self.out_proj]
+    }
+
     pub fn workspace(&self) -> Result<Nemotron3MambaWorkspace> {
         Nemotron3MambaWorkspace::new(&self.manifest)
     }
@@ -212,6 +216,7 @@ impl Nemotron3MambaLayer {
         sequence_lengths: &DeviceBuffer<u32>,
         sequence_count: usize,
         rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         self.run_rows_impl(
@@ -225,6 +230,7 @@ impl Nemotron3MambaLayer {
             sequence_count,
             rows,
             None,
+            gemm,
             stream,
         )
     }
@@ -246,6 +252,7 @@ impl Nemotron3MambaLayer {
         conv_snapshots: &mut DeviceBuffer<u16>,
         ssm_snapshots: &mut DeviceBuffer<u8>,
         snapshot_slots: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         self.run_rows_impl(
@@ -259,6 +266,7 @@ impl Nemotron3MambaLayer {
             sequence_count,
             rows,
             Some((conv_snapshots, ssm_snapshots, snapshot_slots)),
+            gemm,
             stream,
         )
     }
@@ -276,6 +284,7 @@ impl Nemotron3MambaLayer {
         sequence_count: usize,
         rows: usize,
         mut snapshots: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u8>, usize)>,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -295,8 +304,13 @@ impl Nemotron3MambaLayer {
             self.manifest.norm_epsilon,
             stream,
         )?;
-        self.in_proj
-            .run_rows(&workspace.normed, &mut workspace.projected, rows, stream)?;
+        self.in_proj.run_rows(
+            &workspace.normed,
+            &mut workspace.projected,
+            rows,
+            gemm,
+            stream,
+        )?;
         if let Some((conv_snapshots, ssm_snapshots, snapshot_slots)) = snapshots.as_mut() {
             nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
                 &workspace.projected,
@@ -386,6 +400,7 @@ impl Nemotron3MambaLayer {
             &workspace.mixer_output,
             &mut workspace.projected_output,
             rows,
+            gemm,
             stream,
         )?;
         add_f32_into_on_stream(

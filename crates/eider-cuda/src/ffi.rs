@@ -1694,6 +1694,21 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_moe_calibrated_quantize_on_stream(
+        input: *const c_void,
+        input_scales: *const f32,
+        sorted_routes: *const u32,
+        sorted_experts: *const u32,
+        expert_offsets: *const u32,
+        packed: *mut u8,
+        scales: *mut u8,
+        routes: u32,
+        routes_per_row: u32,
+        features: u32,
+        scale_tile_bytes: u32,
+        relu_squared: i32,
+        stream: *mut c_void,
+    ) -> i32;
     pub(crate) fn infer_moe_quantize_sorted_routes_nvfp4_on_stream(
         input: *const f32,
         sorted_routes: *const u32,
@@ -1704,7 +1719,7 @@ unsafe extern "C" {
         routes: u32,
         routes_per_row: u32,
         in_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         gather_rows: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -1717,7 +1732,7 @@ unsafe extern "C" {
         scales: *mut u8,
         routes: u32,
         in_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_on_stream(
@@ -1728,7 +1743,7 @@ unsafe extern "C" {
         scales: *mut u8,
         routes: u32,
         in_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on_stream(
@@ -1745,7 +1760,7 @@ unsafe extern "C" {
         routes: u32,
         routes_per_row: u32,
         in_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -1762,7 +1777,7 @@ unsafe extern "C" {
         routes: u32,
         routes_per_row: u32,
         in_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_moe_grouped_pointer_tables_on_stream(
@@ -1776,7 +1791,7 @@ unsafe extern "C" {
         experts: u32,
         in_features: u32,
         out_features: u32,
-        scale_stride: u32,
+        scale_tile_bytes: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_repeat_row_pointer_table_f32_on_stream(

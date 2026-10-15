@@ -1,11 +1,10 @@
 //! Nemotron 3 MoE router weights and top-k routing execution.
 
-use super::linear::load_bf16_host;
+use super::linear::{Nemotron3Bf16Linear, Nemotron3Linear};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
-    nemotron3_sigmoid_topk_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, F32DenseGemm, Result,
+    nemotron3_sigmoid_topk_f32_batch_into_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 
@@ -13,7 +12,7 @@ use eider_format::ModelOptCheckpoint;
 pub struct Nemotron3Router {
     manifest: Nemotron3Manifest,
     moe: Nemotron3MoeLayerConfig,
-    weight: DeviceBuffer<u16>,
+    weight: Nemotron3Linear,
     correction_bias: DeviceBuffer<f32>,
 }
 
@@ -74,11 +73,12 @@ impl Nemotron3Router {
         prefix: &str,
     ) -> Result<Self> {
         let moe = manifest.resolve_moe_config(checkpoint, moe, prefix)?;
-        let weight = load_bf16_host(
+        let weight = Nemotron3Linear::Bf16(Nemotron3Bf16Linear::load(
             checkpoint,
-            &format!("{prefix}.weight"),
-            &[moe.routed_experts, manifest.hidden_size],
-        )?;
+            prefix,
+            moe.routed_experts,
+            manifest.hidden_size,
+        )?);
         let bias_name = format!("{prefix}.e_score_correction_bias");
         let bias_shard = checkpoint.open_shard_for_tensor(&bias_name)?;
         let bias_info = bias_shard.require_tensor(&bias_name)?;
@@ -93,7 +93,7 @@ impl Nemotron3Router {
         Ok(Self {
             manifest: manifest.clone(),
             moe,
-            weight: DeviceBuffer::from_host(&weight)?,
+            weight,
             correction_bias: DeviceBuffer::from_host(&correction_bias)?,
         })
     }
@@ -123,14 +123,7 @@ impl Nemotron3Router {
             });
         }
         workspace.require_shape(self.moe)?;
-        bf16_linear_logits_f32_into_on_stream(
-            hidden,
-            &self.weight,
-            workspace.logits.output(),
-            self.moe.routed_experts,
-            self.manifest.hidden_size,
-            stream,
-        )?;
+        self.weight.run(hidden, &mut workspace.logits, stream)?;
         nemotron3_sigmoid_topk_f32_into_on_stream(
             &workspace.logits,
             &self.correction_bias,
@@ -151,6 +144,7 @@ impl Nemotron3Router {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3RouterRowsWorkspace,
         rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -161,15 +155,8 @@ impl Nemotron3Router {
             });
         }
         workspace.require_shape(self.moe, rows)?;
-        bf16_linear_logits_f32_batch_into_on_stream(
-            hidden,
-            &self.weight,
-            workspace.logits.output(),
-            rows,
-            self.moe.routed_experts,
-            self.manifest.hidden_size,
-            stream,
-        )?;
+        self.weight
+            .run_rows(hidden, &mut workspace.logits, rows, gemm, stream)?;
         nemotron3_sigmoid_topk_f32_batch_into_on_stream(
             &workspace.logits,
             &self.correction_bias,
@@ -183,6 +170,10 @@ impl Nemotron3Router {
             self.manifest.routed_scaling_factor,
             stream,
         )
+    }
+
+    pub(super) fn linear(&self) -> &Nemotron3Linear {
+        &self.weight
     }
 
     /// Returns bytes owned by the router weights.

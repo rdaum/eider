@@ -468,6 +468,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .count();
         let key = (sequence_count, rows, mtp_sequence_count, mtp_rows);
         if !self.prefill_workspaces.contains_key(&key) {
+            // Keep full chunks and the current tail. Each tail owns GEMM scratch,
+            // so retaining every exact prompt remainder would grow without bound.
+            self.prefill_workspaces
+                .retain(|cached, _| cached.1 == self.config.prefill_token_capacity);
             self.prefill_workspaces.insert(
                 key,
                 Nemotron3PrefillWorkspace::new(

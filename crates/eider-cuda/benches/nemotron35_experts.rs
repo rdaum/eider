@@ -197,6 +197,13 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
                 "pipelined arithmetic"
             );
         }
+        // Time balanced routing after correctness covers skewed and empty groups.
+        context.indices = DeviceBuffer::from_host(
+            &(0..ROUTES)
+                .map(|i| ((i * 17 + i / EXPERTS * 19) % EXPERTS) as u32)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         context
     }
     fn chunk_size() -> Option<usize> {
@@ -258,6 +265,38 @@ fn main() {
                     let group = group.measurement_domain(MeasurementDomain::Gpu);
                     group.bench_sample("SIMT", sample::<1024, 2688, 0, 2816>);
                     group.bench_sample("tensor including sort", sample::<1024, 2688, 2, 2816>);
+                },
+            );
+            runner.group::<Experts<2688, 1024, 11264>>(
+                "Nemotron 3.5 up 512 tokens x 22",
+                |group| {
+                    group
+                        .measurement_domain(MeasurementDomain::Gpu)
+                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 11264>);
+                },
+            );
+            runner.group::<Experts<1024, 2688, 11264>>(
+                "Nemotron 3.5 down 512 tokens x 22",
+                |group| {
+                    group
+                        .measurement_domain(MeasurementDomain::Gpu)
+                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 11264>);
+                },
+            );
+            runner.group::<Experts<2688, 1024, 22528>>(
+                "Nemotron 3.5 up 1024 tokens x 22",
+                |group| {
+                    group
+                        .measurement_domain(MeasurementDomain::Gpu)
+                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 22528>);
+                },
+            );
+            runner.group::<Experts<1024, 2688, 22528>>(
+                "Nemotron 3.5 down 1024 tokens x 22",
+                |group| {
+                    group
+                        .measurement_domain(MeasurementDomain::Gpu)
+                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 22528>);
                 },
             );
         },

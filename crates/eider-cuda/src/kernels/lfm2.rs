@@ -1,11 +1,21 @@
 //! LFM2 projections, gated short convolution, routing, and head-64 attention.
 
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
-use crate::{Bf16TnMatmulPlan, CublasLt, DeviceAddress, Error, GemmShape, MoeSortedRoutes, Result};
+use crate::{
+    Bf16TnMatmulPlan, CublasLt, DeviceAddress, Error, Fp8TnMatmulPlan, GemmShape, MoeSortedRoutes,
+    Result,
+};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn infer_expand_dense_bf16_on_stream(
+        weight: *const u8,
+        scales: *const u8,
+        output: *mut u16,
+        elements: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_quantized_dense_gemm_f32_on_stream(
         input: *const f32,
         weight: *const u8,
@@ -31,6 +41,9 @@ unsafe extern "C" {
         output: *mut f32,
         count: u32,
         stride: u32,
+        channels: *const f32,
+        scale: f32,
+        width: u32,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -95,37 +108,120 @@ pub fn quantized_dense_gemm_f32_into_on_stream(
     }
 }
 
-/// Reusable dense projections with three BF16 components per F32 activation.
-pub struct Lfm2DenseGemm {
+/// Reusable projections from F32 rows, with BF16 decomposition or calibrated FP8 activations.
+pub struct F32DenseGemm {
     lt: CublasLt,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
+    fp8_plans: HashMap<(usize, usize, usize), Fp8TnMatmulPlan>,
+    fp8_input: DeviceBuffer<u8>,
     input: DeviceBuffer<u16>,
     products: DeviceBuffer<f32>,
+    expanded_weight: DeviceBuffer<u16>,
     capacity: usize,
     features: usize,
 }
 
-impl Lfm2DenseGemm {
+enum DenseGemmWeights<'a> {
+    Bf16(&'a DeviceBuffer<u16>),
+    Quantized(&'a DeviceBuffer<u8>),
+}
+
+impl F32DenseGemm {
     /// Allocates scratch for the largest input/output width and prompt chunk.
-    pub fn new(capacity: usize, features: usize) -> Result<Self> {
+    /// Set max_quantized_elements to zero for BF16-only projections.
+    pub fn new(capacity: usize, features: usize, max_quantized_elements: usize) -> Result<Self> {
         let count = capacity
             .checked_next_power_of_two()
             .and_then(|rows| rows.checked_mul(features))
             .and_then(|n| n.checked_mul(3));
-        if capacity == 0 || features == 0 || count.is_none_or(|n| n > u32::MAX as usize) {
+        if capacity == 0
+            || features == 0
+            || max_quantized_elements > u32::MAX as usize
+            || count.is_none_or(|n| n > u32::MAX as usize)
+        {
             return Err(Error::Format {
-                label: "LFM2 dense GEMM",
+                label: "F32 dense GEMM",
                 detail: "invalid workspace dimensions".into(),
             });
         }
         Ok(Self {
             lt: CublasLt::new()?,
             plans: HashMap::new(),
+            fp8_plans: HashMap::new(),
+            fp8_input: DeviceBuffer::zeroed(count.unwrap() / 3)?,
             input: DeviceBuffer::zeroed(count.unwrap())?,
             products: DeviceBuffer::zeroed(count.unwrap())?,
+            expanded_weight: DeviceBuffer::zeroed(max_quantized_elements)?,
             capacity,
             features,
         })
+    }
+
+    /// Uses a checkpoint's calibrated FP8 activation scale and resident FP8 weights.
+    /// Plans use the exact row count; callers retain one workspace per batch shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_calibrated_fp8_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        weight_scale: f32,
+        input_scale: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > self.capacity
+            || out == 0
+            || cols == 0
+            || out > self.features
+            || cols > self.features
+            || input.len() < rows * cols
+            || output.len() < rows * out
+            || weight.len() != out * cols
+            || !input_scale.is_finite()
+            || input_scale <= 0.
+            || !weight_scale.is_finite()
+        {
+            return Err(Error::Format {
+                label: "calibrated FP8 dense GEMM",
+                detail: "invalid shape, buffers, or scales".into(),
+            });
+        }
+        let key = (out, cols, rows);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.fp8_plans.entry(key) {
+            entry.insert(Fp8TnMatmulPlan::new(
+                &self.lt,
+                GemmShape {
+                    m: out,
+                    n: rows,
+                    k: cols,
+                },
+                1 << 20,
+            )?);
+        }
+        unsafe {
+            check_cuda(
+                "infer_quantize_fp8_e4m3_f32_on_stream",
+                crate::ffi::infer_quantize_fp8_e4m3_f32_on_stream(
+                    input.ptr,
+                    self.fp8_input.ptr,
+                    (rows * cols) as u32,
+                    input_scale,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.fp8_plans[&key].run_with_alpha_on_stream(
+            &self.lt,
+            weight,
+            &self.fp8_input,
+            output,
+            weight_scale * input_scale,
+            stream,
+        )
     }
 
     /// Projects active rows, preserving F32 activation residuals in three products.
@@ -136,6 +232,78 @@ impl Lfm2DenseGemm {
         &mut self,
         input: &DeviceBuffer<f32>,
         weight: &DeviceBuffer<u16>,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_impl(
+            input,
+            DenseGemmWeights::Bf16(weight),
+            None,
+            None,
+            1.0,
+            output,
+            rows,
+            out,
+            cols,
+            stream,
+        )
+    }
+
+    /// Expands compressed weights into shared scratch, then projects F32 rows.
+    /// Weight expansion, activation splitting, and scaling run on the same stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_quantized_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        block_scales: Option<&DeviceBuffer<u8>>,
+        channel_scales: Option<&DeviceBuffer<f32>>,
+        global_scale: f32,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let elements = out.checked_mul(cols);
+        let divisor = if block_scales.is_some() { 2 } else { 1 };
+        if !cols.is_multiple_of(16)
+            || elements
+                .is_none_or(|n| n > self.expanded_weight.len() || n / divisor != weight.len())
+            || block_scales.is_some_and(|s| elements.is_none_or(|n| n / 16 != s.len()))
+            || channel_scales.is_some_and(|s| s.len() != out || block_scales.is_some())
+            || !global_scale.is_finite()
+        {
+            return Err(Error::Format {
+                label: "F32 dense GEMM",
+                detail: "invalid compressed weight dimensions or scales".into(),
+            });
+        }
+        self.run_impl(
+            input,
+            DenseGemmWeights::Quantized(weight),
+            block_scales,
+            channel_scales,
+            global_scale,
+            output,
+            rows,
+            out,
+            cols,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_impl(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: DenseGemmWeights<'_>,
+        block_scales: Option<&DeviceBuffer<u8>>,
+        channel_scales: Option<&DeviceBuffer<f32>>,
+        global_scale: f32,
         mut output: DeviceOutput<'_, f32>,
         rows: usize,
         out: usize,
@@ -150,10 +318,10 @@ impl Lfm2DenseGemm {
             || cols > self.features
             || input.len() < rows * cols
             || output.len() < rows * out
-            || out.checked_mul(cols) != Some(weight.len())
+            || matches!(weight, DenseGemmWeights::Bf16(w) if out.checked_mul(cols) != Some(w.len()))
         {
             return Err(Error::Format {
-                label: "LFM2 dense GEMM",
+                label: "F32 dense GEMM",
                 detail: "invalid projection dimensions or buffers".into(),
             });
         }
@@ -184,6 +352,24 @@ impl Lfm2DenseGemm {
                 ),
             )?;
         }
+        let weight = match weight {
+            DenseGemmWeights::Bf16(weight) => weight,
+            DenseGemmWeights::Quantized(weight) => {
+                unsafe {
+                    check_cuda(
+                        "infer_expand_dense_bf16_on_stream",
+                        infer_expand_dense_bf16_on_stream(
+                            weight.ptr,
+                            block_scales.map_or(std::ptr::null(), |s| s.ptr),
+                            self.expanded_weight.ptr,
+                            (out * cols) as u32,
+                            stream.as_raw(),
+                        ),
+                    )?;
+                }
+                &self.expanded_weight
+            }
+        };
         plan.run_on_stream(
             &self.lt,
             weight,
@@ -191,6 +377,7 @@ impl Lfm2DenseGemm {
             self.products.output(),
             stream,
         )?;
+
         unsafe {
             check_cuda(
                 "infer_lfm2_sum_parts_on_stream",
@@ -199,10 +386,30 @@ impl Lfm2DenseGemm {
                     output.buffer_mut().ptr,
                     (rows * out) as u32,
                     (padded_rows * out) as u32,
+                    channel_scales.map_or(std::ptr::null(), |s| s.ptr),
+                    global_scale,
+                    out as u32,
                     stream.as_raw(),
                 ),
             )
         }
+    }
+    /// Returns scratch and cached plan workspace bytes on the device.
+    pub fn device_bytes(&self) -> usize {
+        self.input.device_bytes()
+            + self.fp8_input.device_bytes()
+            + self
+                .fp8_plans
+                .values()
+                .map(Fp8TnMatmulPlan::workspace_bytes)
+                .sum::<usize>()
+            + self.products.device_bytes()
+            + self.expanded_weight.device_bytes()
+            + self
+                .plans
+                .values()
+                .map(Bf16TnMatmulPlan::workspace_bytes)
+                .sum::<usize>()
     }
 }
 
@@ -658,7 +865,7 @@ pub fn lfm2_dense_gemm_into_on_stream(
             .is_none_or(|n| n > output.len())
     {
         return Err(Error::Format {
-            label: "LFM2 dense GEMM",
+            label: "F32 dense GEMM",
             detail: "expected matching positive batch dimensions and K divisible by 16".into(),
         });
     }

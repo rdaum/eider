@@ -1,5 +1,5 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, bf16_linear_logits_f32_batch_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, F32DenseGemm, bf16_linear_logits_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_batch_into_on_stream, fp8_linear_f32_batch_into_on_stream,
     lfm2_dense_gemm_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
     quantized_dense_gemm_f32_into_on_stream,
@@ -10,7 +10,8 @@ use micromeasure::{
 };
 use std::time::Duration;
 
-struct Dense<const OUT: usize, const IN: usize> {
+struct Dense<const OUT: usize, const IN: usize, const ROWS: usize> {
+    gemm: F32DenseGemm,
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -22,10 +23,49 @@ struct Dense<const OUT: usize, const IN: usize> {
     channels: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
 }
-impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
-    fn run(&mut self, format: usize, tensor: bool, rows: usize) {
+impl<const OUT: usize, const IN: usize, const ROWS: usize> Dense<OUT, IN, ROWS> {
+    fn run(&mut self, format: usize, mode: usize, rows: usize) {
         let output = self.output.output();
-        let result = if tensor && format != 0 {
+        if mode == 3 {
+            self.gemm
+                .run_calibrated_fp8_on_stream(
+                    &self.input,
+                    &self.fp8,
+                    output,
+                    rows,
+                    OUT,
+                    IN,
+                    0.125,
+                    0.03125,
+                    &self.stream,
+                )
+                .unwrap();
+            return;
+        }
+        if mode == 2 {
+            if format == 0 {
+                self.gemm
+                    .run_on_stream(&self.input, &self.bf16, output, rows, OUT, IN, &self.stream)
+                    .unwrap();
+            } else {
+                self.gemm
+                    .run_quantized_on_stream(
+                        &self.input,
+                        if format == 3 { &self.fp4 } else { &self.fp8 },
+                        (format == 3).then_some(&self.scales),
+                        (format == 2).then_some(&self.channels),
+                        0.125,
+                        output,
+                        rows,
+                        OUT,
+                        IN,
+                        &self.stream,
+                    )
+                    .unwrap();
+            }
+            return;
+        }
+        let result = if mode == 1 && format != 0 {
             quantized_dense_gemm_f32_into_on_stream(
                 &self.input,
                 if format == 3 { &self.fp4 } else { &self.fp8 },
@@ -40,7 +80,7 @@ impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
             )
         } else {
             match format {
-                0 if tensor => lfm2_dense_gemm_into_on_stream(
+                0 if mode == 1 => lfm2_dense_gemm_into_on_stream(
                     &self.input,
                     &self.bf16,
                     output,
@@ -97,14 +137,15 @@ impl<const OUT: usize, const IN: usize> Dense<OUT, IN> {
         result.unwrap();
     }
 }
-impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
+impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dense<OUT, IN, ROWS> {
     fn prepare(_: usize) -> Self {
         let mut case = Self {
+            gemm: F32DenseGemm::new(ROWS, OUT.max(IN), OUT * IN).unwrap(),
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
             stop: CudaEvent::new().unwrap(),
             input: DeviceBuffer::from_host(
-                &(0..128 * IN)
+                &(0..ROWS * IN)
                     .map(|i| (((i * 31 % 1009) as f32 - 504.) / 137.137).sin())
                     .collect::<Vec<_>>(),
             )
@@ -139,20 +180,57 @@ impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
                     .collect::<Vec<_>>(),
             )
             .unwrap(),
-            output: DeviceBuffer::zeroed(128 * OUT).unwrap(),
+            output: DeviceBuffer::zeroed(ROWS * OUT).unwrap(),
         };
         for format in 0..4 {
-            for rows in [1, 7, 17, 128] {
-                case.run(format, false, rows);
+            for rows in [1, 7, 17, ROWS] {
+                case.run(format, 0, rows);
                 let reference = case.output.copy_to_host(&case.stream).unwrap().to_vec();
-                case.run(format, true, rows);
-                let actual = case.output.copy_to_host(&case.stream).unwrap();
-                for (i, (&a, &b)) in actual.iter().zip(&reference).take(rows * OUT).enumerate() {
-                    assert!(
-                        a.is_finite() && (a - b).abs() < 3e-4 + b.abs() * 3e-5,
-                        "format={format} rows={rows} index={i}: {a} vs {b}"
-                    );
+                for mode in [1, 2] {
+                    case.run(format, mode, rows);
+                    let actual = case.output.copy_to_host(&case.stream).unwrap();
+                    for (i, (&a, &b)) in actual.iter().zip(&reference).take(rows * OUT).enumerate()
+                    {
+                        assert!(
+                            a.is_finite() && (a - b).abs() < 3e-4 + b.abs() * 3e-5,
+                            "format={format} rows={rows} index={i}: {a} vs {b}"
+                        );
+                    }
                 }
+            }
+        }
+        if OUT.is_multiple_of(16) && IN.is_multiple_of(16) {
+            let quantized = DeviceBuffer::from_host(
+                &(0..ROWS * IN)
+                    .map(|i| {
+                        let value = (((i * 31 % 1009) as f32 - 504.) / 137.137).sin();
+                        eider_cuda::format::e4m3_value(eider_cuda::format::cuda_e4m3_code(
+                            value / 0.03125,
+                        )) * 0.03125
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            fp8_linear_f32_batch_into_on_stream(
+                &quantized,
+                &case.fp8,
+                case.output.output(),
+                ROWS,
+                OUT,
+                IN,
+                0.125,
+                256,
+                &case.stream,
+            )
+            .unwrap();
+            let expected = case.output.copy_to_host(&case.stream).unwrap().to_vec();
+            case.run(1, 3, ROWS);
+            let actual = case.output.copy_to_host(&case.stream).unwrap();
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 3e-4 + b.abs() * 3e-5,
+                    "native FP8 {a} vs {b}"
+                );
             }
         }
         case
@@ -161,14 +239,20 @@ impl<const OUT: usize, const IN: usize> BenchContext for Dense<OUT, IN> {
         Some(1)
     }
 }
-fn sample<const OUT: usize, const IN: usize, const FORMAT: usize, const TENSOR: bool>(
-    c: &mut Dense<OUT, IN>,
+fn sample<
+    const OUT: usize,
+    const IN: usize,
+    const FORMAT: usize,
+    const MODE: usize,
+    const ROWS: usize,
+>(
+    c: &mut Dense<OUT, IN, ROWS>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
     c.start.record_on_stream(&c.stream).unwrap();
     for _ in 0..count {
-        c.run(FORMAT, TENSOR, 128);
+        c.run(FORMAT, MODE, ROWS);
     }
     c.stop.record_on_stream(&c.stream).unwrap();
     c.stop.synchronize().unwrap();
@@ -193,21 +277,70 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
-            runner.group::<Dense<18560, 4096>>("Mamba input 128 rows", |g| {
+            runner.group::<Dense<18560, 4096, 128>>("Mamba input 128 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
-                g.bench_sample("FP8 SIMT", sample::<18560, 4096, 1, false>);
-                g.bench_sample("FP8 tensor", sample::<18560, 4096, 1, true>);
-                g.bench_sample("NVFP4 SIMT", sample::<18560, 4096, 3, false>);
-                g.bench_sample("NVFP4 tensor", sample::<18560, 4096, 3, true>);
+                g.bench_sample("FP8 SIMT", sample::<18560, 4096, 1, 0, 128>);
+                g.bench_sample("FP8 tensor", sample::<18560, 4096, 1, 1, 128>);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<18560, 4096, 1, 2, 128>,
+                );
+                g.bench_sample("NVFP4 SIMT", sample::<18560, 4096, 3, 0, 128>);
+                g.bench_sample("NVFP4 tensor", sample::<18560, 4096, 3, 1, 128>);
+                g.bench_sample(
+                    "NVFP4 cuBLAS including expansion",
+                    sample::<18560, 4096, 3, 2, 128>,
+                );
             });
-            runner.group::<Dense<4096, 8192>>("Mamba output 128 rows", |g| {
+            runner.group::<Dense<4096, 8192, 128>>("Mamba output 128 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
-                g.bench_sample("FP8 SIMT", sample::<4096, 8192, 1, false>);
-                g.bench_sample("FP8 tensor", sample::<4096, 8192, 1, true>);
+                g.bench_sample("FP8 SIMT", sample::<4096, 8192, 1, 0, 128>);
+                g.bench_sample("FP8 tensor", sample::<4096, 8192, 1, 1, 128>);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<4096, 8192, 1, 2, 128>,
+                );
             });
-            runner.group::<Dense<67, 80>>("Projection tails", |g| {
+            runner.group::<Dense<512, 4096, 1024>>("Router 1024 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
-                g.bench_sample("FP8 tensor", sample::<67, 80, 1, true>);
+                g.bench_sample("BF16 SIMT", sample::<512, 4096, 0, 0, 1024>);
+                g.bench_sample("BF16 cuBLAS", sample::<512, 4096, 0, 2, 1024>);
+            });
+            runner.group::<Dense<67, 80, 128>>("Projection tails", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample("FP8 tensor", sample::<67, 80, 1, 1, 128>);
+            });
+            runner.group::<Dense<18560, 4096, 512>>("Mamba input 512 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<18560, 4096, 1, 2, 512>,
+                );
+                g.bench_sample("calibrated FP8", sample::<18560, 4096, 1, 3, 512>);
+            });
+            runner.group::<Dense<4096, 8192, 512>>("Mamba output 512 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<4096, 8192, 1, 2, 512>,
+                );
+                g.bench_sample("calibrated FP8", sample::<4096, 8192, 1, 3, 512>);
+            });
+            runner.group::<Dense<18560, 4096, 1024>>("Mamba input 1024 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<18560, 4096, 1, 2, 1024>,
+                );
+                g.bench_sample("calibrated FP8", sample::<18560, 4096, 1, 3, 1024>);
+            });
+            runner.group::<Dense<4096, 8192, 1024>>("Mamba output 1024 rows", |g| {
+                let g = g.measurement_domain(MeasurementDomain::Gpu);
+                g.bench_sample(
+                    "FP8 cuBLAS including expansion",
+                    sample::<4096, 8192, 1, 2, 1024>,
+                );
+                g.bench_sample("calibrated FP8", sample::<4096, 8192, 1, 3, 1024>);
             });
         },
     );

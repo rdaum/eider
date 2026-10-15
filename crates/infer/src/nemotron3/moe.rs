@@ -6,15 +6,17 @@ use super::{
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, MoeSortedRoutes, Result,
-    add_f32_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
+    CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer, Error, F32DenseGemm,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, Result, add_f32_into_on_stream,
+    lfm2_expert_gemm_pipelined_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream, relu_squared_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
-use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt};
 
 /// Device-resident weights for one latent Nemotron 3 MoE layer.
 pub struct Nemotron3MoeLayer {
@@ -164,6 +166,24 @@ impl Nemotron3MoeLayer {
         })
     }
 
+    pub(super) fn has_calibrated_experts(&self) -> bool {
+        self.experts.nvfp4.is_some()
+    }
+
+    pub(super) fn config(&self) -> Nemotron3MoeLayerConfig {
+        self.moe
+    }
+
+    pub(super) fn dense_linears(&self) -> [&Nemotron3Linear; 5] {
+        [
+            self.router.linear(),
+            &self.latent_in,
+            &self.latent_out,
+            &self.shared_up,
+            &self.shared_down,
+        ]
+    }
+
     /// Allocates the scratch buffers and route pointer tables used for one token.
     pub fn workspace(&self) -> Result<Nemotron3MoeWorkspace> {
         Nemotron3MoeWorkspace::new(&self.manifest, self.moe)
@@ -171,7 +191,7 @@ impl Nemotron3MoeLayer {
 
     /// Allocates scratch and route tables for a fixed flattened row count.
     pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MoeRowsWorkspace> {
-        Nemotron3MoeRowsWorkspace::new(&self.manifest, self.moe, rows)
+        Nemotron3MoeRowsWorkspace::new(&self.manifest, self.moe, rows, self.experts.nvfp4.is_some())
     }
 
     /// Runs one token through pre-norm, routed and shared experts, and the residual add.
@@ -241,6 +261,7 @@ impl Nemotron3MoeLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MoeRowsWorkspace,
         rows: usize,
+        gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
@@ -261,14 +282,15 @@ impl Nemotron3MoeLayer {
             stream,
         )?;
         self.router
-            .run_rows(&workspace.normed, &mut workspace.router, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.router, rows, gemm, stream)?;
         self.latent_in
-            .run_rows(&workspace.normed, &mut workspace.latent, rows, stream)?;
+            .run_rows(&workspace.normed, &mut workspace.latent, rows, gemm, stream)?;
         self.experts.run_rows(workspace, rows, stream)?;
         self.latent_out.run_rows(
             &workspace.routed_latent,
             &mut workspace.routed_hidden,
             rows,
+            gemm,
             stream,
         )?;
 
@@ -276,6 +298,7 @@ impl Nemotron3MoeLayer {
             &workspace.normed,
             &mut workspace.shared_projected,
             rows,
+            gemm,
             stream,
         )?;
         relu_squared_f32_into_on_stream(
@@ -287,6 +310,7 @@ impl Nemotron3MoeLayer {
             &workspace.shared_activated,
             &mut workspace.shared_hidden,
             rows,
+            gemm,
             stream,
         )?;
         add_f32_into_on_stream(
@@ -326,6 +350,7 @@ impl Nemotron3MoeLayer {
 }
 
 struct Nemotron3ExpertSlab {
+    nvfp4: Option<Nemotron3Nvfp4Experts>,
     up_packed: DeviceBuffer<u8>,
     up_scales: DeviceBuffer<u8>,
     up_packed_table: DeviceBuffer<DeviceAddress<u8>>,
@@ -359,15 +384,21 @@ impl Nemotron3ExpertSlab {
         let mut down_scales = Vec::with_capacity(experts * scale_stride);
         let mut down_scale_2 = Vec::with_capacity(experts);
 
+        let mut up_input_scale = Vec::with_capacity(experts);
+        let mut down_input_scale = Vec::with_capacity(experts);
+        let mut calibrated = true;
         for expert in 0..experts {
             let prefix = format!("{mixer}.experts.{expert}");
+            let up_name = format!("{prefix}.up_proj");
+            let down_name = format!("{prefix}.down_proj");
+            calibrated &= checkpoint.contains_tensor(&format!("{up_name}.input_scale"))
+                && checkpoint.contains_tensor(&format!("{down_name}.input_scale"));
+            let up = load_expert_linear(checkpoint, &up_name, intermediate, latent)?;
+            let down = load_expert_linear(checkpoint, &down_name, latent, intermediate)?;
+            up_input_scale.push(up.input_scale);
+            down_input_scale.push(down.input_scale);
             append_linear(
-                load_expert_linear(
-                    checkpoint,
-                    &format!("{prefix}.up_proj"),
-                    intermediate,
-                    latent,
-                )?,
+                up,
                 intermediate,
                 latent,
                 &mut up_packed,
@@ -375,12 +406,7 @@ impl Nemotron3ExpertSlab {
                 &mut up_scale_2,
             )?;
             append_linear(
-                load_expert_linear(
-                    checkpoint,
-                    &format!("{prefix}.down_proj"),
-                    latent,
-                    intermediate,
-                )?,
+                down,
                 latent,
                 intermediate,
                 &mut down_packed,
@@ -388,6 +414,28 @@ impl Nemotron3ExpertSlab {
                 &mut down_scale_2,
             )?;
         }
+        let nvfp4 = (calibrated
+            && CutlassFp4GroupedGemmPlan::supported(intermediate, 1, latent, experts)
+            && CutlassFp4GroupedGemmPlan::supported(latent, 1, intermediate, experts))
+        .then(|| -> Result<_> {
+            Ok(Nemotron3Nvfp4Experts {
+                up: Nemotron3Nvfp4ExpertScales::new(
+                    &up_scales,
+                    &up_scale_2,
+                    &up_input_scale,
+                    intermediate,
+                    latent,
+                )?,
+                down: Nemotron3Nvfp4ExpertScales::new(
+                    &down_scales,
+                    &down_scale_2,
+                    &down_input_scale,
+                    latent,
+                    intermediate,
+                )?,
+            })
+        })
+        .transpose()?;
 
         let up_packed = DeviceBuffer::from_host(&up_packed)?;
         let up_scales = DeviceBuffer::from_host(&up_scales)?;
@@ -398,6 +446,7 @@ impl Nemotron3ExpertSlab {
         let down_packed_table = pointer_table(&down_packed, experts, packed_stride)?;
         let down_scale_table = pointer_table(&down_scales, experts, scale_stride)?;
         Ok(Self {
+            nvfp4,
             up_packed,
             up_scales,
             up_packed_table,
@@ -460,6 +509,71 @@ impl Nemotron3ExpertSlab {
         stream: &CudaStream,
     ) -> Result<()> {
         let indices = workspace.router.indices();
+        if let (Some(weights), Some(scratch), Some(routes)) = (
+            &self.nvfp4,
+            &mut workspace.nvfp4,
+            &mut workspace.sorted_routes,
+        ) {
+            routes.sort_on_stream(indices, stream)?;
+            scratch.up_input.gather_scaled_quantize_on_stream(
+                &workspace.latent,
+                routes,
+                &weights.up.input_scales,
+                stream,
+            )?;
+            scratch.up_input.build_pointer_tables_on_stream(
+                routes,
+                &mut scratch.up,
+                &mut scratch.up_outputs,
+                self.intermediate,
+                stream,
+            )?;
+            scratch.up_plan.run_on_stream(
+                &self.up_packed_table,
+                &weights.up.scale_table,
+                scratch.up_input.packed_table(),
+                scratch.up_input.scale_table(),
+                &scratch.up_outputs,
+                &weights.up.alpha_table,
+                routes.expert_counts(),
+                stream,
+            )?;
+            scratch
+                .down_input
+                .relu_squared_scaled_quantize_sorted_on_stream(
+                    &scratch.up,
+                    routes,
+                    &weights.down.input_scales,
+                    stream,
+                )?;
+            scratch.down_input.build_pointer_tables_on_stream(
+                routes,
+                &mut scratch.down,
+                &mut scratch.down_outputs,
+                self.latent,
+                stream,
+            )?;
+            scratch.down_plan.run_on_stream(
+                &self.down_packed_table,
+                &weights.down.scale_table,
+                scratch.down_input.packed_table(),
+                scratch.down_input.scale_table(),
+                &scratch.down_outputs,
+                &weights.down.alpha_table,
+                routes.expert_counts(),
+                stream,
+            )?;
+            return moe_weighted_accumulate_sorted_bf16_batch_on_stream(
+                routes,
+                workspace.router.weights(),
+                &scratch.down,
+                workspace.routed_latent.output(),
+                rows,
+                workspace.routes_per_row,
+                self.latent,
+                stream,
+            );
+        }
         if let Some(routes) = &mut workspace.sorted_routes {
             routes.sort_on_stream(indices, stream)?;
             lfm2_expert_gemm_pipelined_into_on_stream(
@@ -531,7 +645,9 @@ impl Nemotron3ExpertSlab {
     }
 
     fn device_bytes(&self) -> usize {
-        self.up_packed.device_bytes()
+        self.nvfp4.as_ref().map_or(0, |weights| {
+            weights.up.device_bytes() + weights.down.device_bytes()
+        }) + self.up_packed.device_bytes()
             + self.up_scales.device_bytes()
             + self.up_packed_table.device_bytes()
             + self.up_scale_table.device_bytes()
@@ -542,6 +658,125 @@ impl Nemotron3ExpertSlab {
             + self.down_scale_table.device_bytes()
             + self.down_scale_2.device_bytes()
             + self.expert_alpha.device_bytes()
+    }
+}
+
+struct Nemotron3Nvfp4Experts {
+    up: Nemotron3Nvfp4ExpertScales,
+    down: Nemotron3Nvfp4ExpertScales,
+}
+
+struct Nemotron3Nvfp4ExpertScales {
+    scales: DeviceBuffer<u8>,
+    scale_table: DeviceBuffer<DeviceAddress<u8>>,
+    input_scales: DeviceBuffer<f32>,
+    alpha: DeviceBuffer<f32>,
+    alpha_table: DeviceBuffer<DeviceAddress<f32>>,
+}
+
+impl Nemotron3Nvfp4ExpertScales {
+    fn new(
+        raw_scales: &[u8],
+        weight_scales: &[f32],
+        input_scales: &[f32],
+        out: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if input_scales
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(Error::Format {
+                label: "Nemotron calibrated expert scale",
+                detail: "expected finite positive input scales".into(),
+            });
+        }
+        let scales = raw_scales
+            .chunks_exact(out * cols / 16)
+            .flat_map(|scales| modelopt_scales_to_cublaslt(out, cols, scales))
+            .collect::<Vec<_>>();
+        let scales = DeviceBuffer::from_host(&scales)?;
+        let scale_table = pointer_table(
+            &scales,
+            input_scales.len(),
+            scales.len() / input_scales.len(),
+        )?;
+        let alpha = DeviceBuffer::from_host(
+            &input_scales
+                .iter()
+                .zip(weight_scales)
+                .map(|(a, w)| a * w)
+                .collect::<Vec<_>>(),
+        )?;
+        let alpha_table = DeviceBuffer::from_host(
+            &(0..alpha.len())
+                .map(|i| alpha.address_at(i))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        Ok(Self {
+            scales,
+            scale_table,
+            input_scales: DeviceBuffer::from_host(input_scales)?,
+            alpha,
+            alpha_table,
+        })
+    }
+    fn device_bytes(&self) -> usize {
+        self.scales.device_bytes()
+            + self.scale_table.device_bytes()
+            + self.input_scales.device_bytes()
+            + self.alpha.device_bytes()
+            + self.alpha_table.device_bytes()
+    }
+}
+
+struct Nemotron3Nvfp4MoeWorkspace {
+    up_input: MoeSortedNvfp4Rows,
+    down_input: MoeSortedNvfp4Rows,
+    up_plan: CutlassFp4GroupedGemmPlan,
+    down_plan: CutlassFp4GroupedGemmPlan,
+    up: DeviceBuffer<u16>,
+    down: DeviceBuffer<u16>,
+    up_outputs: DeviceBuffer<DeviceAddress<u16>>,
+    down_outputs: DeviceBuffer<DeviceAddress<u16>>,
+}
+impl Nemotron3Nvfp4MoeWorkspace {
+    fn new(moe: Nemotron3MoeLayerConfig, rows: usize, latent: usize) -> Result<Self> {
+        let routes = rows * moe.experts_per_token;
+        let experts = moe.routed_experts;
+        Ok(Self {
+            up_input: MoeSortedNvfp4Rows::new(rows, moe.experts_per_token, experts, latent)?,
+            down_input: MoeSortedNvfp4Rows::new(
+                rows,
+                moe.experts_per_token,
+                experts,
+                moe.intermediate_size,
+            )?,
+            up_plan: CutlassFp4GroupedGemmPlan::new(
+                moe.intermediate_size,
+                routes,
+                latent,
+                experts,
+            )?,
+            down_plan: CutlassFp4GroupedGemmPlan::new(
+                latent,
+                routes,
+                moe.intermediate_size,
+                experts,
+            )?,
+            up: DeviceBuffer::zeroed(routes * moe.intermediate_size)?,
+            down: DeviceBuffer::zeroed(routes * latent)?,
+            up_outputs: DeviceBuffer::zeroed(experts)?,
+            down_outputs: DeviceBuffer::zeroed(experts)?,
+        })
+    }
+    fn device_bytes(&self) -> usize {
+        self.up_input.device_bytes()
+            + self.down_input.device_bytes()
+            + self.up.device_bytes()
+            + self.down.device_bytes()
+            + self.up_outputs.device_bytes()
+            + self.down_outputs.device_bytes()
     }
 }
 
@@ -627,6 +862,7 @@ pub struct Nemotron3MoeWorkspace {
 
 /// Reusable scratch and pointer-table storage for flattened MoE rows.
 pub struct Nemotron3MoeRowsWorkspace {
+    nvfp4: Option<Nemotron3Nvfp4MoeWorkspace>,
     router: Nemotron3RouterRowsWorkspace,
     sorted_routes: Option<MoeSortedRoutes>,
     normed: DeviceBuffer<f32>,
@@ -654,6 +890,7 @@ impl Nemotron3MoeRowsWorkspace {
         manifest: &Nemotron3Manifest,
         moe: Nemotron3MoeLayerConfig,
         rows: usize,
+        calibrated: bool,
     ) -> Result<Self> {
         if rows == 0 {
             return Err(Error::Shape {
@@ -679,6 +916,9 @@ impl Nemotron3MoeRowsWorkspace {
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
+            nvfp4: (calibrated && rows >= 128)
+                .then(|| Nemotron3Nvfp4MoeWorkspace::new(moe, rows, latent))
+                .transpose()?,
             router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
             sorted_routes: (rows >= 16)
                 .then(|| MoeSortedRoutes::new(routes, moe.routed_experts))
@@ -750,7 +990,10 @@ impl Nemotron3MoeRowsWorkspace {
     }
 
     pub(super) fn device_bytes(&self) -> usize {
-        self.router.device_bytes()
+        self.nvfp4
+            .as_ref()
+            .map_or(0, Nemotron3Nvfp4MoeWorkspace::device_bytes)
+            + self.router.device_bytes()
             + self
                 .sorted_routes
                 .as_ref()

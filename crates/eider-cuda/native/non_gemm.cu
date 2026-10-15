@@ -2549,6 +2549,75 @@ extern "C" cudaError_t infer_moe_sort_routes_on_stream(
     return cudaGetLastError();
 }
 
+// Reserve one extra 128-row tile per expert around the sorted route prefix.
+// This bounds scale storage by routes + 128*experts instead of routes*experts.
+__device__ __forceinline__ size_t infer_moe_scale_base(
+    unsigned expert, const uint32_t* offsets, unsigned scale_tile_bytes) {
+    return ((size_t(offsets[expert]) + 127) / 128 + expert) * scale_tile_bytes;
+}
+
+// ModelOpt calibrated activation scales are per expert. The up projection
+// gathers F32 token rows; the down projection fuses ReLU squared on sorted BF16 rows.
+template <bool ReluSquared>
+__global__ void infer_moe_calibrated_quantize_kernel(
+    const void* input, const float* input_scales,
+    const uint32_t* sorted_routes, const uint32_t* sorted_experts,
+    const uint32_t* expert_offsets, uint8_t* packed, uint8_t* scales,
+    unsigned routes_per_row, unsigned features, unsigned scale_tile_bytes) {
+    const unsigned sorted = blockIdx.x, expert = sorted_experts[sorted];
+    const unsigned source_row = ReluSquared ? sorted : sorted_routes[sorted] / routes_per_row;
+    const unsigned expert_col = sorted - expert_offsets[expert];
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const float inverse = 1.0f / input_scales[expert];
+    for (unsigned block = warp; block < features / 16; block += blockDim.x / 32) {
+        float value = 0;
+        if (lane < 16) {
+            const size_t index = size_t(source_row) * features + block * 16 + lane;
+            if constexpr (ReluSquared) {
+                const float x = fmaxf(__bfloat162float(static_cast<const __nv_bfloat16*>(input)[index]), 0.0f);
+                value = (x * x) * inverse;
+            } else {
+                value = static_cast<const float*>(input)[index] * inverse;
+            }
+        }
+        float maximum = fabsf(value);
+        #pragma unroll
+        for (unsigned offset = 16; offset; offset >>= 1)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+        unsigned scale_byte = 0;
+        if (lane == 0) {
+            scale_byte = __nv_cvt_float_to_fp8(maximum / 6.0f, __NV_SATFINITE, __NV_E4M3);
+            scales[infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes) + infer_ue4m3_tiled_scale_offset(expert_col, block, features)] = scale_byte;
+        }
+        scale_byte = __shfl_sync(0xffffffffu, scale_byte, 0);
+        const float scale = infer_e4m3_value(uint8_t(scale_byte));
+        const float lo = __shfl_sync(0xffffffffu, value, (lane & 7) * 2);
+        const float hi = __shfl_sync(0xffffffffu, value, (lane & 7) * 2 + 1);
+        if (lane < 8) {
+            const uint8_t l = __nv_cvt_float_to_fp4(scale ? lo / scale : 0.0f, __NV_E2M1, cudaRoundNearest) & 15;
+            const uint8_t h = __nv_cvt_float_to_fp4(scale ? hi / scale : 0.0f, __NV_E2M1, cudaRoundNearest) & 15;
+            packed[size_t(sorted) * (features / 2) + block * 8 + lane] = l | (h << 4);
+        }
+    }
+}
+extern "C" cudaError_t infer_moe_calibrated_quantize_on_stream(
+    const void* input, const float* input_scales,
+    const uint32_t* sorted_routes, const uint32_t* sorted_experts,
+    const uint32_t* expert_offsets, uint8_t* packed, uint8_t* scales,
+    unsigned routes, unsigned routes_per_row, unsigned features, unsigned scale_tile_bytes,
+    int relu_squared, cudaStream_t stream) {
+    if (!input || !input_scales || !sorted_routes || !sorted_experts || !expert_offsets ||
+        !packed || !scales || !routes || !routes_per_row || !features || features % 16 || !scale_tile_bytes)
+        return cudaErrorInvalidValue;
+    if (relu_squared) infer_moe_calibrated_quantize_kernel<true><<<routes, 256, 0, stream>>>(
+        input, input_scales, sorted_routes, sorted_experts, expert_offsets, packed, scales,
+        routes_per_row, features, scale_tile_bytes);
+    else infer_moe_calibrated_quantize_kernel<false><<<routes, 256, 0, stream>>>(
+        input, input_scales, sorted_routes, sorted_experts, expert_offsets, packed, scales,
+        routes_per_row, features, scale_tile_bytes);
+    return cudaGetLastError();
+}
+
 __global__ void infer_moe_quantize_sorted_routes_nvfp4_kernel(
     const float* __restrict__ input,
     const std::uint32_t* __restrict__ sorted_routes,
@@ -2559,7 +2628,7 @@ __global__ void infer_moe_quantize_sorted_routes_nvfp4_kernel(
     std::uint32_t routes,
     std::uint32_t routes_per_row,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     bool gather_rows) {
     const std::uint32_t k_blocks = (in_features + 15) / 16;
     const std::uint32_t sorted = blockIdx.x;
@@ -2585,7 +2654,7 @@ __global__ void infer_moe_quantize_sorted_routes_nvfp4_kernel(
         if (lane == 0) {
             scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
                 __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-            scales[static_cast<std::size_t>(expert) * scale_stride +
+            scales[infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes) +
                    infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
                 static_cast<std::uint8_t>(scale_word);
         }
@@ -2618,18 +2687,18 @@ extern "C" cudaError_t infer_moe_quantize_sorted_routes_nvfp4_on_stream(
     std::uint32_t routes,
     std::uint32_t routes_per_row,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     int gather_rows,
     cudaStream_t stream) {
     if (input == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
         expert_offsets == nullptr || packed == nullptr || scales == nullptr || routes == 0 ||
         routes_per_row == 0 || in_features == 0 || (in_features % 16) != 0 ||
-        scale_stride == 0) {
+        scale_tile_bytes == 0) {
         return cudaErrorInvalidValue;
     }
     infer_moe_quantize_sorted_routes_nvfp4_kernel<<<routes, 256, 0, stream>>>(
         input, sorted_routes, sorted_experts, expert_offsets, packed, scales,
-        routes, routes_per_row, in_features, scale_stride, gather_rows != 0);
+        routes, routes_per_row, in_features, scale_tile_bytes, gather_rows != 0);
     return cudaGetLastError();
 }
 
@@ -2642,7 +2711,7 @@ __global__ void infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_kernel(
     std::uint8_t* __restrict__ scales,
     std::uint32_t routes,
     std::uint32_t in_features,
-    std::uint32_t scale_stride) {
+    std::uint32_t scale_tile_bytes) {
     const std::uint32_t sorted = blockIdx.x;
     if (sorted >= routes) return;
     const std::uint32_t expert = sorted_experts[sorted];
@@ -2684,7 +2753,7 @@ __global__ void infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_kernel(
         if (half_lane == 0 && k_block < k_blocks) {
             scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
                 __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-            scales[static_cast<std::size_t>(expert) * scale_stride +
+            scales[infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes) +
                    infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
                 static_cast<std::uint8_t>(scale_word);
         }
@@ -2718,18 +2787,18 @@ extern "C" cudaError_t infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_s
     std::uint8_t* scales,
     std::uint32_t routes,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     cudaStream_t stream) {
     if (gate == nullptr || up == nullptr || sorted_experts == nullptr ||
         expert_offsets == nullptr || packed == nullptr || scales == nullptr ||
         routes == 0 || in_features == 0 || (in_features % 16) != 0 ||
-        scale_stride == 0) {
+        scale_tile_bytes == 0) {
         return cudaErrorInvalidValue;
     }
     infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_kernel<<<
         routes, 256, 0, stream>>>(
         gate, up, sorted_experts, expert_offsets, packed, scales, routes,
-        in_features, scale_stride);
+        in_features, scale_tile_bytes);
     return cudaGetLastError();
 }
 
@@ -2741,7 +2810,7 @@ __global__ void infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_kernel(
     std::uint8_t* __restrict__ scales,
     std::uint32_t routes,
     std::uint32_t in_features,
-    std::uint32_t scale_stride) {
+    std::uint32_t scale_tile_bytes) {
     const std::uint32_t sorted = blockIdx.x;
     if (sorted >= routes) return;
     const std::uint32_t expert = sorted_experts[sorted];
@@ -2780,7 +2849,7 @@ __global__ void infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_kernel(
         if (half_lane == 0 && k_block < k_blocks) {
             scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
                 __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-            scales[static_cast<std::size_t>(expert) * scale_stride +
+            scales[infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes) +
                    infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
                 static_cast<std::uint8_t>(scale_word);
         }
@@ -2813,17 +2882,17 @@ extern "C" cudaError_t infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_on
     std::uint8_t* scales,
     std::uint32_t routes,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     cudaStream_t stream) {
     if (gate_up == nullptr || sorted_experts == nullptr || expert_offsets == nullptr ||
         packed == nullptr || scales == nullptr || routes == 0 || in_features == 0 ||
-        (in_features % 16) != 0 || scale_stride == 0) {
+        (in_features % 16) != 0 || scale_tile_bytes == 0) {
         return cudaErrorInvalidValue;
     }
     infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_kernel<<<
         routes, 256, 0, stream>>>(
         gate_up, sorted_experts, expert_offsets, packed, scales, routes,
-        in_features, scale_stride);
+        in_features, scale_tile_bytes);
     return cudaGetLastError();
 }
 
@@ -2908,7 +2977,7 @@ __global__ void infer_moe_scatter_quantized_rows_nvfp4_kernel(
     std::uint32_t routes,
     std::uint32_t routes_per_row,
     std::uint32_t in_features,
-    std::uint32_t scale_stride) {
+    std::uint32_t scale_tile_bytes) {
     const std::uint32_t sorted = blockIdx.x;
     if (sorted >= routes) return;
     const std::uint32_t source_row = sorted_routes[sorted] / routes_per_row;
@@ -2922,7 +2991,7 @@ __global__ void infer_moe_scatter_quantized_rows_nvfp4_kernel(
             source_packed[static_cast<std::size_t>(source_row) * packed_bytes + col];
     }
     for (std::uint32_t k_block = threadIdx.x; k_block < k_blocks; k_block += blockDim.x) {
-        scales[static_cast<std::size_t>(expert) * scale_stride +
+        scales[infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes) +
                infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
             source_scales[static_cast<std::size_t>(source_row) * k_blocks + k_block];
     }
@@ -2942,14 +3011,14 @@ extern "C" cudaError_t infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on
     std::uint32_t routes,
     std::uint32_t routes_per_row,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     float eps,
     cudaStream_t stream) {
     if (input == nullptr || weight == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
         expert_offsets == nullptr || source_packed == nullptr || source_scales == nullptr ||
         packed == nullptr || scales == nullptr || rows == 0 || routes == 0 ||
         routes_per_row == 0 || routes != rows * routes_per_row || in_features == 0 ||
-        (in_features % 16) != 0 || scale_stride == 0 || !isfinite(eps) || eps < 0.0f) {
+        (in_features % 16) != 0 || scale_tile_bytes == 0 || !isfinite(eps) || eps < 0.0f) {
         return cudaErrorInvalidValue;
     }
     infer_moe_quantize_rows_nvfp4_kernel<<<rows, 256, 0, stream>>>(
@@ -2958,7 +3027,7 @@ extern "C" cudaError_t infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on
     if (status != cudaSuccess) return status;
     infer_moe_scatter_quantized_rows_nvfp4_kernel<<<routes, 256, 0, stream>>>(
         source_packed, source_scales, sorted_routes, sorted_experts, expert_offsets,
-        packed, scales, routes, routes_per_row, in_features, scale_stride);
+        packed, scales, routes, routes_per_row, in_features, scale_tile_bytes);
     return cudaGetLastError();
 }
 
@@ -2975,13 +3044,13 @@ extern "C" cudaError_t infer_moe_gather_quantize_sorted_routes_nvfp4_on_stream(
     std::uint32_t routes,
     std::uint32_t routes_per_row,
     std::uint32_t in_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     cudaStream_t stream) {
     if (input == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
         expert_offsets == nullptr || source_packed == nullptr || source_scales == nullptr ||
         packed == nullptr || scales == nullptr || rows == 0 || routes == 0 ||
         routes_per_row == 0 || routes != rows * routes_per_row || in_features == 0 ||
-        (in_features % 16) != 0 || scale_stride == 0) {
+        (in_features % 16) != 0 || scale_tile_bytes == 0) {
         return cudaErrorInvalidValue;
     }
     infer_moe_quantize_rows_nvfp4_kernel<<<rows, 256, 0, stream>>>(
@@ -2990,7 +3059,7 @@ extern "C" cudaError_t infer_moe_gather_quantize_sorted_routes_nvfp4_on_stream(
     if (status != cudaSuccess) return status;
     infer_moe_scatter_quantized_rows_nvfp4_kernel<<<routes, 256, 0, stream>>>(
         source_packed, source_scales, sorted_routes, sorted_experts, expert_offsets,
-        packed, scales, routes, routes_per_row, in_features, scale_stride);
+        packed, scales, routes, routes_per_row, in_features, scale_tile_bytes);
     return cudaGetLastError();
 }
 
@@ -3005,12 +3074,12 @@ __global__ void infer_moe_grouped_pointer_tables_kernel(
     std::uint32_t experts,
     std::uint32_t in_features,
     std::uint32_t out_features,
-    std::uint32_t scale_stride) {
+    std::uint32_t scale_tile_bytes) {
     const std::uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert >= experts) return;
     const std::size_t route_offset = expert_offsets[expert];
     packed_table[expert] = packed + route_offset * (in_features / 2);
-    scale_table[expert] = scales + static_cast<std::size_t>(expert) * scale_stride;
+    scale_table[expert] = scales + infer_moe_scale_base(expert, expert_offsets, scale_tile_bytes);
     output_table[expert] = output + route_offset * out_features;
 }
 
@@ -3025,18 +3094,18 @@ extern "C" cudaError_t infer_moe_grouped_pointer_tables_on_stream(
     std::uint32_t experts,
     std::uint32_t in_features,
     std::uint32_t out_features,
-    std::uint32_t scale_stride,
+    std::uint32_t scale_tile_bytes,
     cudaStream_t stream) {
     if (expert_offsets == nullptr || packed == nullptr || scales == nullptr || output == nullptr ||
         packed_table == nullptr || scale_table == nullptr || output_table == nullptr ||
-        experts == 0 || in_features == 0 || out_features == 0 || scale_stride == 0) {
+        experts == 0 || in_features == 0 || out_features == 0 || scale_tile_bytes == 0) {
         return cudaErrorInvalidValue;
     }
     constexpr std::uint32_t kThreads = 128;
     infer_moe_grouped_pointer_tables_kernel<<<
         (experts + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         expert_offsets, packed, scales, output, packed_table, scale_table,
-        output_table, experts, in_features, out_features, scale_stride);
+        output_table, experts, in_features, out_features, scale_tile_bytes);
     return cudaGetLastError();
 }
 
@@ -6703,6 +6772,68 @@ __global__ void infer_ragged_paged_gqa_attention_f32_kernel(
     }
 }
 
+// Partition a head's causal range between warps. Only the final softmax merge
+// crosses warps; each partition retains FP32 queries, values, and accumulation.
+__global__ void infer_ragged_paged_gqa_head128_f32_kernel(
+    const float* query, const float* key_pool, const float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets, const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions, float* output,
+    std::uint32_t sequence_count, std::uint32_t page_tokens,
+    std::uint32_t q_heads, std::uint32_t kv_heads) {
+    constexpr unsigned kWarps = 8;
+    const unsigned row = blockIdx.x, head = blockIdx.y;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ unsigned sequence, local_row;
+    __shared__ bool valid;
+    __shared__ float maxima[kWarps], sums[kWarps], partial[kWarps][128];
+    if (threadIdx.x == 0) valid = infer_ragged_row_location(
+        row, sequence_offsets, sequence_lengths, sequence_count, &sequence, &local_row);
+    __syncthreads();
+    if (!valid) return;
+    const unsigned length = start_positions[sequence] + local_row + 1;
+    const unsigned kv_head = head / (q_heads / kv_heads);
+    const auto* table = page_tables[sequence];
+    const size_t query_base = (size_t(row) * q_heads + head) * 128;
+    float q[4], acc[4] = {};
+    #pragma unroll
+    for (unsigned i = 0; i < 4; ++i) q[i] = query[query_base + lane + i * 32];
+    float maximum = -INFINITY, sum = 0;
+    for (unsigned position = warp; position < length; position += kWarps) {
+        const size_t physical = size_t(table[position / page_tokens]) * page_tokens + position % page_tokens;
+        const size_t base = (physical * kv_heads + kv_head) * 128 + lane;
+        float dot = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < 4; ++i) dot = fmaf(q[i], key_pool[base + i * 32], dot);
+        #pragma unroll
+        for (unsigned offset = 16; offset; offset >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        const float score = dot * 0.08838834764831845f;
+        const float next = fmaxf(maximum, score);
+        const float rescale = expf(maximum - next), weight = expf(score - next);
+        sum = sum * rescale + weight;
+        #pragma unroll
+        for (unsigned i = 0; i < 4; ++i) acc[i] = fmaf(weight, value_pool[base + i * 32], acc[i] * rescale);
+        maximum = next;
+    }
+    if (lane == 0) { maxima[warp] = maximum; sums[warp] = sum; }
+    #pragma unroll
+    for (unsigned i = 0; i < 4; ++i) partial[warp][lane + i * 32] = acc[i];
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        float max = -INFINITY;
+        #pragma unroll
+        for (unsigned w = 0; w < kWarps; ++w) max = fmaxf(max, maxima[w]);
+        float denominator = 0, numerator = 0;
+        #pragma unroll
+        for (unsigned w = 0; w < kWarps; ++w) {
+            const float scale = expf(maxima[w] - max);
+            denominator += sums[w] * scale;
+            numerator = fmaf(partial[w][threadIdx.x], scale, numerator);
+        }
+        output[query_base + threadIdx.x] = numerator / denominator;
+    }
+}
+
 extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
     const float* query,
     const float* key_pool,
@@ -6728,6 +6859,13 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
         return cudaErrorInvalidValue;
     }
     const dim3 blocks(total_tokens, q_heads);
+    if (head_dim == 128) {
+        infer_ragged_paged_gqa_head128_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+            query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+            start_positions, output, sequence_count, page_tokens, q_heads, kv_heads);
+        return cudaGetLastError();
+    }
+
     infer_ragged_paged_gqa_attention_f32_kernel<<<
         blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
         query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
@@ -12205,7 +12343,7 @@ __global__ void infer_nemotron3_group_rms_norm_f32_chunks_kernel(
     }
 }
 
-template <typename State>
+template <typename State, unsigned RegisterStateSize = 0>
 __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
     const float* projected,
     const float* conv_output,
@@ -12255,6 +12393,13 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
             initial[state_index] = state[state_index];
         }
     }
+    // Retain the recurrent row in registers for the prompt chunk.
+    // BF16 state still rounds after every token, as the stored path does.
+    State local_state[RegisterStateSize ? RegisterStateSize / 32 : 1];
+    if constexpr (RegisterStateSize != 0) {
+        #pragma unroll
+        for (unsigned i = 0; i < RegisterStateSize / 32; ++i) local_state[i] = state[lane + i * 32];
+    }
     for (std::uint32_t row = begin; row < end; ++row) {
         const float* row_projected =
             projected + static_cast<std::size_t>(row) * projection_size;
@@ -12291,12 +12436,15 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
         const float* c =
             row_conv + intermediate_size + bc_width + group * state_size;
         float y = 0.0f;
-        for (std::uint32_t state_index = lane; state_index < state_size;
+        #pragma unroll
+        for (std::uint32_t state_index = lane;
+             state_index < (RegisterStateSize ? RegisterStateSize : state_size);
              state_index += 32) {
-            const float updated =
-                static_cast<float>(state[state_index]) * decay +
-                dt * b[state_index] * x;
-            state[state_index] = static_cast<State>(updated);
+            const State previous = RegisterStateSize ? local_state[state_index / 32] : state[state_index];
+            const float updated = static_cast<float>(previous) * decay + dt * b[state_index] * x;
+            const State stored = static_cast<State>(updated);
+            if constexpr (RegisterStateSize != 0) local_state[state_index / 32] = stored;
+            else state[state_index] = stored;
             if (state_snapshots != nullptr) {
                 const std::uint32_t slot = row - begin + 1;
                 if (slot < snapshot_slots) {
@@ -12304,7 +12452,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
                         (static_cast<std::size_t>(sequence) * snapshot_slots + slot) *
                             complete_state_size +
                         static_cast<std::size_t>(flat) * state_size;
-                    snapshot[state_index] = state[state_index];
+                    snapshot[state_index] = stored;
                 }
             }
             y = __fmaf_rn(updated, c[state_index], y);
@@ -12317,6 +12465,11 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
                 y * silu_gate;
         }
     }
+    if constexpr (RegisterStateSize != 0) {
+        #pragma unroll
+        for (unsigned i = 0; i < RegisterStateSize / 32; ++i) state[lane + i * 32] = local_state[i];
+    }
+
 }
 
 extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
@@ -12418,6 +12571,27 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
         (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const dim3 blocks(sequence_count, state_blocks, 1);
     auto launch = [&](auto state_element) {
+        if (state_size == 128) {
+        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element), 128><<<
+            blocks, kThreads, 0, stream>>>(
+            projected,
+            conv_output,
+            a_log_bf16,
+            d_bf16,
+            dt_bias_bf16,
+            ssm_state_table,
+            sequence_offsets,
+            sequence_lengths,
+            output,
+            nullptr,
+            0,
+            projection_size,
+            heads,
+            head_dim,
+            groups,
+            state_size,
+            dt_floor);
+        } else {
         infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element)><<<
             blocks, kThreads, 0, stream>>>(
             projected,
@@ -12437,6 +12611,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
             groups,
             state_size,
             dt_floor);
+        }
     };
     if (ssm_fp32) {
         launch(float{});

@@ -17,9 +17,11 @@ __global__ void lfm2_split_bf16(const float* input, __nv_bfloat16* parts,
     parts[2 * stride + i] = __float2bfloat16_rn(remainder - __bfloat162float(middle));
 }
 
-__global__ void lfm2_sum_parts(const float* parts, float* output, uint32_t count, uint32_t stride) {
+__global__ void lfm2_sum_parts(const float* parts, float* output, uint32_t count, uint32_t stride,
+    const float* channels, float scale, uint32_t width) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) output[i] = parts[i] + (parts[stride + i] + parts[2 * stride + i]);
+    if (i < count) output[i] = (parts[i] + (parts[stride + i] + parts[2 * stride + i]))
+        * (channels ? channels[i % width] : scale);
 }
 
 extern "C" int infer_lfm2_split_bf16_on_stream(
@@ -29,8 +31,9 @@ extern "C" int infer_lfm2_split_bf16_on_stream(
 }
 
 extern "C" int infer_lfm2_sum_parts_on_stream(
-    const float* parts, float* output, uint32_t count, uint32_t stride, cudaStream_t stream) {
-    lfm2_sum_parts<<<(count + 255) / 256, 256, 0, stream>>>(parts, output, count, stride);
+    const float* parts, float* output, uint32_t count, uint32_t stride,
+    const float* channels, float scale, uint32_t width, cudaStream_t stream) {
+    lfm2_sum_parts<<<(count + 255) / 256, 256, 0, stream>>>(parts, output, count, stride, channels, scale, width);
     return cudaGetLastError();
 }
 
@@ -704,5 +707,28 @@ extern "C" cudaError_t infer_quantized_dense_gemm_f32_on_stream(
             input, reinterpret_cast<const uint16_t*>(weight), output, rows,
             nullptr, global_scale, block_scales);
     }
+    return cudaGetLastError();
+}
+
+// Expand one dense projection into reusable scratch. Global/channel scales
+// remain F32 and are applied after GEMM, avoiding a second weight rounding.
+__global__ void expand_dense_bf16(const uint8_t* weights, const uint8_t* scales,
+    uint32_t* output, unsigned pairs) {
+    const unsigned pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pairs) return;
+    if (scales) {
+        output[pair] = lfm2_weight_pair(weights[pair], lfm2_scale_bf16(scales[pair / 8]));
+    } else {
+        const uint16_t packed = reinterpret_cast<const uint16_t*>(weights)[pair];
+        const float2 v = __half22float2(__nv_cvt_fp8x2_to_halfraw2(packed, __NV_E4M3));
+        output[pair] = lfm2_pair(v.x, v.y);
+    }
+}
+extern "C" cudaError_t infer_expand_dense_bf16_on_stream(
+    const uint8_t* weights, const uint8_t* scales, uint16_t* output,
+    unsigned elements, cudaStream_t stream) {
+    if (!weights || !output || !elements || elements % 16) return cudaErrorInvalidValue;
+    expand_dense_bf16<<<(elements / 2 + 255) / 256, 256, 0, stream>>>(
+        weights, scales, reinterpret_cast<uint32_t*>(output), elements / 2);
     return cudaGetLastError();
 }

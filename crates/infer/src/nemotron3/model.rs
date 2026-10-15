@@ -6,13 +6,14 @@ use super::{
     Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
     Nemotron3CacheContext, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer,
     Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest,
-    Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
-    Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3StorageConfig, nemotron3_cache_error,
+    Nemotron3MoeLayer, Nemotron3MoeLayerConfig, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace,
+    Nemotron3MtpWorkspace, Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3StorageConfig,
+    nemotron3_cache_error,
 };
 use crate::execution::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, PinnedHostBuffer,
-    Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm,
+    PinnedHostBuffer, Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
     prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
@@ -306,7 +307,7 @@ impl Nemotron3Model {
             label: "Nemotron 3 MTP workspace",
             detail: "the loaded checkpoint has no MTP block".to_string(),
         })?;
-        mtp.workspace(sequence_count, rows)
+        mtp.workspace(&self.lm_head, sequence_count, rows)
     }
 
     /// Runs one ragged MTP block using target-model hidden states in matching
@@ -986,18 +987,10 @@ impl Nemotron3Model {
             page_tables,
             &self.stream,
         )?;
-        let last = workspace
-            .layers
-            .last()
-            .ok_or_else(|| Error::Format {
-                label: "Nemotron 3 block model",
-                detail: "model has no layers".to_string(),
-            })?
-            .output();
         rms_norm_f32_into_on_stream(
             rows,
             self.manifest.hidden_size,
-            last,
+            &workspace.hidden,
             &self.final_norm,
             workspace.final_hidden.output(),
             self.manifest.norm_epsilon,
@@ -1008,6 +1001,7 @@ impl Nemotron3Model {
                 &workspace.final_hidden,
                 &mut workspace.logits,
                 rows,
+                &mut workspace.dense_gemm,
                 &self.stream,
             )?;
         }
@@ -1686,13 +1680,9 @@ impl Nemotron3Model {
         page_tables: &[&DeviceBuffer<u32>],
         stream: &CudaStream,
     ) -> Result<()> {
-        let (previous, current) = workspace.layers.split_at_mut(layer);
-        let input = if layer == 0 {
-            &workspace.hidden
-        } else {
-            previous[layer - 1].output()
-        };
-        match (&self.layers[layer], &mut current[0]) {
+        let slot = workspace.layer_slots[layer];
+        let input = &workspace.hidden;
+        match (&self.layers[layer], &mut workspace.layers[slot]) {
             (Nemotron3Layer::Mamba(weights), Nemotron3LayerRowsWorkspace::Mamba(scratch)) => {
                 if let Some(snapshots) = workspace.mamba_snapshots.as_mut() {
                     let snapshot = &mut snapshots[mamba_layer];
@@ -1709,6 +1699,7 @@ impl Nemotron3Model {
                         &mut snapshot.conv,
                         &mut snapshot.ssm,
                         workspace.draft_count.expect("transaction draft count"),
+                        &mut workspace.dense_gemm,
                         stream,
                     )
                 } else {
@@ -1722,12 +1713,13 @@ impl Nemotron3Model {
                         &workspace.sequence_lengths,
                         sequence_count,
                         rows,
+                        &mut workspace.dense_gemm,
                         stream,
                     )
                 }
             }
             (Nemotron3Layer::Moe(weights), Nemotron3LayerRowsWorkspace::Moe(scratch)) => {
-                weights.run_rows(input, scratch, rows, stream)
+                weights.run_rows(input, scratch, rows, &mut workspace.dense_gemm, stream)
             }
             (
                 Nemotron3Layer::Attention(weights),
@@ -1755,6 +1747,7 @@ impl Nemotron3Model {
                             sequence_count,
                             rows,
                             workspace.compact_attention.as_mut(),
+                            &mut workspace.dense_gemm,
                             stream,
                         )
                     })
@@ -1764,7 +1757,14 @@ impl Nemotron3Model {
                 label: "Nemotron 3 block layer workspace",
                 detail: format!("workspace variant mismatch at layer {layer}"),
             }),
-        }
+        }?;
+        workspace.hidden.copy_range_from_device_on_stream(
+            0,
+            workspace.layers[slot].output(),
+            0,
+            rows * self.manifest.hidden_size,
+            stream,
+        )
     }
 
     /// Runs one token through the complete backbone and language-model head.
@@ -2047,6 +2047,13 @@ impl Nemotron3Model {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nemotron3RowsShape {
+    Mamba,
+    Moe(Nemotron3MoeLayerConfig, bool),
+    Attention,
+}
+
 enum Nemotron3LayerRowsWorkspace {
     Mamba(Box<Nemotron3MambaRowsWorkspace>),
     Moe(Box<Nemotron3MoeRowsWorkspace>),
@@ -2202,6 +2209,7 @@ impl Nemotron3LayerRowsWorkspace {
 
 /// Exact-shape scratch, metadata, and pointer tables for block execution.
 pub struct Nemotron3BlockWorkspace {
+    dense_gemm: F32DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     host_offsets: PinnedHostBuffer<u32>,
     host_lengths: PinnedHostBuffer<u32>,
@@ -2214,6 +2222,7 @@ pub struct Nemotron3BlockWorkspace {
     tokens: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerRowsWorkspace>,
+    layer_slots: Vec<usize>,
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     sequence_offsets: DeviceBuffer<u32>,
@@ -2282,8 +2291,25 @@ impl Nemotron3BlockWorkspace {
             .iter()
             .filter(|layer| matches!(layer, Nemotron3Layer::Mamba(_)))
             .count();
-        let mut layers = Vec::with_capacity(model.layers.len());
+        // Row temporaries are reused by shape. Only recurrent and KV state is
+        // layer-specific; hidden carries each residual to the next layer.
+        let mut layers = Vec::new();
+        let mut shapes = Vec::new();
+        let mut layer_slots = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
+            let shape = match layer {
+                Nemotron3Layer::Mamba(_) => Nemotron3RowsShape::Mamba,
+                Nemotron3Layer::Moe(layer) => {
+                    Nemotron3RowsShape::Moe(layer.config(), layer.has_calibrated_experts())
+                }
+                Nemotron3Layer::Attention(_) => Nemotron3RowsShape::Attention,
+            };
+            if let Some(slot) = shapes.iter().position(|existing| *existing == shape) {
+                layer_slots.push(slot);
+                continue;
+            }
+            layer_slots.push(layers.len());
+            shapes.push(shape);
             layers.push(match layer {
                 Nemotron3Layer::Mamba(layer) => {
                     Nemotron3LayerRowsWorkspace::Mamba(Box::new(layer.rows_workspace(rows)?))
@@ -2324,7 +2350,19 @@ impl Nemotron3BlockWorkspace {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
+        let mut dense_weights = Vec::new();
+        for layer in &model.layers {
+            match layer {
+                Nemotron3Layer::Mamba(layer) => dense_weights.extend(layer.dense_linears()),
+                Nemotron3Layer::Moe(layer) => dense_weights.extend(layer.dense_linears()),
+                Nemotron3Layer::Attention(layer) => dense_weights.extend(layer.dense_linears()),
+            }
+        }
+        if !last_logits_only {
+            dense_weights.push(&model.lm_head);
+        }
         let workspace = Self {
+            dense_gemm: Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?,
             host_tokens: PinnedHostBuffer::zeroed(rows)?,
             host_offsets: PinnedHostBuffer::zeroed(sequence_count)?,
             host_lengths: PinnedHostBuffer::zeroed(sequence_count)?,
@@ -2337,6 +2375,7 @@ impl Nemotron3BlockWorkspace {
             tokens: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
             layers,
+            layer_slots,
             final_hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
             logits: DeviceBuffer::zeroed(if last_logits_only {
                 0
@@ -2386,7 +2425,7 @@ impl Nemotron3BlockWorkspace {
             && self.rows == rows
             && self.hidden_size == model.manifest.hidden_size
             && self.vocab_size == model.manifest.vocab_size
-            && self.layers.len() == model.layers.len()
+            && self.layer_slots.len() == model.layers.len()
         {
             return Ok(());
         }
@@ -2399,7 +2438,7 @@ impl Nemotron3BlockWorkspace {
                 self.rows,
                 self.hidden_size,
                 self.vocab_size,
-                self.layers.len()
+                self.layer_slots.len()
             ),
         })
     }
@@ -2417,7 +2456,8 @@ impl Nemotron3BlockWorkspace {
 
     /// Returns bytes owned by block scratch and pointer tables.
     pub fn device_bytes(&self) -> usize {
-        self.tokens.device_bytes()
+        self.dense_gemm.device_bytes()
+            + self.tokens.device_bytes()
             + self.hidden.device_bytes()
             + self
                 .layers
