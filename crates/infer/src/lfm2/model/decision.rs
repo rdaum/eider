@@ -96,6 +96,7 @@ impl Lfm2DecisionReadout {
             model.config.norm_eps,
             &model.stream,
         )?;
+        model.round_matrix_input(&mut self.normalized, model.config.hidden_size)?;
         bf16_linear_logits_f32_into_on_stream(
             &self.normalized,
             &self.weight,

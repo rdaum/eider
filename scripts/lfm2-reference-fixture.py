@@ -3,7 +3,8 @@
 
 Uses the equations in Transformers' modeling_lfm2_moe.py. No model download.
 Run with an output directory, then set LFM2_REFERENCE_DIR for the ignored Rust
-lfm2_reference test. Requires torch and safetensors.
+lfm2_reference test. Add --bf16 for BF16 matrix inputs with F32 accumulation.
+Requires torch and safetensors.
 """
 
 import json
@@ -16,6 +17,7 @@ from safetensors.torch import save_file
 
 torch.set_num_threads(1)
 torch.manual_seed(143)
+use_bf16 = "--bf16" in sys.argv[2:]
 root = Path(sys.argv[1])
 root.mkdir(parents=True, exist_ok=True)
 config = dict(
@@ -83,7 +85,7 @@ save_file(weights, root / "model.safetensors")
 
 
 def linear(x, name):
-    return F.linear(x, reference[name + ".weight"])
+    return F.linear(x.bfloat16().float() if use_bf16 else x, reference[name + ".weight"])
 
 
 def norm(x, name):
@@ -129,6 +131,6 @@ for i, kind in enumerate(config["layer_types"]):
                 e = f + f".experts.{indices[row, slot]}"
                 y[row] += routes[row, slot] * linear(F.silu(linear(z[row], e + ".w1")) * linear(z[row], e + ".w3"), e + ".w2")
     x = x + y
-logits = norm(x, "model.embedding_norm") @ reference["model.embed_tokens.weight"].T
-(root / "reference.json").write_text(json.dumps(dict(tokens=tokens, logits=logits.tolist())))
+logits = linear(norm(x, "model.embedding_norm"), "model.embed_tokens")
+(root / "reference.json").write_text(json.dumps(dict(tokens=tokens, logits=logits.tolist(), bf16=use_bf16)))
 print(root)

@@ -25,6 +25,21 @@ Start Eider:
 EIDER_MODEL=lfm2.5-24b-a2b-nvfp4 scripts/run-eider --offline
 ```
 
+LFM2 preserves F32 matrix inputs by default for prefill, decode, and decisions.
+The expert weights remain NVFP4. Matrix accumulation, residuals, normalization,
+attention, KV storage, and short-convolution history remain F32.
+This selects matrix arithmetic, not a full BF16 state representation.
+
+To opt into BF16 matrix inputs, add `--lfm2-compute-precision bf16`:
+
+```sh
+EIDER_MODEL=lfm2.5-24b-a2b-nvfp4 scripts/run-eider --offline \
+  --lfm2-compute-precision bf16
+```
+
+Decision scores can change with compute precision. Recheck calibration profiles
+before using them with a different precision.
+
 Start Pi in a second terminal:
 
 ```sh
@@ -96,7 +111,7 @@ The full-checkpoint regression compares selected logits against the full head,
 isolated questions, and reversed question order. It also covers queued and
 active cancellation with one sequence slot.
 
-On GB10, packed execution reduced three-question HTTP latency from 417 ms to
+With F32 arithmetic on GB10, packed execution reduced three-question HTTP latency from 417 ms to
 220 ms. Scaled FP16 expert components reduced it further to 193 ms. Each median
 covers five runs after one warm-up, with 379 logical input tokens and 1,024-token
 prefill capacity. The 64-question case fell from 5.65 seconds to 1.59 seconds,
@@ -122,21 +137,44 @@ LFM2_MODEL_DIR="$checkpoint" cargo test --release -p eider-inference --lib \
 Prefill groups routes by expert and multiplies sixteen rows per tensor-core tile.
 The kernel reads the original NVFP4 weight and scale tables without expanding
 the resident weights. It applies each projection's global scale before SiLU.
-Each routed input uses a power-of-two scale and two FP16 components.
-Matrix loads feed both components into separate tensor-core accumulators.
-The weights remain packed NVFP4; their finite scaled products are exact in FP16.
-The former three-component BF16 path remains the benchmark reference and K16-tail
-fallback. Asynchronous copies overlap weight, scale, and activation loads with
-computation. Most dense BF16 projections
-use cached cuBLASLt plans with three activation components. The two long dense
-FFN reductions retain the kernel with four high-component accumulators.
-Prefill scratch and route-sorting storage are reusable. The FP16 component
-buffers add about 32 MiB at 1,024-token capacity.
+BF16 mode uses one tensor-core product per input tile, with F32 accumulation.
+It omits the FP16 component preparation and its 32 MiB scratch allocation at
+1,024-token capacity. Asynchronous copies overlap weight, scale, and activation
+loads with computation. Dense projections use one BF16 product through cached
+cuBLASLt plans or the native small-batch kernel.
 
-At 1,516 routes, the focused projection benchmark measured gate/up at 0.933 ms
-versus 1.164 ms, and down at 0.919 ms versus 1.146 ms. These medians include
-route sorting and activation preparation. The request improvement is smaller because
-expert projections account for about 70% of the original decision GPU time.
+Decode rounds each shared matrix input once before its existing GEMV kernels.
+The full output head and compact decision head use the same input precision.
+Packed decisions preserve prefix and suffix matrix shapes during dense projection.
+This keeps their cuBLAS reductions aligned with separate execution.
+
+The F32 reference mode retains three BF16 components for dense projections and
+two scaled FP16 components for expert projections. Long dense reductions keep
+four high-component accumulators. K16 expert tails use the native BF16 component
+kernel. Prefill scratch and route-sorting storage are reusable.
+
+On GB10, the BF16 matrix-input mode produced these whole-request results:
+
+| Measurement | F32 reference | BF16 inputs |
+| --- | ---: | ---: |
+| Prefill, 4,864 tokens | 2,344 tok/s | 2,990 tok/s |
+| Cold HTTP time to first token | 2.107 s | 1.658 s |
+| Decode, 96 output tokens | 60.7 tok/s | 61.2 tok/s |
+| Three-question HTTP median | 144 ms | 141 ms |
+
+Each generation measurement used one cold request followed by an identical request.
+The repeat reused 4,863 prefix tokens and produced identical tokens within each mode.
+Decision medians cover five requests after one warm-up, with 190 logical input tokens.
+The decisions checked arrival, colour, and book count; both modes returned the same choices.
+Arithmetic, JSON, and bird-retrieval smoke answers also matched. A code-generation
+prompt exhausted its 512-token reasoning budget in both modes. These checks do
+not establish broad task-quality parity. Decision probabilities changed between modes.
+
+At 1,516 routes, BF16 expert gate/up took 0.848 ms versus 0.975 ms for FP16 components.
+Down took 0.897 ms versus 0.963 ms. These focused measurements include route sorting.
+Each case compares outputs against the SIMT kernel with independently rounded inputs
+before timing. The full-model decision check matched packed, isolated, and full-head
+logits exactly after preserving dense reduction shapes.
 
 The checkpoint also supplies calibrated FP4 activation scales. The runtime still
 uses weight-only NVFP4. A calibrated W4A4 trial reached 149 ms on the same
@@ -159,13 +197,19 @@ and [Transformers implementation](https://github.com/huggingface/transformers/bl
 
 ## Correctness checks
 
-The small fixture and 128-token full-checkpoint reference tests pass with
+The F32 small fixture and 128-token full-checkpoint reference tests pass with
 maximum absolute logit error below `2e-4`. They cover sequential execution, batched
 chunks, graph replay, and prefix restoration after the source request advances.
 The fixture also covers cache eviction and disabled retention.
 Offline catalogue startup, reasoning separation, and tool-call round trips
 passed through both HTTP APIs. Live checks also covered concurrent requests,
 streaming, stop sequences, output limits, and cancellation with state release.
+
+The fixture also supports `--bf16`, which rounds matrix inputs before the CPU
+F32 products. Its BF16 check requires matching top tokens and absolute logit error
+below `0.01`. The F32 reference limit remains `2e-4`. BF16 rounding can amplify
+small CPU/GPU reduction differences across layers. Kernel tests separately check
+BF16 matrix products, all finite NVFP4 scales, packed codes, and K16 tails.
 
 Generate the small reference checkpoint and CPU logits:
 

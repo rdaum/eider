@@ -1155,6 +1155,20 @@ unsafe extern "C" {
         in_features: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn infer_lfm2_expert_gemm_bf16_on_stream(
+        sorted_routes: *const u32,
+        offsets: *const u32,
+        inputs: *const *const f32,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        globals: *const f32,
+        outputs: *const *mut f32,
+        routes: u32,
+        experts: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_lfm2_expert_gemm_f16_parts_on_stream(
         sorted_routes: *const u32,
         offsets: *const u32,
@@ -1244,6 +1258,34 @@ pub fn lfm2_expert_gemm_pipelined_into_on_stream(
     in_features: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    lfm2_expert_gemm_with_precision_into_on_stream(
+        routes,
+        inputs,
+        weights,
+        scales,
+        globals,
+        outputs,
+        out_features,
+        in_features,
+        GemmPrecision::F32,
+        stream,
+    )
+}
+
+/// Projects BF16-rounded inputs or preserves F32 inputs with component products.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm2_expert_gemm_with_precision_into_on_stream(
+    routes: &MoeSortedRoutes,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    scales: &DeviceBuffer<DeviceAddress<u8>>,
+    globals: &DeviceBuffer<f32>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    precision: GemmPrecision,
+    stream: &CudaStream,
+) -> Result<()> {
     let experts = weights.len();
     if experts == 0
         || experts > 1024
@@ -1263,10 +1305,14 @@ pub fn lfm2_expert_gemm_pipelined_into_on_stream(
             detail: "expected matching route and expert tables, positive dimensions and K divisible by 16".into(),
         });
     }
+    let kernel = match precision {
+        GemmPrecision::F32 => infer_lfm2_expert_gemm_pipelined_on_stream,
+        GemmPrecision::Bf16 => infer_lfm2_expert_gemm_bf16_on_stream,
+    };
     unsafe {
         check_cuda(
             "infer_lfm2_expert_gemm_pipelined_on_stream",
-            infer_lfm2_expert_gemm_pipelined_on_stream(
+            kernel(
                 routes.sorted_routes().as_const_ptr().cast(),
                 routes.expert_offsets().as_const_ptr().cast(),
                 inputs.ptr.cast(),
@@ -1373,16 +1419,49 @@ unsafe extern "C" {
         in_features: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn infer_lfm2_dense_gemm_bf16_on_stream(
+        input: *const f32,
+        weight: *const u16,
+        output: *mut f32,
+        rows: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Multiplies BF16 weights by a row-major F32 batch using three BF16 components.
 pub fn lfm2_dense_gemm_into_on_stream(
     input: &DeviceBuffer<f32>,
     weight: &DeviceBuffer<u16>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    lfm2_dense_gemm_with_precision_into_on_stream(
+        input,
+        weight,
+        output,
+        rows,
+        out_features,
+        in_features,
+        GemmPrecision::F32,
+        stream,
+    )
+}
+
+/// Projects BF16-rounded inputs or preserves F32 inputs with component products.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm2_dense_gemm_with_precision_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
     mut output: DeviceOutput<'_, f32>,
     rows: usize,
     out_features: usize,
     in_features: usize,
+    precision: GemmPrecision,
     stream: &CudaStream,
 ) -> Result<()> {
     if rows == 0
@@ -1405,10 +1484,14 @@ pub fn lfm2_dense_gemm_into_on_stream(
             detail: "expected matching positive batch dimensions and K divisible by 16".into(),
         });
     }
+    let kernel = match precision {
+        GemmPrecision::F32 => infer_lfm2_dense_gemm_on_stream,
+        GemmPrecision::Bf16 => infer_lfm2_dense_gemm_bf16_on_stream,
+    };
     unsafe {
         check_cuda(
             "infer_lfm2_dense_gemm_on_stream",
-            infer_lfm2_dense_gemm_on_stream(
+            kernel(
                 input.ptr,
                 weight.ptr,
                 output.buffer_mut().ptr,
@@ -1706,6 +1789,37 @@ mod tests {
                 }
             }
         }
+        for active in [1, 7, 8, 9, rows] {
+            lfm2_dense_gemm_with_precision_into_on_stream(
+                &input,
+                &weight,
+                output.output(),
+                active,
+                out,
+                cols,
+                GemmPrecision::Bf16,
+                &stream,
+            )
+            .unwrap();
+            let actual = output.copy_to_host(&stream).unwrap();
+            for row in 0..active {
+                for channel in 0..out {
+                    let expected = (0..cols)
+                        .map(|k| {
+                            f64::from(rounded(host[row * cols + k]))
+                                * f64::from(f32::from_bits(
+                                    u32::from(weights[channel * cols + k]) << 16,
+                                ))
+                        })
+                        .sum::<f64>() as f32;
+                    let a = actual[row * out + channel];
+                    assert!(
+                        (a - expected).abs() < 2e-4 + expected.abs() * 2e-5,
+                        "native BF16 {a} vs {expected}"
+                    );
+                }
+            }
+        }
         assert_eq!(
             gemm.plans.len(),
             4,
@@ -1846,8 +1960,22 @@ mod tests {
                     input[nibble] = magnitude;
                     let input = DeviceBuffer::from_host(&input).unwrap();
                     let inputs = DeviceBuffer::from_host(&[input.cuda_address()]).unwrap();
-                    for mode in 0..3 {
-                        if mode == 2 {
+                    for mode in 0..4 {
+                        if mode == 3 {
+                            lfm2_expert_gemm_with_precision_into_on_stream(
+                                &routes,
+                                &inputs,
+                                &weights,
+                                &scale_table,
+                                &global,
+                                &outputs,
+                                rows,
+                                cols,
+                                GemmPrecision::Bf16,
+                                &stream,
+                            )
+                            .unwrap();
+                        } else if mode == 2 {
                             lfm2_expert_gemm_f16_parts_into_on_stream(
                                 &routes,
                                 &inputs,

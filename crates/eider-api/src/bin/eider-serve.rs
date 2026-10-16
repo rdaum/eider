@@ -78,26 +78,26 @@ impl From<StepBf16StorageArg> for Step37Bf16Storage {
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum NemotronPrecisionArg {
+enum ComputePrecisionArg {
     #[default]
     F32,
     Bf16,
 }
 
-impl From<NemotronPrecisionArg> for GemmPrecision {
-    fn from(value: NemotronPrecisionArg) -> Self {
+impl From<ComputePrecisionArg> for GemmPrecision {
+    fn from(value: ComputePrecisionArg) -> Self {
         match value {
-            NemotronPrecisionArg::F32 => Self::F32,
-            NemotronPrecisionArg::Bf16 => Self::Bf16,
+            ComputePrecisionArg::F32 => Self::F32,
+            ComputePrecisionArg::Bf16 => Self::Bf16,
         }
     }
 }
 
-impl From<NemotronPrecisionArg> for MambaSsmDtype {
-    fn from(value: NemotronPrecisionArg) -> Self {
+impl From<ComputePrecisionArg> for MambaSsmDtype {
+    fn from(value: ComputePrecisionArg) -> Self {
         match value {
-            NemotronPrecisionArg::F32 => Self::F32,
-            NemotronPrecisionArg::Bf16 => Self::Bf16,
+            ComputePrecisionArg::F32 => Self::F32,
+            ComputePrecisionArg::Bf16 => Self::Bf16,
         }
     }
 }
@@ -287,13 +287,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::F32)]
     nemotron_kv_cache: NemotronKvCacheStorageArg,
 
+    /// LFM2 matrix input precision; accumulation and sequence state remain F32.
+    #[arg(long, value_enum, default_value_t = ComputePrecisionArg::F32)]
+    lfm2_compute_precision: ComputePrecisionArg,
+
     /// Model arithmetic for Nemotron prefill, decode, and verification.
-    #[arg(long, value_enum, default_value_t = NemotronPrecisionArg::F32)]
-    nemotron_compute_precision: NemotronPrecisionArg,
+    #[arg(long, value_enum, default_value_t = ComputePrecisionArg::F32)]
+    nemotron_compute_precision: ComputePrecisionArg,
 
     /// Override Nemotron recurrent-state storage; defaults to checkpoint metadata.
     #[arg(long, value_enum)]
-    nemotron_mamba_ssm_dtype: Option<NemotronPrecisionArg>,
+    nemotron_mamba_ssm_dtype: Option<ComputePrecisionArg>,
 
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
@@ -430,6 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_expert: args.step_bf16_shared_expert.into(),
         lm_head: args.step_bf16_lm_head.into(),
     };
+    actor_config.engine.lfm2_compute_precision = args.lfm2_compute_precision.into();
     actor_config.engine.nemotron_storage = Nemotron3StorageConfig {
         bf16: args.nemotron_bf16_storage.into(),
         fp8: args.nemotron_fp8_storage.into(),

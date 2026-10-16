@@ -279,7 +279,7 @@ __device__ __forceinline__ void lfm2_mma(float* d, uint32_t a0, uint32_t a1,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template <bool Routed, unsigned Columns = 1, unsigned DenseFormat = 0>
+template <bool Routed, unsigned Columns = 1, unsigned DenseFormat = 0, bool Bf16 = false>
 __global__ void lfm2_gemm(
     const uint32_t* sorted_routes, const uint32_t* offsets,
     const float* const* inputs, const uint8_t* const* weights,
@@ -383,13 +383,17 @@ __global__ void lfm2_gemm(
         #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
             high[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
-            const float residual = x[i] - high[i];
-            middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
-            tail[i] = residual - middle[i];
+            if constexpr (!Bf16) {
+                const float residual = x[i] - high[i];
+                middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
+                tail[i] = residual - middle[i];
+            }
         }
         lfm2_mma(hi[n][part], a0, a1, a2, a3, lfm2_pair(high[0], high[1]), lfm2_pair(high[2], high[3]));
-        lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
-        lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+        if constexpr (!Bf16) {
+            lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
+            lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+        }
         }
       }
     }
@@ -491,7 +495,7 @@ __device__ __forceinline__ void lfm2_stage_expert(
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
-template <bool Prepared, unsigned Columns = 2>
+template <bool Prepared, unsigned Columns = 2, bool Bf16 = false>
 __global__ void lfm2_expert_gemm_pipeline(
     const uint32_t* sorted_routes, const uint32_t* offsets,
     const float* const* inputs, const uint16_t* prepared, const float* input_powers,
@@ -584,13 +588,17 @@ __global__ void lfm2_expert_gemm_pipeline(
                     #pragma unroll
                     for (unsigned i = 0; i < 4; ++i) {
                         high[i] = __bfloat162float(__float2bfloat16_rn(v[i]));
-                        const float residual = v[i] - high[i];
-                        middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
-                        tail[i] = residual - middle[i];
+                        if constexpr (!Bf16) {
+                            const float residual = v[i] - high[i];
+                            middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
+                            tail[i] = residual - middle[i];
+                        }
                     }
                     lfm2_mma(hi[n][p], a0, a1, a2, a3, lfm2_pair(high[0], high[1]), lfm2_pair(high[2], high[3]));
-                    lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
-                    lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+                    if constexpr (!Bf16) {
+                        lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
+                        lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+                    }
                 }
             }
         }
@@ -635,6 +643,32 @@ extern "C" cudaError_t infer_lfm2_expert_gemm_pipelined_on_stream(
             weights, scales, globals, outputs, experts, out_features, in_features);
     } else {
         lfm2_gemm<true, 2><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
+            weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0, nullptr, 1.0f, nullptr);
+    }
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_lfm2_expert_gemm_bf16_on_stream(
+    const uint32_t* sorted_routes, const uint32_t* offsets,
+    const float* const* inputs, const uint8_t* const* weights,
+    const uint8_t* const* scales, const float* globals, float* const* outputs,
+    unsigned routes, unsigned experts, unsigned out_features, unsigned in_features,
+    cudaStream_t stream) {
+    if (!sorted_routes || !offsets || !inputs || !weights || !scales || !globals || !outputs
+        || routes == 0 || experts == 0 || out_features == 0 || in_features == 0
+        || in_features % 16 != 0) return cudaErrorInvalidValue;
+    const dim3 grid((out_features + 63) / 64, (routes + 15) / 16 + experts - 1);
+    if (in_features % 64 == 0) {
+        if (experts >= 240 && routes >= 4096 && out_features <= 3072 && in_features <= 3072) {
+            const dim3 wide_grid((out_features + 63) / 64, (routes + 31) / 32 + experts - 1);
+            lfm2_expert_gemm_pipeline<false, 4, true><<<wide_grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
+                nullptr, nullptr, weights, scales, globals, outputs, experts, out_features, in_features);
+            return cudaGetLastError();
+        }
+        lfm2_expert_gemm_pipeline<false, 2, true><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs, nullptr, nullptr,
+            weights, scales, globals, outputs, experts, out_features, in_features);
+    } else {
+        lfm2_gemm<true, 2, 0, true><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
             weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0, nullptr, 1.0f, nullptr);
     }
     return cudaGetLastError();
@@ -695,6 +729,17 @@ extern "C" cudaError_t infer_lfm2_dense_gemm_on_stream(
     if (!input || !weight || !output || rows == 0 || out_features == 0 || in_features == 0
         || in_features % 16 != 0) return cudaErrorInvalidValue;
     lfm2_gemm<false><<<dim3((out_features + 63) / 64, (rows + 7) / 8), 128, 0, stream>>>(
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, out_features,
+        in_features, input, weight, output, rows, nullptr, 1.0f, nullptr);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_lfm2_dense_gemm_bf16_on_stream(
+    const float* input, const uint16_t* weight, float* output,
+    unsigned rows, unsigned out_features, unsigned in_features, cudaStream_t stream) {
+    if (!input || !weight || !output || rows == 0 || out_features == 0 || in_features == 0
+        || in_features % 16 != 0) return cudaErrorInvalidValue;
+    lfm2_gemm<false, 1, 0, true><<<dim3((out_features + 63) / 64, (rows + 7) / 8), 128, 0, stream>>>(
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, out_features,
         in_features, input, weight, output, rows, nullptr, 1.0f, nullptr);
     return cudaGetLastError();

@@ -38,6 +38,8 @@ pub struct InferenceEngineConfig {
     pub deepseek_expert_capacity: usize,
     /// Step BF16 storage policy.
     pub step_bf16_storage: Step37Bf16StorageConfig,
+    /// LFM2 matrix input precision.
+    pub lfm2_compute_precision: eider_cuda::GemmPrecision,
     /// Nemotron storage policy.
     pub nemotron_storage: Nemotron3StorageConfig,
 }
@@ -61,6 +63,7 @@ impl InferenceEngineConfig {
             step_expert_capacity: 240,
             deepseek_expert_capacity: 8,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
+            lfm2_compute_precision: eider_cuda::GemmPrecision::F32,
             nemotron_storage: Nemotron3StorageConfig::default(),
         }
     }

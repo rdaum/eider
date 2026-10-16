@@ -132,6 +132,7 @@ pub fn with_loaded_engine<R>(
         deepseek_expert_capacity,
         step_bf16_storage,
         nemotron_storage,
+        lfm2_compute_precision,
         ..
     } = config;
     let architecture = checkpoint_architecture(&model_dir)?;
@@ -161,7 +162,7 @@ pub fn with_loaded_engine<R>(
     let defaults = GenerationConfig::from_model_dir(&model_dir)?;
     match architecture {
         CheckpointArchitecture::Lfm2Moe => {
-            let model = Lfm2Model::load(&model_dir)?;
+            let model = Lfm2Model::load_with_precision(&model_dir, lfm2_compute_precision)?;
             let scheduler = SchedulerConfig {
                 max_context_tokens: scheduler
                     .max_context_tokens

@@ -1,15 +1,16 @@
 use super::config::{Lfm2Config, invalid};
 use crate::execution::kv_cache::{LayerKvCache, LayerKvCacheCheckpoint};
 use eider_cuda::{
-    CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Head64DecodeAttention, Result,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    fill_f32_into_on_stream, lfm2_decode_inputs_on_stream, lfm2_router_into_on_stream,
-    lfm2_short_conv_into_on_stream, moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, GemmPrecision, Head64DecodeAttention,
+    Result, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, fill_f32_into_on_stream, lfm2_decode_inputs_on_stream,
+    lfm2_router_into_on_stream, lfm2_short_conv_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_f32_indexed_into_on_stream, rope_neox_f32_into_on_stream,
-    silu_mul_f32_into_on_stream,
+    round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use std::path::Path;
@@ -199,6 +200,7 @@ struct Layer {
 /// Fully resident LFM2 MoE weights and one explicit execution stream.
 pub struct Lfm2Model {
     config: Lfm2Config,
+    precision: GemmPrecision,
     embedding: DeviceBuffer<u16>,
     layers: Vec<Layer>,
     norm: DeviceBuffer<f32>,
@@ -272,6 +274,11 @@ pub struct Lfm2Sequence<'model> {
 impl Lfm2Model {
     /// Loads the experts-only ModelOpt NVFP4 checkpoint without modifying it.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_precision(root, GemmPrecision::F32)
+    }
+
+    /// Selects matrix input precision; accumulation, mixers and state stay F32.
+    pub fn load_with_precision(root: impl AsRef<Path>, precision: GemmPrecision) -> Result<Self> {
         let root = root.as_ref();
         let c = Lfm2Config::load(root)?;
         let cp = ModelOptCheckpoint::open(root)?;
@@ -359,13 +366,22 @@ impl Lfm2Model {
             info!(layer = i, "loaded LFM2 NVFP4 layer");
         }
         let norm = read_float(&cp, "model.embedding_norm.weight", &[h])?;
+        info!(?precision, "loaded LFM2 matrix compute policy");
         Ok(Self {
             config: c,
+            precision,
             embedding,
             layers,
             norm,
             stream: CudaStream::new_non_blocking()?,
         })
+    }
+
+    fn round_matrix_input(&self, input: &mut DeviceBuffer<f32>, count: usize) -> Result<()> {
+        if self.precision == GemmPrecision::Bf16 {
+            round_f32_to_bf16_prefix_in_place_on_stream(input.inout(), count, &self.stream)?;
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &Lfm2Config {
@@ -560,6 +576,7 @@ impl Lfm2Model {
                 c.norm_eps,
                 stream,
             )?;
+            self.round_matrix_input(&mut s.normalized, h)?;
             match (&layer.mixer, history) {
                 (
                     Mixer::Conv {
@@ -578,6 +595,7 @@ impl Lfm2Model {
                         c.conv_width,
                         stream,
                     )?;
+                    self.round_matrix_input(&mut s.mixed, h)?;
                     output.run(&s.mixed, &mut s.projected, stream)?;
                 }
                 (
@@ -683,6 +701,7 @@ impl Lfm2Model {
                             stream,
                         )?;
                     }
+                    self.round_matrix_input(&mut s.mixed, h)?;
                     output.run(&s.mixed, &mut s.projected, stream)?;
                 }
                 _ => return Err(invalid("mismatched mixer state")),
@@ -697,6 +716,7 @@ impl Lfm2Model {
                 c.norm_eps,
                 stream,
             )?;
+            self.round_matrix_input(&mut s.normalized, h)?;
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
                     gate.run(&s.normalized, &mut s.dense_gate, stream)?;
@@ -707,6 +727,7 @@ impl Lfm2Model {
                         s.dense_act.output(),
                         stream,
                     )?;
+                    self.round_matrix_input(&mut s.dense_act, c.intermediate_size)?;
                     down.run(&s.dense_act, &mut s.projected, stream)?;
                 }
                 Ffn::Moe(moe) => {
@@ -734,6 +755,10 @@ impl Lfm2Model {
                         &s.expert_up.values,
                         s.expert_act.values.output(),
                         stream,
+                    )?;
+                    self.round_matrix_input(
+                        &mut s.expert_act.values,
+                        c.num_experts_per_tok * c.moe_intermediate_size,
                     )?;
                     down.run_slots(
                         &s.indices,
@@ -764,6 +789,7 @@ impl Lfm2Model {
                 c.norm_eps,
                 stream,
             )?;
+            self.round_matrix_input(&mut s.normalized, h)?;
             bf16_linear_logits_f32_into_on_stream(
                 &s.normalized,
                 &self.embedding,
@@ -910,6 +936,8 @@ mod tests {
     struct Reference {
         tokens: Vec<u32>,
         logits: Vec<Vec<f32>>,
+        #[serde(default)]
+        bf16: bool,
     }
 
     #[test]
@@ -923,7 +951,32 @@ mod tests {
             serde_json::from_slice(&std::fs::read(reference_path).unwrap()).unwrap();
         assert!(reference.tokens.len() > 4);
         assert_eq!(reference.tokens.len(), reference.logits.len());
-        let model = Lfm2Model::load(root).unwrap();
+        let model = Lfm2Model::load_with_precision(
+            root,
+            if reference.bf16 {
+                GemmPrecision::Bf16
+            } else {
+                GemmPrecision::F32
+            },
+        )
+        .unwrap();
+        // BF16 rounding can move an intermediate across a rounding boundary
+        // after different CPU/GPU reduction orders. Keep the F32 gate unchanged.
+        let tolerance = if reference.bf16 { 0.01 } else { 2e-4 };
+        let assert_close = |actual: &[f32], expected: &[f32], label: &str| {
+            assert_close(actual, expected, label, tolerance);
+            if reference.bf16 {
+                let top = |values: &[f32]| {
+                    values
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .unwrap()
+                        .0
+                };
+                assert_eq!(top(actual), top(expected), "{label}: top token");
+            }
+        };
         let mut single = model.new_sequence(reference.tokens.len()).unwrap();
         let mut split = model.new_sequence(reference.tokens.len()).unwrap();
         let mut whole = model.new_sequence(reference.tokens.len()).unwrap();
@@ -942,7 +995,11 @@ mod tests {
                 .zip(&reference.logits[i])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_error < 2e-4, "token {i}: max logit error {max_error}");
+            assert!(
+                max_error < tolerance,
+                "token {i}: max logit error {max_error}"
+            );
+            assert_close(&logits, &reference.logits[i], "serial reference");
             if i == 3 {
                 model
                     .prefill_sequential(&mut split, &reference.tokens[..4])
@@ -1071,7 +1128,7 @@ mod tests {
         }
         assert!(model.forward_one(&mut whole, 0).is_err());
     }
-    fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+    fn assert_close(actual: &[f32], expected: &[f32], label: &str, tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
         assert!(actual.iter().chain(expected).all(|x| x.is_finite()));
         let error = actual
@@ -1079,6 +1136,6 @@ mod tests {
             .zip(expected)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(error < 2e-4, "{label}: max error {error}");
+        assert!(error < tolerance, "{label}: max error {error}");
     }
 }

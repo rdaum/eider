@@ -1,8 +1,8 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, F32DenseGemm, MoeSortedRoutes,
-    bf16_linear_logits_f32_batch_into_on_stream, lfm2_dense_gemm_into_on_stream,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, F32DenseGemm, GemmPrecision,
+    MoeSortedRoutes, bf16_linear_logits_f32_batch_into_on_stream, lfm2_dense_gemm_into_on_stream,
     lfm2_expert_gemm_f16_parts_into_on_stream, lfm2_expert_gemm_into_on_stream,
-    lfm2_expert_gemm_pipelined_into_on_stream,
+    lfm2_expert_gemm_pipelined_into_on_stream, lfm2_expert_gemm_with_precision_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
 };
 use micromeasure::{
@@ -34,7 +34,24 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
 
 impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, ROUTES> {
     fn enqueue(&mut self, mode: usize) {
-        if mode == 3 {
+        if mode == 4 {
+            self.routes
+                .sort_on_stream(&self.indices, &self.stream)
+                .unwrap();
+            lfm2_expert_gemm_with_precision_into_on_stream(
+                &self.routes,
+                &self.inputs,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                &self.outputs,
+                OUT,
+                IN,
+                GemmPrecision::Bf16,
+                &self.stream,
+            )
+            .unwrap();
+        } else if mode == 3 {
             self.routes
                 .sort_on_stream(&self.indices, &self.stream)
                 .unwrap();
@@ -229,6 +246,39 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
                 );
             }
         }
+        // Compare BF16 arithmetic with the SIMT path on independently rounded inputs.
+        let original = context
+            ._input
+            .copy_to_host(&context.stream)
+            .unwrap()
+            .to_vec();
+        let rounded = original
+            .iter()
+            .map(|x| {
+                f32::from_bits((x.to_bits() + 0x7fff + ((x.to_bits() >> 16) & 1)) & 0xffff0000)
+            })
+            .collect::<Vec<_>>();
+        for routes in [ROUTES, 1, 7, 9, 67] {
+            context.routes.set_routes(routes).unwrap();
+            context.enqueue(4);
+            let actual = context
+                .output
+                .copy_to_host(&context.stream)
+                .unwrap()
+                .to_vec();
+            context._input.copy_from_host(&rounded).unwrap();
+            context.enqueue(0);
+            let expected = context.output.copy_to_host(&context.stream).unwrap();
+            for (&a, &b) in actual.iter().zip(expected.iter()).take(routes * OUT) {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 2e-4 + b.abs() * 2e-5,
+                    "BF16 {a} vs SIMT {b}"
+                );
+            }
+            drop(expected);
+            context._input.copy_from_host(&original).unwrap();
+        }
+        context.routes.set_routes(ROUTES).unwrap();
         context
     }
     fn chunk_size() -> Option<usize> {
@@ -386,23 +436,27 @@ fn main() {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample("pipelined tiles", sample::<1536, 2048, 2, 1516>);
                 group.bench_sample("scaled FP16 components", sample::<1536, 2048, 3, 1516>);
+                group.bench_sample("BF16 inputs", sample::<1536, 2048, 4, 1516>);
             });
             runner.group::<Experts<2048, 1536, 1516>>("LFM2 decision down", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample("pipelined tiles", sample::<2048, 1536, 2, 1516>);
                 group.bench_sample("scaled FP16 components", sample::<2048, 1536, 3, 1516>);
+                group.bench_sample("BF16 inputs", sample::<2048, 1536, 4, 1516>);
             });
             runner.group::<Experts<1536, 2048, 4096>>("LFM2 gate or up 4096 routes", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample("tensor including sort", sample::<1536, 2048, 1, 4096>);
                 group.bench_sample("pipelined tiles", sample::<1536, 2048, 2, 4096>);
                 group.bench_sample("scaled FP16 components", sample::<1536, 2048, 3, 4096>);
+                group.bench_sample("BF16 inputs", sample::<1536, 2048, 4, 4096>);
             });
             runner.group::<Experts<2048, 1536, 4096>>("LFM2 down 4096 routes", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
                 group.bench_sample("tensor including sort", sample::<2048, 1536, 1, 4096>);
                 group.bench_sample("pipelined tiles", sample::<2048, 1536, 2, 4096>);
                 group.bench_sample("scaled FP16 components", sample::<2048, 1536, 3, 4096>);
+                group.bench_sample("BF16 inputs", sample::<2048, 1536, 4, 4096>);
             });
             runner.group::<Dense<6144, 2048>>("LFM2 convolution projection", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
@@ -422,6 +476,7 @@ fn main() {
                 group.bench_sample("tensor including sort", sample::<1536, 2048, 1, 1024>);
                 group.bench_sample("pipelined tiles", sample::<1536, 2048, 2, 1024>);
                 group.bench_sample("scaled FP16 components", sample::<1536, 2048, 3, 1024>);
+                group.bench_sample("BF16 inputs", sample::<1536, 2048, 4, 1024>);
             });
             runner.group::<Experts<2048, 1536, 1024>>("LFM2 down", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
@@ -429,6 +484,7 @@ fn main() {
                 group.bench_sample("tensor including sort", sample::<2048, 1536, 1, 1024>);
                 group.bench_sample("pipelined tiles", sample::<2048, 1536, 2, 1024>);
                 group.bench_sample("scaled FP16 components", sample::<2048, 1536, 3, 1024>);
+                group.bench_sample("BF16 inputs", sample::<2048, 1536, 4, 1024>);
             });
         },
     );

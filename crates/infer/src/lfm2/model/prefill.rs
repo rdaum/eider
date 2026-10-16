@@ -3,8 +3,9 @@
 use super::*;
 use eider_cuda::{
     CudaEvent, F32DenseGemm, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, lfm2_dense_gemm_into_on_stream,
-    lfm2_expert_gemm_f16_parts_into_on_stream, lfm2_router_batch_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    lfm2_dense_gemm_with_precision_into_on_stream, lfm2_expert_gemm_f16_parts_into_on_stream,
+    lfm2_expert_gemm_with_precision_into_on_stream, lfm2_router_batch_into_on_stream,
     lfm2_short_conv_batch_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream,
     rope_neox_sequence_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
@@ -31,6 +32,7 @@ pub struct Lfm2PrefillWorkspace<'model> {
     pub(super) model: &'model Lfm2Model,
     pub(super) capacity: usize,
     dense_gemm: F32DenseGemm,
+    dense_row_segments: Vec<u32>,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
     upload_done: CudaEvent,
@@ -74,8 +76,12 @@ impl Bf16Linear {
         stream: &CudaStream,
         gemm: &mut F32DenseGemm,
     ) -> Result<()> {
-        // Long reductions retain four high-component accumulators.
-        if rows >= 16 && self.rows >= 512 && self.cols <= 4096 {
+        // F32 long reductions retain four high-component accumulators.
+        // BF16 projections use one product, including the dense FFN down path.
+        if rows >= 16
+            && self.rows >= 512
+            && (self.cols <= 4096 || gemm.precision() == GemmPrecision::Bf16)
+        {
             return gemm.run_on_stream(
                 input,
                 &self.weight,
@@ -86,19 +92,21 @@ impl Bf16Linear {
                 stream,
             );
         }
-        lfm2_dense_gemm_into_on_stream(
+        lfm2_dense_gemm_with_precision_into_on_stream(
             input,
             &self.weight,
             output.output(),
             rows,
             self.rows,
             self.cols,
+            gemm.precision(),
             stream,
         )
     }
 }
 
 impl ExpertProjection {
+    #[allow(clippy::too_many_arguments)]
     fn run_rows(
         &self,
         routes: &MoeSortedRoutes,
@@ -106,8 +114,23 @@ impl ExpertProjection {
         outputs: &DeviceBuffer<DeviceAddress<f32>>,
         prepared: &mut DeviceBuffer<u16>,
         powers: &mut DeviceBuffer<f32>,
+        precision: GemmPrecision,
         stream: &CudaStream,
     ) -> Result<()> {
+        if precision == GemmPrecision::Bf16 {
+            return lfm2_expert_gemm_with_precision_into_on_stream(
+                routes,
+                inputs,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                outputs,
+                self.rows,
+                self.cols,
+                precision,
+                stream,
+            );
+        }
         lfm2_expert_gemm_f16_parts_into_on_stream(
             routes,
             inputs,
@@ -157,10 +180,13 @@ impl Lfm2Model {
                 .map(|i| normalized.address_at(i / c.num_experts_per_tok * h))
                 .collect::<Result<Vec<_>>>()?,
         )?;
+        let mut dense_gemm = F32DenseGemm::new(capacity, (h * 3).max(c.intermediate_size), 0)?;
+        dense_gemm.set_precision(self.precision);
         Ok(Lfm2PrefillWorkspace {
             model: self,
             capacity,
-            dense_gemm: F32DenseGemm::new(capacity, (h * 3).max(c.intermediate_size), 0)?,
+            dense_gemm,
+            dense_row_segments: Vec::with_capacity(65),
             host_tokens: PinnedHostBuffer::zeroed(capacity)?,
             tokens: DeviceBuffer::zeroed(capacity)?,
             upload_done: CudaEvent::new()?,
@@ -186,8 +212,16 @@ impl Lfm2Model {
             sorted_routes: MoeSortedRoutes::new(routes, c.num_experts)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
             expert_inputs,
-            expert_parts: DeviceBuffer::zeroed(routes * h.max(c.moe_intermediate_size) * 2)?,
-            expert_powers: DeviceBuffer::zeroed(routes)?,
+            expert_parts: DeviceBuffer::zeroed(if self.precision == GemmPrecision::F32 {
+                routes * h.max(c.moe_intermediate_size) * 2
+            } else {
+                0
+            })?,
+            expert_powers: DeviceBuffer::zeroed(if self.precision == GemmPrecision::F32 {
+                routes
+            } else {
+                0
+            })?,
             expert_gate: Slots::new(routes, c.moe_intermediate_size)?,
             expert_up: Slots::new(routes, c.moe_intermediate_size)?,
             expert_act: Slots::new(routes, c.moe_intermediate_size)?,
@@ -250,6 +284,16 @@ impl Lfm2Model {
         let stream = &self.stream;
         let rows = tokens.len();
         let h = c.hidden_size;
+        // Match standalone prefix/suffix reduction shapes. BF16 rounding can
+        // amplify a cuBLAS reduction-order change through later expert routing.
+        w.dense_row_segments.clear();
+        if self.precision == GemmPrecision::Bf16
+            && let Some(tree) = &tree
+        {
+            w.dense_row_segments
+                .extend(tree.segments.iter().map(|range| range.len() as u32));
+        }
+        w.dense_gemm.set_row_segments(&w.dense_row_segments)?;
         if w.upload_pending {
             w.upload_done.synchronize()?;
         }
@@ -556,6 +600,7 @@ impl Lfm2Model {
                         &w.expert_gate.addresses,
                         &mut w.expert_parts,
                         &mut w.expert_powers,
+                        self.precision,
                         stream,
                     )?;
                     moe.up.run_rows(
@@ -564,6 +609,7 @@ impl Lfm2Model {
                         &w.expert_up.addresses,
                         &mut w.expert_parts,
                         &mut w.expert_powers,
+                        self.precision,
                         stream,
                     )?;
                     silu_mul_f32_prefix_into_on_stream(
@@ -579,6 +625,7 @@ impl Lfm2Model {
                         &w.expert_down.addresses,
                         &mut w.expert_parts,
                         &mut w.expert_powers,
+                        self.precision,
                         stream,
                     )?;
                     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
@@ -619,6 +666,7 @@ impl Lfm2Model {
             c.norm_eps,
             stream,
         )?;
+        self.round_matrix_input(&mut s.normalized, h)?;
         bf16_linear_logits_f32_into_on_stream(
             &s.normalized,
             &self.embedding,
