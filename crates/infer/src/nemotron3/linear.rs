@@ -1,7 +1,7 @@
 //! Nemotron 3 dense-linear storage choices and device operations.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, F32DenseGemm, Result,
+    CudaStream, DeviceBuffer, Error, F32DenseGemm, GgmlWeights, Result,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
@@ -51,12 +51,23 @@ pub struct Nemotron3StorageConfig {
 }
 
 pub(super) enum Nemotron3Linear {
+    Ggml(GgmlWeights),
     Bf16(Nemotron3Bf16Linear),
     Fp8(Nemotron3Fp8Linear),
     Nvfp4(Nemotron3Nvfp4Linear),
 }
 
 impl Nemotron3Linear {
+    pub(super) fn lilicorr_head(&self) -> Option<super::lilicorr::LiLiCorrTargetHead<'_>> {
+        match self {
+            Self::Bf16(linear) => Some(super::lilicorr::LiLiCorrTargetHead::Bf16(&linear.weight)),
+            Self::Ggml(linear) if linear.format() == eider_format::GgmlBlockFormat::Q8 => {
+                Some(super::lilicorr::LiLiCorrTargetHead::Q8(linear))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn load(
         checkpoint: &ModelOptCheckpoint,
         prefix: &str,
@@ -68,6 +79,26 @@ impl Nemotron3Linear {
         let shard = checkpoint.open_shard_for_tensor(&weight_name)?;
         let dtype = shard.require_tensor(&weight_name)?.dtype.as_str();
         match dtype {
+            "U8" if eider_format::GgmlBlockFormat::from_shape(
+                &shard.require_tensor(&weight_name)?.shape,
+            )
+            .is_some() =>
+            {
+                let weight = checkpoint.load_ggml_linear(prefix)?;
+                if weight.out_features != rows || weight.in_features != cols {
+                    return Err(Error::Format {
+                        label: "Nemotron GGML linear",
+                        detail: format!("unexpected dimensions for {prefix}"),
+                    });
+                }
+                Ok(Self::Ggml(GgmlWeights::new(
+                    weight.format,
+                    1,
+                    rows,
+                    cols,
+                    &weight.packed,
+                )?))
+            }
             "BF16" => match storage.bf16 {
                 Nemotron3Bf16Storage::Bf16 => Ok(Self::Bf16(Nemotron3Bf16Linear::load(
                     checkpoint, prefix, rows, cols,
@@ -104,6 +135,7 @@ impl Nemotron3Linear {
         stream: &CudaStream,
     ) -> Result<()> {
         match self {
+            Self::Ggml(linear) => linear.run_rows(input, output.output(), 1, None, stream),
             Self::Bf16(linear) => linear.run(input, output, stream),
             Self::Fp8(linear) => linear.run(input, output, stream),
             Self::Nvfp4(linear) => linear.run(input, output, stream),
@@ -118,7 +150,38 @@ impl Nemotron3Linear {
         gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
-        if batch_rows >= 2
+        if (2..=8).contains(&batch_rows)
+            && let Self::Ggml(linear) = self
+            && linear.format() == eider_format::GgmlBlockFormat::Iq2Xxs
+        {
+            return linear.run_rows(
+                input,
+                output.output(),
+                batch_rows,
+                Some(gemm.ggml_workspace(batch_rows, linear.in_features())?),
+                stream,
+            );
+        }
+        if (2..=8).contains(&batch_rows)
+            && let Self::Fp8(linear) = self
+            && linear.channel_weight_scale.is_none()
+            && linear.rows.is_multiple_of(16)
+            && linear.cols.is_multiple_of(16)
+        {
+            return gemm.run_fp8_f32_on_stream(
+                input,
+                &linear.weight,
+                output.output(),
+                batch_rows,
+                linear.rows,
+                linear.cols,
+                linear.weight_scale,
+                stream,
+            );
+        }
+        // Verification blocks must retain the serial path's F32 activations.
+        // Calibrated FP8 activation quantization is reserved for larger prefill batches.
+        if batch_rows > 8
             && let Self::Fp8(linear) = self
             && let Some(input_scale) = linear.input_scale
             && linear.channel_weight_scale.is_none()
@@ -137,8 +200,15 @@ impl Nemotron3Linear {
                 stream,
             );
         }
-        if batch_rows >= 8 {
+        if batch_rows > 8 {
             return match self {
+                Self::Ggml(linear) => linear.run_rows(
+                    input,
+                    output.output(),
+                    batch_rows,
+                    Some(gemm.ggml_workspace(batch_rows, linear.in_features())?),
+                    stream,
+                ),
                 Self::Bf16(linear) => gemm.run_on_stream(
                     input,
                     &linear.weight,
@@ -186,6 +256,7 @@ impl Nemotron3Linear {
             };
         }
         match self {
+            Self::Ggml(linear) => linear.run_rows(input, output.output(), batch_rows, None, stream),
             Self::Bf16(linear) => bf16_linear_logits_f32_batch_into_on_stream(
                 input,
                 &linear.weight,
@@ -254,6 +325,7 @@ impl Nemotron3Linear {
             Ok(selected)
         }
         Ok(match self {
+            Self::Ggml(w) => Self::Ggml(w.select_rows(ids, stream)?),
             Self::Bf16(w) => Self::Bf16(Nemotron3Bf16Linear {
                 weight: gather(&w.weight, w.cols, ids, stream)?,
                 rows: ids.len(),
@@ -292,20 +364,22 @@ impl Nemotron3Linear {
         let mut features = 1;
         let mut elements = 0;
         for weight in weights {
-            if rows < 8 {
+            if rows <= 8 {
                 let Self::Fp8(w) = weight else {
                     continue;
                 };
-                if w.input_scale.is_none()
-                    || w.channel_weight_scale.is_some()
+                if w.channel_weight_scale.is_some()
                     || !w.rows.is_multiple_of(16)
                     || !w.cols.is_multiple_of(16)
                 {
                     continue;
                 }
+                features = features.max(w.rows).max(w.cols);
+                continue;
             }
 
             let (out, cols, quantized) = match weight {
+                Self::Ggml(_) => continue,
                 Self::Bf16(w) => (w.rows, w.cols, false),
                 Self::Fp8(w) => (
                     w.rows,
@@ -327,6 +401,7 @@ impl Nemotron3Linear {
 
     pub(super) fn device_bytes(&self) -> usize {
         match self {
+            Self::Ggml(linear) => linear.device_bytes(),
             Self::Bf16(linear) => linear.device_bytes(),
             Self::Fp8(linear) => linear.device_bytes(),
             Self::Nvfp4(linear) => linear.device_bytes(),

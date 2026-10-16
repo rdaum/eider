@@ -138,6 +138,11 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Attention<2, 1024, true>>("Bolt draft attention with sinks", |group| {
+                group
+                    .measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("split context", attention_sample::<true, 2, 1024, true>);
+            });
             macro_rules! case {
                 ($o:literal,$i:literal,$r:literal,$name:literal) => {
                     runner.group::<Dense<$o, $i, $r>>($name, |group| {
@@ -152,14 +157,14 @@ fn main() {
             case!(131072, 4096, 8, "candidate LM head");
             runner.group::<Attention>("draft sliding attention", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("serial keys", attention_sample::<false>);
-                group.bench_sample("split context", attention_sample::<true>);
+                group.bench_sample("serial keys", attention_sample::<false, 8, 8192, false>);
+                group.bench_sample("split context", attention_sample::<true, 8, 8192, false>);
             });
         },
     );
 }
 
-struct Attention {
+struct Attention<const KV: usize = 8, const WINDOW: usize = 8192, const SINK: bool = false> {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -170,8 +175,9 @@ struct Attention {
     bk: DeviceBuffer<f32>,
     bv: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
+    sinks: Option<DeviceBuffer<f32>>,
 }
-impl Attention {
+impl<const KV: usize, const WINDOW: usize, const SINK: bool> Attention<KV, WINDOW, SINK> {
     fn enqueue(&mut self, split: bool, end: usize, rows: usize) {
         if split {
             self.workspace
@@ -181,11 +187,12 @@ impl Attention {
                     &self.cv,
                     &self.bk,
                     &self.bv,
+                    self.sinks.as_ref(),
                     &mut self.output,
                     end,
-                    end.min(8192),
+                    end.min(WINDOW),
                     rows,
-                    8,
+                    KV,
                     &self.stream,
                 )
                 .unwrap();
@@ -198,19 +205,80 @@ impl Attention {
                 &self.bv,
                 self.output.output(),
                 end,
-                end.min(8192),
+                end.min(WINDOW),
                 rows,
                 32,
-                8,
+                KV,
                 128,
-                8192,
+                WINDOW,
                 &self.stream,
             )
             .unwrap();
         }
     }
+
+    fn reference_with_sinks(&self, end: usize, rows: usize) -> Vec<f32> {
+        let q = self.q.copy_to_host(&self.stream).unwrap();
+        let ck = self.ck.copy_to_host(&self.stream).unwrap();
+        let cv = self.cv.copy_to_host(&self.stream).unwrap();
+        let bk = self.bk.copy_to_host(&self.stream).unwrap();
+        let bv = self.bv.copy_to_host(&self.stream).unwrap();
+        let sinks = self
+            .sinks
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&self.stream)
+            .unwrap();
+        let mut out = vec![0.; rows * 32 * 128];
+        for row in 0..rows {
+            let first = end
+                .saturating_sub(WINDOW)
+                .max((end + row + 1).saturating_sub(WINDOW));
+            let context = end - first;
+            for head in 0..32 {
+                let kv = head / (32 / KV);
+                let mut scores = Vec::with_capacity(context + rows);
+                for i in 0..context + rows {
+                    let (key, pos) = if i < context {
+                        (&ck, (first + i) % WINDOW)
+                    } else {
+                        (&bk, i - context)
+                    };
+                    let dot: f64 = (0..128)
+                        .map(|c| {
+                            q[(row * 32 + head) * 128 + c] as f64
+                                * key[(pos * KV + kv) * 128 + c] as f64
+                        })
+                        .sum();
+                    scores.push(dot / 128f64.sqrt());
+                }
+                let max = scores.iter().copied().fold(sinks[head] as f64, f64::max);
+                let mut total = (sinks[head] as f64 - max).exp();
+                let mut acc = [0f64; 128];
+                for (i, score) in scores.into_iter().enumerate() {
+                    let (value, pos) = if i < context {
+                        (&cv, (first + i) % WINDOW)
+                    } else {
+                        (&bv, i - context)
+                    };
+                    let p = (score - max).exp();
+                    total += p;
+                    for c in 0..128 {
+                        acc[c] += p * value[(pos * KV + kv) * 128 + c] as f64;
+                    }
+                }
+                for c in 0..128 {
+                    out[(row * 32 + head) * 128 + c] = (acc[c] / total) as f32;
+                }
+            }
+        }
+        out
+    }
 }
-impl BenchContext for Attention {
+
+impl<const KV: usize, const WINDOW: usize, const SINK: bool> BenchContext
+    for Attention<KV, WINDOW, SINK>
+{
     fn prepare(_: usize) -> Self {
         let data = |n, seed| {
             DeviceBuffer::from_host(
@@ -224,21 +292,38 @@ impl BenchContext for Attention {
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
             stop: CudaEvent::new().unwrap(),
-            workspace: lilicorr::ContextAttentionWorkspace::new(8, 32, 8192).unwrap(),
+            workspace: lilicorr::ContextAttentionWorkspace::new(8, 32, WINDOW).unwrap(),
             q: data(8 * 32 * 128, 31),
-            ck: data(8192 * 8 * 128, 17),
-            cv: data(8192 * 8 * 128, 7),
-            bk: data(8 * 8 * 128, 13),
-            bv: data(8 * 8 * 128, 19),
+            ck: data(WINDOW * KV * 128, 17),
+            cv: data(WINDOW * KV * 128, 7),
+            bk: data(8 * KV * 128, 13),
+            bv: data(8 * KV * 128, 19),
             output: DeviceBuffer::zeroed(8 * 32 * 128).unwrap(),
-        };
-        for (end, rows) in [(0, 2), (27, 8), (8191, 4), (8192, 8), (17017, 8)] {
-            s.enqueue(false, end, rows);
-            let expected = s
-                .output
-                .copy_prefix_to_host(rows * 32 * 128, &s.stream)
+            sinks: SINK.then(|| {
+                DeviceBuffer::from_host(
+                    &(0..32)
+                        .map(|h| [-20., 0., 8., 80.][h % 4])
+                        .collect::<Vec<_>>(),
+                )
                 .unwrap()
-                .into_vec();
+            }),
+        };
+        for (end, rows) in [
+            (0, 2),
+            (27, 8),
+            (WINDOW - 1, 4),
+            (WINDOW, 8),
+            (WINDOW * 2 + 17, 8),
+        ] {
+            s.enqueue(false, end, rows);
+            let expected = if SINK {
+                s.reference_with_sinks(end, rows)
+            } else {
+                s.output
+                    .copy_prefix_to_host(rows * 32 * 128, &s.stream)
+                    .unwrap()
+                    .into_vec()
+            };
             s.enqueue(true, end, rows);
             let actual = s
                 .output
@@ -257,8 +342,8 @@ impl BenchContext for Attention {
         Some(1)
     }
 }
-fn attention_sample<const SPLIT: bool>(
-    s: &mut Attention,
+fn attention_sample<const SPLIT: bool, const KV: usize, const WINDOW: usize, const SINK: bool>(
+    s: &mut Attention<KV, WINDOW, SINK>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {

@@ -1083,19 +1083,20 @@ mod tests {
 
     #[test]
     fn local_nemotron_omni_selects_the_text_runtime() {
-        let fixture = CheckpointFixture::new(NEMOTRON_OMNI_ARCHITECTURE, true);
-        std::fs::write(
-            fixture.path().join("config.json"),
+        for config in [
             include_str!("../../infer/src/nemotron3/fixtures/omni-config.json"),
-        )
-        .unwrap();
-        let resolved = resolve_local_model(fixture.path()).expect("resolve Omni text model");
-        assert_eq!(resolved.identity, "local-nemotron_h");
-        assert_eq!(resolved.preparation, ArtifactKind::None);
-        assert_eq!(
-            eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
-            eider_inference::CheckpointArchitecture::Nemotron3,
-        );
+            include_str!("../../infer/src/nemotron3/fixtures/bolt-74b-config.json"),
+        ] {
+            let fixture = CheckpointFixture::new(NEMOTRON_OMNI_ARCHITECTURE, true);
+            std::fs::write(fixture.path().join("config.json"), config).unwrap();
+            let resolved = resolve_local_model(fixture.path()).expect("resolve Omni text model");
+            assert_eq!(resolved.identity, "local-nemotron_h");
+            assert_eq!(resolved.preparation, ArtifactKind::None);
+            assert_eq!(
+                eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
+                eider_inference::CheckpointArchitecture::Nemotron3,
+            );
+        }
     }
 
     #[test]

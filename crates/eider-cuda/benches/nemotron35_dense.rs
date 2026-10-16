@@ -42,6 +42,21 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> Dense<OUT, IN, ROWS> 
                 .unwrap();
             return;
         }
+        if mode == 5 {
+            self.gemm
+                .run_fp8_f32_on_stream(
+                    &self.input,
+                    &self.fp8,
+                    output,
+                    rows,
+                    OUT,
+                    IN,
+                    0.125,
+                    &self.stream,
+                )
+                .unwrap();
+            return;
+        }
         if mode == 3 {
             self.gemm
                 .run_calibrated_fp8_on_stream(
@@ -206,7 +221,10 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dens
             for rows in [1, 2, 3, 7, 17, ROWS].into_iter().filter(|&n| n <= ROWS) {
                 case.run(format, 0, rows);
                 let reference = case.output.copy_to_host(&case.stream).unwrap().to_vec();
-                for mode in [1, 2] {
+                for mode in [1, 2, 5]
+                    .into_iter()
+                    .filter(|&m| m != 5 || (format == 1 && rows <= 8))
+                {
                     case.run(format, mode, rows);
                     let actual = case.output.copy_to_host(&case.stream).unwrap();
                     for (i, (&a, &b)) in actual.iter().zip(&reference).take(rows * OUT).enumerate()
@@ -264,6 +282,36 @@ impl<const OUT: usize, const IN: usize, const ROWS: usize> BenchContext for Dens
                 );
             }
         }
+        if ROWS <= 8 {
+            let original = case.input.copy_to_host(&case.stream).unwrap().into_vec();
+            let scaled: Vec<_> = original
+                .iter()
+                .enumerate()
+                .map(|(i, x)| x * [1.0, 0.0, 0.00390625, 16.0][i / IN % 4])
+                .collect();
+            case.input = DeviceBuffer::from_host(&scaled).unwrap();
+            case.run(1, 0, ROWS);
+            let expected = case.output.copy_to_host(&case.stream).unwrap().into_vec();
+            case.run(1, 5, ROWS);
+            let actual = case.output.copy_to_host(&case.stream).unwrap();
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 3e-4 + b.abs() * 3e-5,
+                    "FP8 components with row scaling: {a} vs {b}"
+                );
+            }
+            case.gemm.set_row_segments(&vec![1; ROWS]).unwrap();
+            case.run(1, 5, ROWS);
+            let actual = case.output.copy_to_host(&case.stream).unwrap();
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 3e-4 + b.abs() * 3e-5,
+                    "FP8 components with row segments: {a} vs {b}"
+                );
+            }
+            case.gemm.set_row_segments(&[]).unwrap();
+            case.input = DeviceBuffer::from_host(&original).unwrap();
+        }
         case
     }
     fn chunk_size() -> Option<usize> {
@@ -308,11 +356,45 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            macro_rules! nvfp4_mamba {
+                ($out:literal, $input:literal, $rows:literal, $name:literal) => {
+                    runner.group::<Dense<$out, $input, $rows>>($name, |g| {
+                        let g = g.measurement_domain(MeasurementDomain::Gpu);
+                        g.bench_sample("packed NVFP4", sample::<$out, $input, 3, 0, $rows>);
+                        g.bench_sample("NVFP4 tensor", sample::<$out, $input, 3, 1, $rows>);
+                        g.bench_sample("prepared NVFP4", sample::<$out, $input, 3, 4, $rows>);
+                    });
+                };
+            }
+            nvfp4_mamba!(18560, 4096, 4, "Bolt NVFP4 Mamba input 4 rows");
+            nvfp4_mamba!(4096, 8192, 4, "Bolt NVFP4 Mamba output 4 rows");
+            nvfp4_mamba!(18560, 4096, 512, "Bolt NVFP4 Mamba input 512 rows");
+            nvfp4_mamba!(4096, 8192, 512, "Bolt NVFP4 Mamba output 512 rows");
             runner.group::<Dense<18560, 4096, 4>>("Verification Mamba input 4 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("per-row FP8 weights", sample::<18560, 4096, 1, 0, 4>);
                 g.bench_sample("calibrated FP8", sample::<18560, 4096, 1, 3, 4>);
+                g.bench_sample(
+                    "FP8 weights F32 activations",
+                    sample::<18560, 4096, 1, 1, 4>,
+                );
+                g.bench_sample("FP8 residual components", sample::<18560, 4096, 1, 5, 4>);
             });
+            macro_rules! fp8_verification {
+                ($out:literal, $input:literal, $rows:literal, $name:literal) => {
+                    runner.group::<Dense<$out, $input, $rows>>($name, |g| {
+                        let g = g.measurement_domain(MeasurementDomain::Gpu);
+                        g.bench_sample("per-row FP8 weights", sample::<$out, $input, 1, 0, $rows>);
+                        g.bench_sample(
+                            "FP8 residual components",
+                            sample::<$out, $input, 1, 5, $rows>,
+                        );
+                    });
+                };
+            }
+            fp8_verification!(4096, 8192, 4, "Verification Mamba output 4 rows");
+            fp8_verification!(18560, 4096, 8, "Verification Mamba input 8 rows");
+            fp8_verification!(4096, 8192, 8, "Verification Mamba output 8 rows");
             runner.group::<Dense<5376, 4096, 4>>("Verification shared up 4 rows", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("reused NVFP4 weights", sample::<5376, 4096, 3, 0, 4>);

@@ -7,6 +7,7 @@
 
 mod checkpoint;
 mod error;
+mod ggml_blocks;
 mod gguf;
 mod gguf_quant;
 mod modelopt;
@@ -15,6 +16,7 @@ mod safetensors;
 
 pub use checkpoint::SafeTensorCheckpoint;
 pub use error::{Error, Result};
+pub use ggml_blocks::{GgmlBlockFormat, IQ2_XXS_GRID, ModelOptGgmlLinear};
 pub use gguf::{GgufIndex, GgufTensor, GgufValue};
 pub use gguf_quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, dequantize_to_bf16, quantized_byte_len};
 pub use modelopt::{

@@ -17,6 +17,13 @@ use std::path::Path;
 
 const CONTEXT_ROWS: usize = 128;
 
+/// A borrowed target output head for companions without their own head.
+#[derive(Clone, Copy)]
+pub enum LiLiCorrTargetHead<'a> {
+    Bf16(&'a DeviceBuffer<u16>),
+    Q8(&'a eider_cuda::GgmlWeights),
+}
+
 struct Conv {
     base: DeviceBuffer<f32>,
     projection: Linear,
@@ -29,6 +36,7 @@ struct Layer {
     value: Linear,
     q_norm: DeviceBuffer<f32>,
     k_norm: DeviceBuffer<f32>,
+    attention_sinks: Option<DeviceBuffer<f32>>,
     output: Linear,
     post_attention_norm: DeviceBuffer<f32>,
     mlp_conv: Conv,
@@ -44,7 +52,7 @@ pub struct LiLiCorrDraft {
     hidden_norm: DeviceBuffer<f32>,
     layers: Vec<Layer>,
     norm: DeviceBuffer<f32>,
-    lm_head: Linear,
+    lm_head: Option<Linear>,
     head: Head,
 }
 
@@ -161,7 +169,7 @@ impl LiLiCorrDraft {
         self.fc.device_bytes()
             + self.hidden_norm.device_bytes()
             + self.norm.device_bytes()
-            + self.lm_head.device_bytes()
+            + self.lm_head.as_ref().map_or(0, Linear::device_bytes)
             + self.head.device_bytes()
             + self
                 .layers
@@ -178,6 +186,9 @@ impl LiLiCorrDraft {
                     .iter()
                     .map(|b| b.device_bytes())
                     .sum::<usize>()
+                        + l.attention_sinks
+                            .as_ref()
+                            .map_or(0, DeviceBuffer::device_bytes)
                         + [
                             &l.attention_conv.projection,
                             &l.mlp_conv.projection,
@@ -225,6 +236,17 @@ impl LiLiCorrDraft {
                     &format!("{p}.self_attn.k_norm.weight"),
                     &[c.head_dim],
                 )?,
+                attention_sinks: c
+                    .dflash_config
+                    .attention_sink_bias
+                    .then(|| {
+                        load_f32(
+                            &checkpoint,
+                            &format!("{p}.self_attn.attention_sink_bias"),
+                            &[c.num_attention_heads],
+                        )
+                    })
+                    .transpose()?,
                 output: Linear::load(&checkpoint, &format!("{p}.self_attn.o_proj"), h, q, false)?,
                 post_attention_norm: load_f32(
                     &checkpoint,
@@ -259,7 +281,10 @@ impl LiLiCorrDraft {
             fc: Linear::load(&checkpoint, "fc", h, h * c.target_layers().len(), false)?,
             hidden_norm: load_f32(&checkpoint, "hidden_norm.weight", &[h])?,
             norm: load_f32(&checkpoint, "norm.weight", &[h])?,
-            lm_head: Linear::load(&checkpoint, "lm_head", c.vocab_size, h, false)?,
+            lm_head: c
+                .has_own_lm_head
+                .then(|| Linear::load(&checkpoint, "lm_head", c.vocab_size, h, false))
+                .transpose()?,
             head: Head::load(&checkpoint, c)?,
             layers,
             config,
@@ -360,7 +385,9 @@ impl LiLiCorrDraft {
             return Err(invalid("invalid committed feature range"));
         }
         let kv = c.num_key_value_heads * c.head_dim;
-        let mut processed = 0;
+        // Context projections are independent per row. Earlier rows in this
+        // append would be overwritten before the next proposal reads the ring.
+        let mut processed = rows.saturating_sub(c.sliding_window);
         while processed < rows {
             let chunk = (rows - processed).min(CONTEXT_ROWS);
             let execute = if chunk <= c.block_size {
@@ -451,9 +478,11 @@ impl LiLiCorrDraft {
     }
 
     /// Drafts one block without modifying the committed context or target state.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose(
         &self,
         embeddings: &DeviceBuffer<u16>,
+        target_lm_head: Option<LiLiCorrTargetHead<'_>>,
         state: &LiLiCorrSequence,
         anchor: u32,
         drafts: usize,
@@ -504,12 +533,13 @@ impl LiLiCorrDraft {
         if let Some(graph) = ws.head_graphs.get(&drafts) {
             graph.launch(stream)?;
         } else if ws.warmed_shapes.contains(&rows) {
-            let graph =
-                stream.capture(|stream| self.proposal_head(embeddings, drafts, ws, stream))?;
+            let graph = stream.capture(|stream| {
+                self.proposal_head(embeddings, target_lm_head, drafts, ws, stream)
+            })?;
             graph.launch(stream)?;
             ws.head_graphs.insert(drafts, graph);
         } else {
-            self.proposal_head(embeddings, drafts, ws, stream)?;
+            self.proposal_head(embeddings, target_lm_head, drafts, ws, stream)?;
         }
         ws.warmed_shapes.insert(rows);
         Ok(())
@@ -518,6 +548,7 @@ impl LiLiCorrDraft {
     fn proposal_head(
         &self,
         embeddings: &DeviceBuffer<u16>,
+        target_lm_head: Option<LiLiCorrTargetHead<'_>>,
         drafts: usize,
         ws: &mut LiLiCorrWorkspace,
         stream: &CudaStream,
@@ -541,13 +572,35 @@ impl LiLiCorrDraft {
             drafts * h,
             stream,
         )?;
-        self.lm_head.run(
-            &ws.sample_hidden,
-            &mut ws.logits,
-            drafts,
-            &mut ws.linear,
-            stream,
-        )?;
+        if let Some(head) = &self.lm_head {
+            head.run(
+                &ws.sample_hidden,
+                &mut ws.logits,
+                drafts,
+                &mut ws.linear,
+                stream,
+            )?;
+        } else {
+            let head = target_lm_head.ok_or_else(|| Error::Format {
+                label: "LiLiCorr shared LM head",
+                detail: "Bolt requires the target BF16 or Q8_0 LM head".into(),
+            })?;
+            match head {
+                LiLiCorrTargetHead::Bf16(head) => ws.linear.run_bf16(
+                    head,
+                    &ws.sample_hidden,
+                    &mut ws.logits,
+                    drafts,
+                    c.vocab_size,
+                    h,
+                    stream,
+                )?,
+                LiLiCorrTargetHead::Q8(head) => {
+                    head.run_rows(&ws.sample_hidden, ws.logits.output(), drafts, None, stream)?
+                }
+            }
+            lilicorr::bias_activation(&mut ws.logits, None, drafts, c.vocab_size, false, stream)?;
+        }
         lilicorr::candidates(
             &ws.logits,
             &mut ws.candidates,
@@ -592,7 +645,7 @@ impl LiLiCorrDraft {
         } else {
             self.prepare_layer(layer, rows, ws, stream)?;
         }
-        self.attend_layer(cache, position, rows, ws, stream)?;
+        self.attend_layer(layer, cache, position, rows, ws, stream)?;
         let key = (rows, index, true);
         if let Some(graph) = ws.layer_graphs.get(&key) {
             graph.launch(stream)?;
@@ -657,6 +710,7 @@ impl LiLiCorrDraft {
 
     fn attend_layer(
         &self,
+        layer: &Layer,
         cache: &LayerState,
         position: usize,
         rows: usize,
@@ -700,6 +754,7 @@ impl LiLiCorrDraft {
             &cache.value,
             &ws.key,
             &ws.value,
+            layer.attention_sinks.as_ref(),
             &mut ws.attention,
             position,
             position.min(c.sliding_window),
@@ -957,6 +1012,57 @@ mod tests {
     use super::*;
     use eider_format::SafeTensorShard;
 
+    #[test]
+    #[ignore = "requires LILICORR_DIR and NEMOTRON_MODEL_DIR; loads the companion on the GPU"]
+    fn windowed_append_matches_incremental_context() {
+        let target =
+            Nemotron3Manifest::from_model_dir(std::env::var("NEMOTRON_MODEL_DIR").unwrap())
+                .unwrap();
+        let draft = LiLiCorrDraft::load(std::env::var("LILICORR_DIR").unwrap(), &target).unwrap();
+        let rows = draft.config.sliding_window + CONTEXT_ROWS;
+        let width = draft.config.hidden_size * draft.config.target_layers().len();
+        let captured = DeviceBuffer::from_host(
+            &(0..rows * width)
+                .map(|i| ((i * 31 % 1009) as f32 - 504.0) / 137.137)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let mut ws = draft.new_workspace().unwrap();
+        let mut whole = draft.new_sequence().unwrap();
+        let mut incremental = draft.new_sequence().unwrap();
+        draft
+            .append_context(&mut whole, &captured, 0, rows, &mut ws, &stream)
+            .unwrap();
+        for row in (0..rows).step_by(CONTEXT_ROWS) {
+            draft
+                .append_context(
+                    &mut incremental,
+                    &captured,
+                    row,
+                    CONTEXT_ROWS,
+                    &mut ws,
+                    &stream,
+                )
+                .unwrap();
+        }
+        assert_eq!(whole.position, incremental.position);
+        assert_eq!(
+            whole.anchor.copy_to_host(&stream).unwrap(),
+            incremental.anchor.copy_to_host(&stream).unwrap()
+        );
+        for (actual, expected) in whole.layers.iter().zip(&incremental.layers) {
+            assert_eq!(
+                actual.key.copy_to_host(&stream).unwrap(),
+                expected.key.copy_to_host(&stream).unwrap()
+            );
+            assert_eq!(
+                actual.value.copy_to_host(&stream).unwrap(),
+                expected.value.copy_to_host(&stream).unwrap()
+            );
+        }
+    }
+
     fn compare(label: &str, actual: &[f32], expected: &[f32], tolerance: f64) {
         assert_eq!(actual.len(), expected.len());
         let error = actual
@@ -1129,6 +1235,7 @@ mod tests {
         draft
             .propose(
                 &embedding,
+                None,
                 &state,
                 anchor_token,
                 slots,
@@ -1188,6 +1295,7 @@ mod tests {
         draft
             .propose(
                 &embedding,
+                None,
                 &restored,
                 anchor_token,
                 slots,

@@ -9,11 +9,179 @@ adds `NemotronH_Omni_Reasoning_V3` for Super 3.5 VL and Bolt 74B-A9B.
 The inspected head is `e64207bab6c2989a4ae5aa8b9e0cbe700e135ee3`.
 The GitHub API reports that the PR merged on 2026-10-15.
 
-[NVIDIA announced](https://blogs.nvidia.com/blog/local-ai-rtx-spark-laptops-software-updates/)
-Bolt 74B-A9B for October 15. The advertised 24 GB checkpoint uses 2-bit
-quantization and quantization-aware training. That announcement does not establish
-an NVFP4 checkpoint format. Super 3.5 VL now has an official ModelOpt NVFP4
-checkpoint, described below.
+[NVIDIA released Bolt 74B-A9B](https://research.nvidia.com/labs/nemotron/Nemotron-3.5-Bolt-24GB/)
+on October 15. Its official 24 GB checkpoint uses IQ2_XXS experts, NVFP4 Mamba
+projections, and Q8_0 dense weights. Native packed execution supports text generation
+and the compact decision head. The community NVFP4 conversion also remains supported.
+
+## Bolt
+
+The launcher defaults to the official 24 GB checkpoint and its LiLiCorr companion.
+The earlier measurements used
+[cloudnathan5's conversion](https://huggingface.co/cloudnathan5/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4)
+at revision `fcf26d4c868500a8e1bacd28b7ec2d1dcb7b2646`.
+Its index reports 47,772,692,520 bytes across 63 shards, including unused vision weights.
+This is a community conversion from NVIDIA's BF16 release.
+
+The text model has 88 layers and a 262,144-token context limit.
+Each MoE layer selects nine experts. Expert counts range from 240 to 496,
+and intermediate widths range from 1,536 to 2,560.
+The parser accepts the released expert-count fields and retains each layer's dimensions.
+Conflicting global counts and invalid per-layer bounds fail before device allocation.
+
+Expert weights use W4A16 NVFP4 without calibrated activation scales.
+Mamba projections use calibrated FP8. Attention, latent projections, embeddings,
+and the output head remain BF16.
+Sampled shard headers confirm these formats.
+The loader preserves these precisions and uses the existing text and decision runtime.
+This checkpoint has no MTP block. Generation can use the official Bolt LiLiCorr companion.
+The companion uses six target features, two KV heads, a 1,024-token window,
+and attention sinks. It shares the target output head: Q8_0 for the official
+checkpoint, BF16 for the conversion.
+Super uses a different companion with five target features and its own output head.
+
+Download the pinned checkpoint into the Hugging Face cache:
+
+```sh
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB \
+  --revision c6cc2e8ffa353403213d6b9b18aaf8eb684d705a
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr \
+  --revision 4c6a5613b6d887194a3a5493e3a18a5b3930bb86
+```
+
+Start the server, then use Pi or the decision script:
+
+```sh
+scripts/run-eider-nemotron35-bolt.sh
+# In another terminal:
+scripts/run-pi-eider-nemotron35-bolt.sh
+scripts/questions.sh 8 eider-nemotron3.5-bolt
+```
+
+Set `NEMOTRON35_BOLT_MODEL` to use another local snapshot.
+Explicit server arguments override launcher defaults.
+The launcher enables three LiLiCorr drafts by default. Set `LILICORR_DIR` for
+another companion path, or `EIDER_LILICORR=0` for generation without the companion.
+The decision path shares prompt prefill and recurrent state, then reads selected
+label logits through the compact output head. Image inputs are not supported.
+
+On 2026-10-16, the community NVFP4 checkpoint passed an isolated HTTP smoke check.
+All three decision types returned the expected factual answers.
+Chat returned `4` for a non-thinking `2+2` request.
+Repeated requests were deterministic. Grouped and isolated selected logits agreed
+within `1e-3`. Concurrent chat and decisions completed with one admission slot.
+The check also covered 64 questions, 64 labels, and rejection of 65 questions.
+Probabilities remain uncalibrated.
+
+The same parcel/book workload as Super used 384 logical input tokens and a
+239-token shared prefix. With a 1,024-token prefill capacity and no prefix retention:
+
+| Workload | HTTP latency |
+| --- | ---: |
+| Three questions together, median of three warm runs | 1,023 ms |
+| Three separate requests, combined | 2,224 ms |
+| 64 repeated questions, one run | 9,019 ms |
+
+This run establishes basic serving and decision behaviour, not general model
+quality or parity with NVIDIA's 2-bit release.
+The focused CUDA fixture covers variable expert widths, W4A16 weights, absent MTP,
+recurrent-state forks, and decision logits against isolated full-head inference.
+The Nemotron tests passed: 27 checks, with three external-checkpoint tests skipped.
+Deployment tests, launcher checks, release build, formatting, and Clippy passed.
+Clippy reported existing warnings elsewhere in the inference crate.
+
+### Generation performance
+
+The 2026-10-16 community NVFP4 replay used greedy, non-thinking chat requests and
+256 output tokens on one GB10. The prompts contained 1,795 and 7,051 tokens.
+A third request reused 7,040 of its 7,061 prompt tokens. Prefill capacity was
+2,048, with one active sequence and a 1 GiB retained-prefix budget.
+The benchmark context limit was 32,768; the launcher still permits 262,144.
+
+The companion raised decode throughput from about 20 to 28 tokens/s in these
+requests. Three drafts performed better than one or seven. Acceptance averaged
+1.43–1.57 drafts per verification cycle with three proposals. This narrow replay
+does not establish performance across other prompts or parity with NVIDIA's
+2-bit target, which trained the companion.
+
+Wider W4A16 expert tiles reuse compressed weights across 32 rows. On the long
+request, they raised prefill throughput from 606 to 750 tokens/s and reduced
+complete HTTP latency from 21.9 to 19.7 seconds. Short-prompt latency changed
+little. Both tile sizes produced identical text for all three requests.
+
+Small FP8 verification projections use six scaled residual components rather
+than a single quantized activation. This retains low input bits while sharing
+weight reads across the verification batch. The real-checkpoint check matched
+64 serial target tokens, including shortened verification blocks and rollback.
+The drafter projects only the retained context window; its complete ring and
+anchor matched incremental appends exactly. CUDA checks cover Bolt's attention
+sinks against a CPU reference and retain the existing Super attention comparison.
+
+For the community conversion, major costs include the 40 Mamba layers and
+uncalibrated W4A16 expert execution. Fewer active experts alone do not remove
+those costs. This conversion remained close to Super in the replay.
+
+The [official 24GB checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB)
+uses different formats. Its revision `c6cc2e8ffa353403213d6b9b18aaf8eb684d705a`
+stores GGML-packed IQ2_XXS experts, NVFP4 Mamba projections, and Q8_0 dense
+projections and output head. The inspected embedding tensor is BF16.
+Native loaders and kernels retain the packed expert and dense weights, including
+selected output rows for decisions. LiLiCorr can share the Q8_0 target head.
+Focused checks compare packed projections against CPU decoding and exercise
+mixed-format prefill followed by decode. The official checkpoint also passed
+a 64-token comparison of speculative and serial decoding. The community conversion does not
+preserve the official checkpoint's memory footprint or arithmetic.
+
+The packed-kernel benchmark uses the 496-expert, 2,560-wide layer shape.
+On GB10, IQ2_XXS up/down projections took 0.29/0.28 ms for 36 verification
+routes and 14.0/15.2 ms for 18,432 prefill routes. Prefill timings include
+route sorting, tile preparation, and activation preparation. These are kernel
+measurements, not complete-request throughput. The prefill kernels keep weights
+packed and overlap input copies with tensor-core execution.
+
+The verification benchmark also covers four rows selecting the same nine
+experts. That case took about 0.28 ms per IQ2_XXS projection.
+
+The official target's NVFP4 Mamba projections use packed matvec for short batches
+and prepared BF16 weights for prefill. At four rows, input/output projections
+took about 0.25/0.18 ms. At 512 rows, the prepared path took 3.6/1.5 ms.
+Preparation preserves the NVFP4 weight values but adds about 8.2 GiB of resident
+BF16 copies across the 40 Mamba layers. That memory cost is additional to the
+checkpoint's packed weights.
+
+### Official 24 GB generation replay
+
+The same three-request replay measured the native IQ2/Q8 target and its released companion.
+The table uses the warm 7,051-token prompt and its 256-token response.
+The cached request has 7,061 prompt tokens, with 7,040 reused.
+
+| Runtime | Prefill tokens/s | Decode tokens/s | Complete request | Cached request |
+| --- | ---: | ---: | ---: | ---: |
+| Super NVFP4 | 832 | 26.3 | 18.9 s | 9.40 s |
+| Bolt official, initial kernels | 516 | 30.1 | 22.6 s | 8.78 s |
+| Bolt official, revised kernels | 560 | 37.0 | 19.9 s | 6.85 s |
+
+Revised Bolt decoded at 34.1 tokens/s on the short prompt and 38.9 with prefix reuse.
+Its retained text weights occupied about 29.0 GiB, including the prepared Mamba copies.
+This excludes drafter weights and runtime workspaces.
+
+Shared IQ2 verification now splits the reduction across quantization blocks.
+At four rows, the 5,376-by-4,096 shared projections fell from about 0.20 ms to 0.065–0.070 ms.
+Shared prefill uses 32-row tiles; those projections fell from about 8.7 ms to 6.6 ms.
+Vector activation reads reduced routed verification projections from 0.28 ms to 0.18–0.21 ms.
+Unaligned routed inputs retain scalar reads. Neither change expands the resident expert table.
+
+The long response remained identical across the initial and revised kernels.
+Short and cached responses changed after the reduction change; vector reads preserved all three revised responses.
+The revised runtime matched 64 serial target tokens in the full-model speculative check.
+CUDA checks compare against CPU decoding at the existing tolerance, including unaligned inputs.
+
+Decode is now faster than Super on these requests. Uncached request latency still trails Super because IQ2 prefill remains slower.
+Both models retain 40 Mamba layers and the same 5,376-wide shared experts.
+Their common dense work limits the benefit from reducing the routed parameter count.
+
+The Bolt launcher selects this official snapshot by default. Set
+`NEMOTRON35_BOLT_MODEL` or `--model-dir` to use the community conversion.
 
 ## Released checkpoint
 
@@ -222,8 +390,7 @@ existing `chunks_exact` suggestions. The full workspace test suite was not run.
   on representative workloads.
 - Extend template coverage to reasoning, tool results, and streaming through
   both HTTP APIs.
-- Assess Bolt separately if its weights become available. Native 2-bit support
-  requires its own format and kernel assessment.
+- Assess native Bolt 2-bit execution separately from the NVFP4 conversion.
 
 The released LiLiCorr companion is available through `EIDER_LILICORR=1` in the
 launcher. See [LiLiCorr configuration, validation, and measurements](nemotron-lilicorr.md).

@@ -5,6 +5,62 @@
 #include <cstdint>
 #include <type_traits>
 
+// Six scaled E4M3 residual components preserve low input bits while sharing
+// one FP8 weight read across the component columns of a small batch.
+__global__ void split_f32_fp8_parts(const float* input, uint8_t* parts, float* powers,
+                                   uint32_t rows, uint32_t width) {
+    __shared__ float maxima[256];
+    const uint32_t row = blockIdx.x, lane = threadIdx.x;
+    float maximum = 0.f;
+    for (uint32_t k=lane; k<width; k+=256)
+        maximum = fmaxf(maximum, fabsf(input[size_t(row)*width+k]));
+    maxima[lane] = maximum;
+    __syncthreads();
+    for (uint32_t step=128; step; step>>=1) {
+        if (lane<step) maxima[lane] = fmaxf(maxima[lane], maxima[lane+step]);
+        __syncthreads();
+    }
+    int exponent = 0;
+    frexpf(maxima[0], &exponent);
+    const float power = ldexpf(1.f, max(-106, min(120, exponent-8)));
+    if (!lane) powers[row] = power;
+    for (uint32_t k=lane; k<width; k+=256) {
+        float residual = input[size_t(row)*width+k], scale = power;
+        #pragma unroll
+        for (int part=0; part<6; ++part) {
+            const __nv_fp8_e4m3 value(residual / scale);
+            parts[(size_t(part)*rows+row)*width+k] = value.__x;
+            residual = fmaf(-float(value), scale, residual);
+            scale *= 0.0625f;
+        }
+    }
+}
+
+__global__ void sum_f32_fp8_parts(const float* parts, const float* powers, float* output,
+                                 uint32_t rows, uint32_t width, float weight_scale) {
+    const uint32_t i = blockIdx.x*blockDim.x+threadIdx.x, count=rows*width;
+    if (i>=count) return;
+    float sum=parts[5*size_t(count)+i];
+    #pragma unroll
+    for (int part=4; part>=0; --part) sum=fmaf(sum,0.0625f,parts[part*size_t(count)+i]);
+    output[i]=sum*(powers[i/width]*weight_scale);
+}
+
+extern "C" cudaError_t infer_split_f32_fp8_parts_on_stream(
+    const float* input, uint8_t* parts, float* powers, uint32_t rows, uint32_t width,
+    cudaStream_t stream) {
+    split_f32_fp8_parts<<<rows,256,0,stream>>>(input,parts,powers,rows,width);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sum_f32_fp8_parts_on_stream(
+    const float* parts, const float* powers, float* output, uint32_t rows,
+    uint32_t width, float weight_scale, cudaStream_t stream) {
+    sum_f32_fp8_parts<<<(rows*width+255)/256,256,0,stream>>>(
+        parts,powers,output,rows,width,weight_scale);
+    return cudaGetLastError();
+}
+
 __global__ void lfm2_split_bf16(const float* input, __nv_bfloat16* parts,
                                uint32_t count, uint32_t stride) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -390,7 +446,7 @@ __device__ __forceinline__ void lfm2_half_mma(
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-template <bool Prepared>
+template <bool Prepared, unsigned TileRows = 16>
 __device__ __forceinline__ void lfm2_stage_expert(
     uint8_t* destination_weight, uint32_t* destination_scale,
     std::conditional_t<Prepared, uint16_t, float>* destination_input,
@@ -408,16 +464,16 @@ __device__ __forceinline__ void lfm2_stage_expert(
         lfm2_async4(destination_scale + row, s, valid);
     }
     if constexpr (Prepared) {
-        for (unsigned i = threadIdx.x; i < 2 * 16 * 8; i += 128) {
-            const unsigned component = i / (16 * 8);
-            row = (i / 8) % 16;
+        for (unsigned i = threadIdx.x; i < 2 * TileRows * 8; i += 128) {
+            const unsigned component = i / (TileRows * 8);
+            row = (i / 8) % TileRows;
             const unsigned col = (i % 8) * 8;
             const uint16_t* x = source[row] ? source[row] : source[0];
-            lfm2_async16(destination_input + (component * 16 + row) * 72 + col,
+            lfm2_async16(destination_input + (component * TileRows + row) * 72 + col,
                 x + component * in_features + k + col, source[row] != nullptr);
         }
     } else {
-        for (unsigned i = threadIdx.x; i < 16 * 16; i += 128) {
+        for (unsigned i = threadIdx.x; i < TileRows * 16; i += 128) {
             row = i / 16;
             const unsigned col = (i % 16) * 4;
             const float* x = source[row] ? source[row] : source[0];
@@ -427,27 +483,29 @@ __device__ __forceinline__ void lfm2_stage_expert(
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
-template <bool Prepared>
+template <bool Prepared, unsigned Columns = 2>
 __global__ void lfm2_expert_gemm_pipeline(
     const uint32_t* sorted_routes, const uint32_t* offsets,
     const float* const* inputs, const uint16_t* prepared, const float* input_powers,
     const uint8_t* const* weights,
     const uint8_t* const* scales, const float* globals, float* const* outputs,
     unsigned experts, unsigned out_features, unsigned in_features) {
+    static_assert(!Prepared || Columns == 2);
+    constexpr unsigned TileRows = Columns * 8;
     __shared__ unsigned expert, begin, end;
     __shared__ __align__(16) uint8_t packed[2][64][48];
     __shared__ uint32_t scale_tile[2][64];
     __shared__ __align__(16) std::conditional_t<Prepared, uint16_t, float>
-        input_tile[2][Prepared ? 2 : 1][16][72];
-    __shared__ const std::conditional_t<Prepared, uint16_t, float>* source[16];
+        input_tile[2][Prepared ? 2 : 1][TileRows][72];
+    __shared__ const std::conditional_t<Prepared, uint16_t, float>* source[TileRows];
     if (threadIdx.x == 0) {
         unsigned tile = blockIdx.y;
         expert = experts;
         for (unsigned e = 0; e < experts; ++e) {
             const unsigned first = offsets[e], last = offsets[e + 1];
-            const unsigned tiles = (last - first + 15) / 16;
+            const unsigned tiles = (last - first + TileRows - 1) / TileRows;
             if (tile < tiles) {
-                expert = e; begin = first + tile * 16; end = min(begin + 16, last);
+                expert = e; begin = first + tile * TileRows; end = min(begin + TileRows, last);
                 break;
             }
             tile -= tiles;
@@ -455,7 +513,7 @@ __global__ void lfm2_expert_gemm_pipeline(
     }
     __syncthreads();
     if (expert == experts) return;
-    if (threadIdx.x < 16) {
+    if (threadIdx.x < TileRows) {
         if (begin + threadIdx.x >= end) source[threadIdx.x] = nullptr;
         else if constexpr (Prepared) source[threadIdx.x] = prepared
             + size_t(sorted_routes[begin + threadIdx.x]) * 2 * in_features;
@@ -467,14 +525,14 @@ __global__ void lfm2_expert_gemm_pipeline(
     const unsigned pair = (lane & 3) * 2, input_row = lane >> 2;
     const uint8_t* weight = weights[expert];
     const uint8_t* scale = scales[expert];
-    lfm2_stage_expert<Prepared>(&packed[0][0][0], &scale_tile[0][0], &input_tile[0][0][0][0],
+    lfm2_stage_expert<Prepared, TileRows>(&packed[0][0][0], &scale_tile[0][0], &input_tile[0][0][0][0],
         weight, scale, source, blockIdx.x * 64, out_features, in_features, 0);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
-    float hi[2][4][4] = {}, mid[2][4] = {}, low[2][4] = {};
+    float hi[Columns][4][4] = {}, mid[Columns][4] = {}, low[Columns][4] = {};
     // Copy the next compressed tile while tensor cores consume this stage.
     for (unsigned base = 0, stage = 0; base < in_features; base += 64, stage ^= 1) {
-        if (base + 64 < in_features) lfm2_stage_expert<Prepared>(
+        if (base + 64 < in_features) lfm2_stage_expert<Prepared, TileRows>(
             &packed[stage ^ 1][0][0], &scale_tile[stage ^ 1][0], &input_tile[stage ^ 1][0][0][0],
             weight, scale, source, blockIdx.x * 64, out_features, in_features, base + 64);
         #pragma unroll
@@ -503,13 +561,13 @@ __global__ void lfm2_expert_gemm_pipeline(
                         : "=r"(parts[component][0]), "=r"(parts[component][1]), "=r"(parts[component][2]), "=r"(parts[component][3]) : "r"(address));
                 }
                 #pragma unroll
-                for (unsigned n = 0; n < 2; ++n) {
+                for (unsigned n = 0; n < Columns; ++n) {
                     lfm2_half_mma(hi[n][p], a0, a1, a2, a3, parts[0][2 * n], parts[0][2 * n + 1]);
                     lfm2_half_mma(mid[n], a0, a1, a2, a3, parts[1][2 * n], parts[1][2 * n + 1]);
                 }
             } else {
                 #pragma unroll
-                for (unsigned n = 0; n < 2; ++n) {
+                for (unsigned n = 0; n < Columns; ++n) {
                     const float* x = &input_tile[stage][0][input_row + n * 8][p * 16 + pair];
                     const float2 v0 = *reinterpret_cast<const float2*>(x);
                     const float2 v1 = *reinterpret_cast<const float2*>(x + 8);
@@ -533,7 +591,7 @@ __global__ void lfm2_expert_gemm_pipeline(
     }
     const float global = globals[expert];
     #pragma unroll
-    for (unsigned n = 0; n < 2; ++n) {
+    for (unsigned n = 0; n < Columns; ++n) {
         #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
             const unsigned route = begin + n * 8 + (lane & 3) * 2 + (i & 1);
@@ -559,6 +617,12 @@ extern "C" cudaError_t infer_lfm2_expert_gemm_pipelined_on_stream(
         || in_features % 16 != 0) return cudaErrorInvalidValue;
     const dim3 grid((out_features + 63) / 64, (routes + 15) / 16 + experts - 1);
     if (in_features % 64 == 0) {
+        if (experts >= 240 && routes >= 4096 && out_features <= 3072 && in_features <= 3072) {
+            const dim3 wide_grid((out_features + 63) / 64, (routes + 31) / 32 + experts - 1);
+            lfm2_expert_gemm_pipeline<false, 4><<<wide_grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
+                nullptr, nullptr, weights, scales, globals, outputs, experts, out_features, in_features);
+            return cudaGetLastError();
+        }
         lfm2_expert_gemm_pipeline<false><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs, nullptr, nullptr,
             weights, scales, globals, outputs, experts, out_features, in_features);
     } else {

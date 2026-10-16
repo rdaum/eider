@@ -204,7 +204,12 @@ struct Nemotron3Config {
     chunk_size: usize,
     #[serde(default)]
     mamba_ssm_cache_dtype: Option<String>,
-    n_routed_experts: usize,
+    #[serde(default)]
+    n_routed_experts: Option<usize>,
+    #[serde(default)]
+    num_experts: Option<usize>,
+    #[serde(default)]
+    num_local_experts: Option<usize>,
     #[serde(default)]
     num_experts_per_tok: Option<usize>,
     #[serde(default)]
@@ -233,6 +238,8 @@ struct Nemotron3Config {
 #[derive(Debug, Deserialize)]
 struct Nemotron3BlockConfig {
     block_type: String,
+    #[serde(default)]
+    n_routed_experts: Option<usize>,
     #[serde(default)]
     moe_intermediate_size: Option<usize>,
     #[serde(default)]
@@ -323,17 +330,39 @@ impl Nemotron3Manifest {
             )?
         };
 
+        let mut routed_experts = None;
+        for count in [
+            config.n_routed_experts,
+            config.num_experts,
+            config.num_local_experts,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if routed_experts.is_some_and(|previous| previous != count) {
+                return Err(Error::Format {
+                    label: "Nemotron 3 expert count",
+                    detail: "conflicting n_routed_experts, num_experts, or num_local_experts"
+                        .into(),
+                });
+            }
+            routed_experts = Some(count);
+        }
+        let routed_experts = routed_experts.ok_or_else(|| Error::Format {
+            label: "Nemotron 3 expert count",
+            detail: "missing n_routed_experts, num_experts, or num_local_experts".into(),
+        })?;
         let moe_layers = parse_moe_layers(
             &layers,
             config.block_configs.as_deref(),
-            config.n_routed_experts,
+            routed_experts,
             config.moe_intermediate_size,
             config.num_experts_per_tok,
         )?;
         let mtp_moe_layers = parse_moe_layers(
             &mtp_layers,
             config.mtp_block_configs.as_deref(),
-            config.n_routed_experts,
+            routed_experts,
             config.moe_intermediate_size,
             config.num_experts_per_tok,
         )?;
@@ -380,7 +409,7 @@ impl Nemotron3Manifest {
             mamba_conv_kernel: config.conv_kernel,
             mamba_chunk_size: config.chunk_size,
             mamba_ssm_dtype,
-            routed_experts: config.n_routed_experts,
+            routed_experts,
             experts_per_token: first_moe.experts_per_token,
             moe_intermediate_size: first_moe.intermediate_size,
             moe_latent_size: config.moe_latent_size,
@@ -416,17 +445,14 @@ impl Nemotron3Manifest {
         if info.dtype != "BF16"
             || !valid_shape
             || experts < moe.experts_per_token
-            || experts > self.routed_experts
+            || experts > moe.routed_experts
             || !experts.is_multiple_of(self.expert_groups)
         {
             return Err(Error::Shape {
                 label: "Nemotron 3 per-layer router",
                 expected: format!(
                     "{tensor}: BF16 [experts, {}], {} <= experts <= {}, divisible by {} groups",
-                    self.hidden_size,
-                    moe.experts_per_token,
-                    self.routed_experts,
-                    self.expert_groups
+                    self.hidden_size, moe.experts_per_token, moe.routed_experts, self.expert_groups
                 ),
                 actual: format!("{} {:?}", info.dtype, info.shape),
             });
@@ -632,17 +658,19 @@ impl Nemotron3Manifest {
                 (Nemotron3LayerKind::Moe, Some(moe))
                     if moe.intermediate_size != 0
                         && moe.experts_per_token != 0
-                        && moe.experts_per_token <= self.routed_experts => {}
+                        && moe.experts_per_token <= moe.routed_experts
+                        && moe.routed_experts <= self.routed_experts
+                        && moe.routed_experts.is_multiple_of(self.expert_groups) => {}
                 (Nemotron3LayerKind::Moe, Some(moe)) => {
                     return Err(Error::Shape {
                         label: "Nemotron 3 routed experts",
                         expected: format!(
-                            "{scope} layer {layer}: non-zero top-k <= {}",
-                            self.routed_experts
+                            "{scope} layer {layer}: non-zero top-k <= {} experts <= {}, divisible by {} groups",
+                            moe.routed_experts, self.routed_experts, self.expert_groups
                         ),
                         actual: format!(
-                            "intermediate={} top-k={}",
-                            moe.intermediate_size, moe.experts_per_token
+                            "intermediate={} top-k={} experts={}",
+                            moe.intermediate_size, moe.experts_per_token, moe.routed_experts
                         ),
                     });
                 }
@@ -799,7 +827,9 @@ fn parse_moe_layers(
                     detail: format!("missing num_experts_per_tok for layer {layer}"),
                 })?;
             Ok(Some(Nemotron3MoeLayerConfig {
-                routed_experts,
+                routed_experts: block
+                    .and_then(|block| block.n_routed_experts)
+                    .unwrap_or(routed_experts),
                 intermediate_size: intermediate,
                 experts_per_token,
             }))

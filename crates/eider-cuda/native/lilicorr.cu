@@ -216,11 +216,16 @@ __global__ void context_attention_partial(
     if (lane==0) { dst[128]=mx; dst[129]=total; }
 }
 
-__global__ void context_attention_merge(const float* partial, float* out, uint32_t splits) {
+__global__ void context_attention_merge(const float* partial, const float* sinks, float* out,
+                                        uint32_t splits, uint32_t qheads) {
     const uint32_t lane=threadIdx.x, row=blockIdx.x;
     const float* src=partial+row*splits*130;
-    float mx=-INFINITY, total=0.f, acc[4]={};
+    // The sink is an extra logit with zero value. Include it once after merging
+    // partitions; adding it to each partition would multiply its probability.
+    const float sink = sinks ? sinks[row % qheads] : -INFINITY;
+    float mx=sink, total=0.f, acc[4]={};
     for (uint32_t s=0;s<splits;++s) mx=fmaxf(mx,src[s*130+128]);
+    if (sinks) total=expf(sink-mx);
     for (uint32_t s=0;s<splits;++s) {
         const float p=expf(src[s*130+128]-mx);
         total+=src[s*130+129]*p;
@@ -234,12 +239,12 @@ __global__ void context_attention_merge(const float* partial, float* out, uint32
 
 extern "C" cudaError_t infer_lilicorr_context_attention(
     const float* q, const float* ck, const float* cv, const float* bk, const float* bv,
-    float* partial, float* out, uint32_t end, uint32_t retained, uint32_t rows,
+    const float* sinks, float* partial, float* out, uint32_t end, uint32_t retained, uint32_t rows,
     uint32_t qheads, uint32_t kvheads, uint32_t window, cudaStream_t stream) {
     const uint32_t splits=(retained+rows+255)/256;
     context_attention_partial<<<dim3(qheads,rows,splits),32,0,stream>>>(
         q,ck,cv,bk,bv,partial,end,retained,rows,qheads,kvheads,window,splits);
-    context_attention_merge<<<qheads*rows,32,0,stream>>>(partial,out,splits);
+    context_attention_merge<<<qheads*rows,32,0,stream>>>(partial,sinks,out,splits,qheads);
     return cudaGetLastError();
 }
 

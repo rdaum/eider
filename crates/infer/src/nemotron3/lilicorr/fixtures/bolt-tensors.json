@@ -1,0 +1,1143 @@
+{
+  "fc.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.0.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.0.mlp.gate_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.0.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.1.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.1.mlp.gate_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.1.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.2.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.2.mlp.gate_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.2.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.3.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.3.mlp.gate_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.3.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.4.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.4.mlp.gate_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "layers.4.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.context_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.0.attn.out_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.0.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.0.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.1.attn.out_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.1.mlp.down_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.layers.1.mlp.up_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.pass_hidden_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "lilicorr.token_proj.weight_scale_2": {
+    "dtype": "F32",
+    "shape": []
+  },
+  "hidden_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.0.attention_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.0.attention_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.0.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.0.mlp_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.0.mlp_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.0.post_attention_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.0.self_attn.attention_sink_bias": {
+    "dtype": "BF16",
+    "shape": [
+      32
+    ]
+  },
+  "layers.0.self_attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.0.self_attn.k_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.0.self_attn.o_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.0.self_attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.0.self_attn.q_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.0.self_attn.v_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.1.attention_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.1.attention_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.1.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.1.mlp_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.1.mlp_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.1.post_attention_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.1.self_attn.attention_sink_bias": {
+    "dtype": "BF16",
+    "shape": [
+      32
+    ]
+  },
+  "layers.1.self_attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.1.self_attn.k_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.1.self_attn.o_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.1.self_attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.1.self_attn.q_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.1.self_attn.v_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.2.attention_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.2.attention_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.2.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.2.mlp_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.2.mlp_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.2.post_attention_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.2.self_attn.attention_sink_bias": {
+    "dtype": "BF16",
+    "shape": [
+      32
+    ]
+  },
+  "layers.2.self_attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.2.self_attn.k_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.2.self_attn.o_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.2.self_attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.2.self_attn.q_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.2.self_attn.v_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.3.attention_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.3.attention_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.3.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.3.mlp_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.3.mlp_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.3.post_attention_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.3.self_attn.attention_sink_bias": {
+    "dtype": "BF16",
+    "shape": [
+      32
+    ]
+  },
+  "layers.3.self_attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.3.self_attn.k_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.3.self_attn.o_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.3.self_attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.3.self_attn.q_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.3.self_attn.v_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.4.attention_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.4.attention_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.4.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.4.mlp_conv.base_kernel": {
+    "dtype": "BF16",
+    "shape": [
+      2,
+      2,
+      4096
+    ]
+  },
+  "layers.4.mlp_conv.kernel_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      4096
+    ]
+  },
+  "layers.4.post_attention_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "layers.4.self_attn.attention_sink_bias": {
+    "dtype": "BF16",
+    "shape": [
+      32
+    ]
+  },
+  "layers.4.self_attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.4.self_attn.k_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "layers.4.self_attn.o_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.4.self_attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "layers.4.self_attn.q_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096,
+      4096
+    ]
+  },
+  "layers.4.self_attn.v_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256,
+      4096
+    ]
+  },
+  "lilicorr.anchor_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.anchor_out_head.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.anchor_out_head.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.context_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.factor_input_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.factor_input_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      3072
+    ]
+  },
+  "lilicorr.feature_mlp.down_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.feature_mlp.down_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.feature_mlp.up_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.feature_mlp.up_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      5
+    ]
+  },
+  "lilicorr.feature_norm.bias": {
+    "dtype": "BF16",
+    "shape": [
+      5
+    ]
+  },
+  "lilicorr.feature_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5
+    ]
+  },
+  "lilicorr.in_head.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.in_head.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.layers.0.attn.in_proj_bias": {
+    "dtype": "BF16",
+    "shape": [
+      3072
+    ]
+  },
+  "lilicorr.layers.0.attn.in_proj_weight": {
+    "dtype": "BF16",
+    "shape": [
+      3072,
+      1024
+    ]
+  },
+  "lilicorr.layers.0.attn.out_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.0.attn_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.0.mlp.down_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.0.mlp.up_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      2048
+    ]
+  },
+  "lilicorr.layers.0.mlp_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.1.attn.in_proj_bias": {
+    "dtype": "BF16",
+    "shape": [
+      3072
+    ]
+  },
+  "lilicorr.layers.1.attn.in_proj_weight": {
+    "dtype": "BF16",
+    "shape": [
+      3072,
+      1024
+    ]
+  },
+  "lilicorr.layers.1.attn.out_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.1.attn_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.1.mlp.down_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.layers.1.mlp.up_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      2048
+    ]
+  },
+  "lilicorr.layers.1.mlp_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.out_head.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.out_head.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.output_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.pass_hidden_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "lilicorr.rank_embedding": {
+    "dtype": "BF16",
+    "shape": [
+      1,
+      1,
+      1,
+      8,
+      1024
+    ]
+  },
+  "lilicorr.relative_slot_bias": {
+    "dtype": "BF16",
+    "shape": [
+      8,
+      15
+    ]
+  },
+  "lilicorr.same_slot_bias": {
+    "dtype": "BF16",
+    "shape": [
+      8
+    ]
+  },
+  "lilicorr.slot_embedding": {
+    "dtype": "BF16",
+    "shape": [
+      1,
+      1,
+      7,
+      1,
+      1024
+    ]
+  },
+  "lilicorr.token_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      1024
+    ]
+  },
+  "norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4096
+    ]
+  },
+  "fc.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      1536
+    ]
+  },
+  "layers.0.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      768
+    ]
+  },
+  "layers.0.mlp.gate_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.0.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.1.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      768
+    ]
+  },
+  "layers.1.mlp.gate_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.1.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.2.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      768
+    ]
+  },
+  "layers.2.mlp.gate_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.2.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.3.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      768
+    ]
+  },
+  "layers.3.mlp.gate_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.3.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.4.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      4096,
+      768
+    ]
+  },
+  "layers.4.mlp.gate_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "layers.4.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      12288,
+      256
+    ]
+  },
+  "lilicorr.context_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      256
+    ]
+  },
+  "lilicorr.layers.0.attn.out_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      64
+    ]
+  },
+  "lilicorr.layers.0.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      128
+    ]
+  },
+  "lilicorr.layers.0.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      2048,
+      64
+    ]
+  },
+  "lilicorr.layers.1.attn.out_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      64
+    ]
+  },
+  "lilicorr.layers.1.mlp.down_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      128
+    ]
+  },
+  "lilicorr.layers.1.mlp.up_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      2048,
+      64
+    ]
+  },
+  "lilicorr.pass_hidden_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      256
+    ]
+  },
+  "lilicorr.token_proj.weight_scale": {
+    "dtype": "F8_E4M3",
+    "shape": [
+      1024,
+      256
+    ]
+  },
+  "fc.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      12288
+    ]
+  },
+  "layers.0.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      6144
+    ]
+  },
+  "layers.0.mlp.gate_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.0.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.1.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      6144
+    ]
+  },
+  "layers.1.mlp.gate_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.1.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.2.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      6144
+    ]
+  },
+  "layers.2.mlp.gate_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.2.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.3.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      6144
+    ]
+  },
+  "layers.3.mlp.gate_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.3.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.4.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      4096,
+      6144
+    ]
+  },
+  "layers.4.mlp.gate_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "layers.4.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      12288,
+      2048
+    ]
+  },
+  "lilicorr.context_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      2048
+    ]
+  },
+  "lilicorr.layers.0.attn.out_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      512
+    ]
+  },
+  "lilicorr.layers.0.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.layers.0.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      2048,
+      512
+    ]
+  },
+  "lilicorr.layers.1.attn.out_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      512
+    ]
+  },
+  "lilicorr.layers.1.mlp.down_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      1024
+    ]
+  },
+  "lilicorr.layers.1.mlp.up_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      2048,
+      512
+    ]
+  },
+  "lilicorr.pass_hidden_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      2048
+    ]
+  },
+  "lilicorr.token_proj.weight": {
+    "dtype": "U8",
+    "shape": [
+      1024,
+      2048
+    ]
+  }
+}

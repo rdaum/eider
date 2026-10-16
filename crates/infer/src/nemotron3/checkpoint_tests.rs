@@ -43,6 +43,71 @@ fn omni_configuration_selects_text_dimensions_and_namespace() {
 }
 
 #[test]
+fn bolt_release_configuration_preserves_layer_shapes() {
+    // cloudnathan5 NVFP4 revision fcf26d4c868500a8e1bacd28b7ec2d1dcb7b2646;
+    // vision and per-tensor quantization metadata are omitted from this fixture.
+    let config: Value =
+        serde_json::from_str(include_str!("fixtures/bolt-74b-config.json")).unwrap();
+    let manifest = Nemotron3Manifest::from_config_str(&config.to_string()).unwrap();
+    assert_eq!(manifest.layers.len(), 88);
+    assert_eq!(manifest.hidden_size, 4096);
+    assert_eq!(manifest.max_position_embeddings, 262144);
+    assert_eq!(manifest.mamba_ssm_dtype, MambaSsmDtype::F32);
+    assert_eq!(manifest.routed_experts, 512);
+    assert_eq!(manifest.moe_latent_size, Some(1024));
+    assert_eq!(manifest.mtp_prediction_layers, 0);
+    assert!(manifest.mtp_layers.is_empty());
+    for (layer, block) in config["llm_config"]["block_configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        if block["block_type"] != "moe" {
+            continue;
+        }
+        let moe = manifest.moe_layer_config(layer).unwrap();
+        assert_eq!(
+            moe.routed_experts,
+            block["n_routed_experts"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            moe.intermediate_size,
+            block["moe_intermediate_size"].as_u64().unwrap() as usize
+        );
+        assert_eq!(moe.experts_per_token, 9);
+    }
+}
+
+#[test]
+fn bolt_rejects_conflicting_counts_and_invalid_layer_bounds() {
+    let released: Value =
+        serde_json::from_str(include_str!("fixtures/bolt-74b-config.json")).unwrap();
+    for (key, value) in [("n_routed_experts", 511), ("num_local_experts", 511)] {
+        let mut config = released.clone();
+        config["llm_config"][key] = json!(value);
+        let error = Nemotron3Manifest::from_config_str(&config.to_string()).unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "{error}");
+    }
+    for experts in [0, 8, 513] {
+        let mut config = released.clone();
+        config["llm_config"]["block_configs"][1]["n_routed_experts"] = json!(experts);
+        assert!(Nemotron3Manifest::from_config_str(&config.to_string()).is_err());
+    }
+    let mut config = released;
+    config["llm_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("num_experts");
+    assert!(Nemotron3Manifest::from_config_str(&config.to_string()).is_ok());
+    config["llm_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("num_local_experts");
+    assert!(Nemotron3Manifest::from_config_str(&config.to_string()).is_err());
+}
+
+#[test]
 fn super_35_release_configuration_preserves_state_precision() {
     // NVIDIA NVFP4 revision 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c;
     // vision and per-tensor quantization metadata are omitted from this fixture.
@@ -266,6 +331,37 @@ fn shared_prefill_scratch_matches_serial_layers_and_following_decode() {
 }
 
 #[test]
+fn ggml_checkpoint_prefill_and_following_decode_match_serial() {
+    let fixture = Fixture::ggml();
+    let model = Nemotron3Model::load(&fixture.root).unwrap();
+    let mut cache = super::new_nemotron3_sequence_cache(&model, 2, 64).unwrap();
+    let mut serial = super::Nemotron3Sequence::admit(&model, &mut cache, 64).unwrap();
+    let mut batched = super::Nemotron3Sequence::admit(&model, &mut cache, 64).unwrap();
+    let tokens: Vec<_> = (1..=31).collect();
+    let mut workspace = model.prefill_workspace(1, tokens.len()).unwrap();
+    for &token in &tokens {
+        model.forward_one(&mut serial, &mut cache, token).unwrap();
+    }
+    model
+        .forward_block(&mut [&mut batched], &[&tokens], &mut workspace, &mut cache)
+        .unwrap();
+    for next in [None, Some(32), Some(33)] {
+        if let Some(token) = next {
+            model.forward_one(&mut serial, &mut cache, token).unwrap();
+            model.forward_one(&mut batched, &mut cache, token).unwrap();
+        }
+        let expected = model.logits_to_host(&serial).unwrap();
+        let actual = model.logits_to_host(&batched).unwrap();
+        for (&a, &b) in actual.iter().zip(&expected) {
+            assert!(
+                a.is_finite() && (a - b).abs() < 1e-4 + b.abs() * 1e-5,
+                "{a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prefill_workspace_can_be_reused_across_chunks_and_released_sequences() {
     let fixture = Fixture::new(true, 4);
     let model = Nemotron3Model::load(&fixture.root).unwrap();
@@ -384,21 +480,22 @@ fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
 #[test]
 fn decisions_fork_recurrent_state_and_unaligned_kv_with_compact_readout() {
     use super::{Nemotron3Bf16Storage, Nemotron3Sequence, Nemotron3StorageConfig};
-    for (wrapped, storage) in [
-        (false, Nemotron3StorageConfig::default()),
-        (true, Nemotron3StorageConfig::default()),
+    for (fixture, storage) in [
+        (Fixture::new(false, 4), Nemotron3StorageConfig::default()),
+        (Fixture::new(true, 4), Nemotron3StorageConfig::default()),
+        (Fixture::bolt(), Nemotron3StorageConfig::default()),
+        (Fixture::ggml(), Nemotron3StorageConfig::default()),
         (
-            false,
+            Fixture::new(false, 4),
             Nemotron3StorageConfig {
                 bf16: Nemotron3Bf16Storage::Nvfp4,
                 ..Default::default()
             },
         ),
     ] {
-        let fixture = Fixture::new(wrapped, 4);
         let mut config: Value =
             serde_json::from_slice(&fs::read(fixture.root.join("config.json")).unwrap()).unwrap();
-        let text = if wrapped {
+        let text = if !fixture.prefix.is_empty() {
             &mut config["llm_config"]
         } else {
             &mut config
@@ -487,6 +584,71 @@ struct Fixture {
 
 impl Fixture {
     fn new(wrapped: bool, first_experts: usize) -> Self {
+        Self::build(wrapped, first_experts, false)
+    }
+
+    fn bolt() -> Self {
+        Self::build(true, 4, true)
+    }
+
+    fn ggml() -> Self {
+        use eider_format::GgmlBlockFormat::{Iq2Xxs, Q8};
+        let mut fixture = Self::bolt();
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join("config.json")).unwrap()).unwrap();
+        config["llm_config"]["moe_latent_size"] = json!(256);
+        for layer in [1, 3] {
+            config["llm_config"]["block_configs"][layer]["moe_intermediate_size"] = json!(256);
+        }
+        fs::write(fixture.root.join("config.json"), config.to_string()).unwrap();
+        let mut packed = |name: &str,
+                          format: eider_format::GgmlBlockFormat,
+                          out: usize,
+                          cols: usize,
+                          salt: usize| {
+            let mut bytes =
+                vec![0u8; out * (cols / format.block_elements()) * format.block_bytes()];
+            for (i, block) in bytes.chunks_exact_mut(format.block_bytes()).enumerate() {
+                let scale = 0x1800u16 + ((salt % 4) as u16 * 1024);
+                block[..2].copy_from_slice(&scale.to_le_bytes());
+                if format == Q8 {
+                    for (j, v) in block[2..].iter_mut().enumerate() {
+                        *v = ((i * 17 + j * 31) % 127) as u8;
+                    }
+                }
+            }
+            let full = format!("{}{name}.", fixture.prefix);
+            fixture.header.retain(|key, _| !key.starts_with(&full));
+            fixture.tensor(
+                &format!("{name}.weight"),
+                "U8",
+                &[out, cols / format.block_elements(), format.block_bytes()],
+                &bytes,
+            );
+        };
+        packed("lm_head", Q8, 128, 128, 0);
+        for (layer, experts) in [(1, 4), (3, 3)] {
+            let mixer = format!("backbone.layers.{layer}.mixer");
+            packed(&format!("{mixer}.fc1_latent_proj"), Q8, 256, 128, 0);
+            packed(&format!("{mixer}.fc2_latent_proj"), Q8, 128, 256, 0);
+            for name in ["up_proj", "down_proj"] {
+                packed(&format!("{mixer}.shared_experts.{name}"), Q8, 128, 128, 0);
+                for expert in 0..experts {
+                    packed(
+                        &format!("{mixer}.experts.{expert}.{name}"),
+                        Iq2Xxs,
+                        256,
+                        256,
+                        expert,
+                    );
+                }
+            }
+        }
+        fixture.write_checkpoint();
+        fixture
+    }
+
+    fn build(wrapped: bool, first_experts: usize, bolt: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "eider-nemotron-omni-{}-{}",
@@ -494,11 +656,28 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let config = if wrapped {
+        let mut config = if wrapped {
             omni_config("llm_config")
         } else {
             text_config()
         };
+        if bolt {
+            let text = &mut config["llm_config"];
+            let fields = text.as_object_mut().unwrap();
+            fields.remove("n_routed_experts");
+            fields.remove("num_experts_per_tok");
+            fields.remove("moe_intermediate_size");
+            text["model_type"] = json!("nemotron_h_puzzle");
+            text["num_experts"] = json!(8);
+            text["num_local_experts"] = json!(8);
+            text["num_nextn_predict_layers"] = json!(0);
+            text["block_configs"] = json!([
+                {"block_type": "mamba"},
+                {"block_type": "moe", "n_routed_experts": first_experts, "num_experts_per_tok": 2, "moe_intermediate_size": 64},
+                {"block_type": "attention"},
+                {"block_type": "moe", "n_routed_experts": 3, "num_experts_per_tok": 2, "moe_intermediate_size": 128}
+            ]);
+        }
         fs::write(root.join("config.json"), config.to_string()).unwrap();
         let mut fixture = Self {
             root,
@@ -508,7 +687,7 @@ impl Fixture {
         };
         fixture.bf16("backbone.embeddings.weight", &[128, 128], 0.125);
         fixture.bf16("backbone.norm_f.weight", &[128], 1.0);
-        if wrapped {
+        if wrapped && !bolt {
             // Released Omni checkpoints mix scalar and singleton FP8 scales.
             fixture.tensor(
                 "lm_head.weight",
@@ -536,21 +715,32 @@ impl Fixture {
             fixture.bf16(&format!("{mamba}.{name}"), &shape, 0.125);
         }
         fixture.attention("backbone.layers.2");
-        fixture.moe("backbone.layers.1", first_experts);
-        fixture.moe("backbone.layers.3", 3);
-        fixture.attention("mtp.layers.0");
-        fixture.moe("mtp.layers.1", 2);
-        for name in ["enorm", "hnorm"] {
-            fixture.bf16(&format!("mtp.layers.0.{name}.weight"), &[128], 1.0);
+        fixture.moe("backbone.layers.1", first_experts, 64);
+        fixture.moe("backbone.layers.3", 3, if bolt { 128 } else { 64 });
+        if !bolt {
+            fixture.attention("mtp.layers.0");
+            fixture.moe("mtp.layers.1", 2, 64);
+            for name in ["enorm", "hnorm"] {
+                fixture.bf16(&format!("mtp.layers.0.{name}.weight"), &[128], 1.0);
+            }
+            fixture.bf16("mtp.layers.0.eh_proj.weight", &[128, 256], 0.125);
+            fixture.bf16("mtp.layers.1.final_layernorm.weight", &[128], 1.0);
+        } else {
+            // Bolt's expert projections are W4A16, without calibrated activation scales.
+            fixture
+                .header
+                .retain(|name, _| !name.ends_with(".input_scale"));
         }
-        fixture.bf16("mtp.layers.0.eh_proj.weight", &[128, 256], 0.125);
-        fixture.bf16("mtp.layers.1.final_layernorm.weight", &[128], 1.0);
-        let header = serde_json::to_vec(&fixture.header).unwrap();
+        fixture.write_checkpoint();
+        fixture
+    }
+
+    fn write_checkpoint(&self) {
+        let header = serde_json::to_vec(&self.header).unwrap();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
-        bytes.extend(&fixture.data);
-        fs::write(fixture.root.join("model.safetensors"), bytes).unwrap();
-        fixture
+        bytes.extend(&self.data);
+        fs::write(self.root.join("model.safetensors"), bytes).unwrap();
     }
 
     fn tensor(&mut self, name: &str, dtype: &str, shape: &[usize], data: &[u8]) {
@@ -565,19 +755,19 @@ impl Fixture {
         self.tensor(name, "BF16", shape, &bytes);
     }
 
-    fn nvfp4(&mut self, prefix: &str, value: f32) {
-        let weight = ModelOptNvfp4Linear::quantize_values(prefix, 64, 64, |_| value).unwrap();
+    fn nvfp4(&mut self, prefix: &str, rows: usize, cols: usize, value: f32) {
+        let weight = ModelOptNvfp4Linear::quantize_values(prefix, rows, cols, |_| value).unwrap();
         let scalar_shape: &[usize] = if self.prefix.is_empty() { &[] } else { &[1] };
         self.tensor(
             &format!("{prefix}.weight"),
             "U8",
-            &[64, 32],
+            &[rows, cols / 2],
             &weight.packed_weight,
         );
         self.tensor(
             &format!("{prefix}.weight_scale"),
             "F8_E4M3",
-            &[64, 4],
+            &[rows, cols / 16],
             &weight.weight_scale,
         );
         self.tensor(
@@ -606,7 +796,7 @@ impl Fixture {
         }
     }
 
-    fn moe(&mut self, prefix: &str, experts: usize) {
+    fn moe(&mut self, prefix: &str, experts: usize, intermediate: usize) {
         self.bf16(&format!("{prefix}.norm.weight"), &[128], 1.0);
         let mixer = format!("{prefix}.mixer");
         let mut gate = Vec::new();
@@ -635,8 +825,16 @@ impl Fixture {
             self.bf16(&format!("{mixer}.{name}.weight"), &shape, 0.125);
         }
         for expert in 0..experts {
-            for name in ["up_proj", "down_proj"] {
-                self.nvfp4(&format!("{mixer}.experts.{expert}.{name}"), 0.125);
+            for (name, rows, cols) in [
+                ("up_proj", intermediate, 64),
+                ("down_proj", 64, intermediate),
+            ] {
+                self.nvfp4(
+                    &format!("{mixer}.experts.{expert}.{name}"),
+                    rows,
+                    cols,
+                    0.125,
+                );
             }
         }
     }

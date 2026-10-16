@@ -147,7 +147,7 @@ fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
 }
 
-fn f16_to_f32(value: u16) -> f32 {
+pub(crate) fn f16_to_f32(value: u16) -> f32 {
     let sign = u32::from(value & 0x8000) << 16;
     let exponent = (value >> 10) & 0x1f;
     let fraction = u32::from(value & 0x03ff);

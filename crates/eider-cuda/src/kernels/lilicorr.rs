@@ -13,6 +13,7 @@ unsafe extern "C" {
         cv: *const f32,
         bk: *const f32,
         bv: *const f32,
+        sinks: *const f32,
         partial: *mut f32,
         out: *mut f32,
         end: u32,
@@ -158,6 +159,7 @@ impl ContextAttentionWorkspace {
         cv: &DeviceBuffer<f32>,
         bk: &DeviceBuffer<f32>,
         bv: &DeviceBuffer<f32>,
+        sinks: Option<&DeviceBuffer<f32>>,
         out: &mut DeviceBuffer<f32>,
         end: usize,
         retained: usize,
@@ -168,6 +170,7 @@ impl ContextAttentionWorkspace {
         require(
             rows > 0
                 && rows <= self.rows
+                && sinks.is_none_or(|s| s.len() == self.heads)
                 && kvheads > 0
                 && self.heads.is_multiple_of(kvheads)
                 && retained <= self.window
@@ -192,6 +195,7 @@ impl ContextAttentionWorkspace {
                     cv.ptr,
                     bk.ptr,
                     bv.ptr,
+                    sinks.map_or(std::ptr::null(), |s| s.ptr),
                     self.partial.ptr,
                     out.ptr,
                     end as u32,

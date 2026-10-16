@@ -17,6 +17,10 @@ micromeasure.workspace = true
 serial_test.workspace = true
 
 [[bench]]
+name = "nemotron35_ggml"
+harness = false
+
+[[bench]]
 name = "fp4_cublaslt"
 harness = false
 

@@ -39,6 +39,41 @@ impl LinearWorkspace {
             capacity,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_bf16(
+        &mut self,
+        weight: &DeviceBuffer<u16>,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        out: usize,
+        width: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if weight.len() != out * width
+            || input.len() < rows * width
+            || output.len() < rows * out
+            || rows == 0
+            || rows > self.capacity
+        {
+            return Err(Error::Format {
+                label: "LiLiCorr shared BF16 linear",
+                detail: "invalid row count or buffers".into(),
+            });
+        }
+        let key = (rows, out, width);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.plans.entry(key) {
+            entry.insert(Bf16TnMatmulPlan::new(
+                &self.lt,
+                GemmShape::new(out, rows, width),
+                1 << 20,
+            )?);
+        }
+        f32_to_bf16_prefix_into_on_stream(input, self.input.output(), rows * width, stream)?;
+        self.plans[&key].run_on_stream(&self.lt, weight, &self.input, output.output(), stream)?;
+        Ok(())
+    }
 }
 
 impl Linear {
@@ -145,21 +180,7 @@ impl Linear {
                 )?;
             }
             Weight::Bf16(weight) => {
-                let key = (rows, self.out, self.input);
-                if let std::collections::hash_map::Entry::Vacant(entry) = ws.plans.entry(key) {
-                    entry.insert(Bf16TnMatmulPlan::new(
-                        &ws.lt,
-                        GemmShape::new(self.out, rows, self.input),
-                        1 << 20,
-                    )?);
-                }
-                f32_to_bf16_prefix_into_on_stream(
-                    input,
-                    ws.input.output(),
-                    rows * self.input,
-                    stream,
-                )?;
-                ws.plans[&key].run_on_stream(&ws.lt, weight, &ws.input, output.output(), stream)?;
+                ws.run_bf16(weight, input, output, rows, self.out, self.input, stream)?;
             }
             Weight::Nvfp4(weight) => weight.run_batch_prefix_on_stream(
                 &ws.w4a16,

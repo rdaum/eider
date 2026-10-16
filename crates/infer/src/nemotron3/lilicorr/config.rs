@@ -1,4 +1,4 @@
-//! The released W4A16 companion has a distinct correlator and candidate LM head.
+//! Released W4A16 companions and their target feature and candidate-head contracts.
 
 use crate::nemotron3::Nemotron3Manifest;
 use eider_cuda::{Error, Result};
@@ -24,7 +24,7 @@ pub struct LiLiCorrConfig {
     pub(crate) intermediate_size: usize,
     hidden_act: String,
     pub(crate) rms_norm_eps: f32,
-    /// Full target vocabulary; the companion owns its candidate LM head.
+    /// Full target vocabulary.
     pub vocab_size: usize,
     pub(crate) max_position_embeddings: usize,
     attention_bias: bool,
@@ -37,8 +37,9 @@ pub struct LiLiCorrConfig {
     layer_types: Vec<String>,
     pub(crate) sliding_window: usize,
     use_sliding_window: bool,
-    has_own_lm_head: bool,
-    draft_vocab_size: usize,
+    #[serde(default)]
+    pub(crate) has_own_lm_head: bool,
+    draft_vocab_size: Option<usize>,
     quantization_config: Quantization,
 }
 
@@ -47,6 +48,8 @@ pub(crate) struct DraftConfig {
     pub mask_token_id: u32,
     pub target_layer_ids: Vec<usize>,
     causal: bool,
+    #[serde(default)]
+    pub attention_sink_bias: bool,
     projector_type: String,
     lilicorr_enabled: bool,
     pub lilicorr_candidate_topk: usize,
@@ -86,13 +89,17 @@ impl LiLiCorrConfig {
     pub fn validate_target(&self, target: &Nemotron3Manifest) -> Result<()> {
         if target.hidden_size != self.hidden_size
             || target.vocab_size != self.vocab_size
-            || target.layers.len() != self.num_target_layers
+            || target.layers.len() != 88
+            || self
+                .target_layers()
+                .iter()
+                .any(|&layer| layer >= target.layers.len())
         {
             return Err(invalid(format!(
                 "target must have hidden={}, vocab={}, layers={}; got {}/{}/{}",
                 self.hidden_size,
                 self.vocab_size,
-                self.num_target_layers,
+                88,
                 target.hidden_size,
                 target.vocab_size,
                 target.layers.len(),
@@ -112,8 +119,7 @@ impl LiLiCorrConfig {
             || self.attention_dropout != 0.0
             || self.rope_scaling.is_some()
             || self.tie_word_embeddings
-            || !self.has_own_lm_head
-            || self.draft_vocab_size != self.vocab_size
+            || self.draft_vocab_size.is_some_and(|v| v != self.vocab_size)
             || d.causal
             || !d.lilicorr_enabled
             || d.projector_type != "lilicorr"
@@ -123,20 +129,28 @@ impl LiLiCorrConfig {
             || q.kv_cache_quant_algo.is_some()
         {
             return Err(invalid(
-                "requires the non-causal LiLiCorrDraftModel W4A16_NVFP4 checkpoint with its own LM head",
+                "requires a non-causal LiLiCorrDraftModel W4A16_NVFP4 checkpoint",
             ));
         }
-        // These bounds describe the released companion, not other qwen3 drafts.
+        // The Bolt release leaves the target layer count at zero and shares its
+        // target LM head. Keep both released profiles explicit.
+        let bolt = d.target_layer_ids == [1, 18, 35, 51, 68, 85];
+        let expected_window = if bolt { 1024 } else { 8192 };
+        if self.has_own_lm_head == bolt
+            || d.attention_sink_bias != bolt
+            || self.num_target_layers != if bolt { 0 } else { 88 }
+            || (!bolt && d.target_layer_ids != [1, 22, 43, 64, 85])
+        {
+            return Err(invalid("unsupported Nemotron 3.5 LiLiCorr target profile"));
+        }
         if self.block_size != 8
             || self.hidden_size != 4096
             || self.vocab_size != 131072
             || self.num_hidden_layers != 5
-            || self.num_target_layers != 88
             || self.num_attention_heads != 32
-            || self.num_key_value_heads != 8
+            || self.num_key_value_heads != if bolt { 2 } else { 8 }
             || self.head_dim != 128
             || self.intermediate_size != 12288
-            || d.target_layer_ids != [1, 22, 43, 64, 85]
             || d.lilicorr_candidate_topk != 8
             || d.lilicorr_hidden_size != 1024
             || d.lilicorr_num_layers != 2
@@ -146,7 +160,7 @@ impl LiLiCorrConfig {
             || d.conv_kernel_size != 2
             || d.conv_group_size != 16
             || d.mask_token_id as usize >= self.vocab_size
-            || self.sliding_window != 8192
+            || self.sliding_window != expected_window
             || !self.use_sliding_window
             || !d.use_swa
             || d.swa_window_size != self.sliding_window
@@ -252,7 +266,9 @@ fn expected_tensors(c: &LiLiCorrConfig) -> Vec<Tensor> {
     let l = d.lilicorr_hidden_size;
     let mut t = Vec::new();
     linear(&mut t, "fc", h, h * d.target_layer_ids.len(), true, false);
-    linear(&mut t, "lm_head", c.vocab_size, h, true, false);
+    if c.has_own_lm_head {
+        linear(&mut t, "lm_head", c.vocab_size, h, true, false);
+    }
     for name in ["hidden_norm", "norm"] {
         push(&mut t, format!("{name}.weight"), "BF16", &[h]);
     }
@@ -283,6 +299,14 @@ fn expected_tensors(c: &LiLiCorrConfig) -> Vec<Tensor> {
                 format!("{p}.self_attn.{n}.weight"),
                 "BF16",
                 &[c.head_dim],
+            );
+        }
+        if d.attention_sink_bias {
+            push(
+                &mut t,
+                format!("{p}.self_attn.attention_sink_bias"),
+                "BF16",
+                &[c.num_attention_heads],
             );
         }
         for (n, out, input) in [
@@ -405,6 +429,25 @@ mod tests {
             let shape: Vec<usize> = serde_json::from_value(info["shape"].clone()).unwrap();
             t.validate(info["dtype"].as_str().unwrap(), &shape).unwrap();
         }
+    }
+
+    #[test]
+    fn bolt_header_matches_shared_head_and_attention_sinks() {
+        let config: LiLiCorrConfig =
+            serde_json::from_str(include_str!("fixtures/bolt-config.json")).unwrap();
+        config.validate().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/bolt-tensors.json")).unwrap();
+        let expected = expected_tensors(&config);
+        assert_eq!(expected.len(), header.as_object().unwrap().len());
+        for t in expected {
+            let info = &header[&t.name];
+            let shape: Vec<usize> = serde_json::from_value(info["shape"].clone()).unwrap();
+            t.validate(info["dtype"].as_str().unwrap(), &shape).unwrap();
+        }
+        let mut invalid = config;
+        invalid.dflash_config.attention_sink_bias = false;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

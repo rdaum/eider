@@ -76,6 +76,37 @@ pub struct ModelOptCheckpoint {
 }
 
 impl ModelOptCheckpoint {
+    /// Reads the GGML-packed `[output, blocks, bytes]` weights in Bolt 24GB.
+    pub fn load_ggml_linear(&self, prefix: &str) -> Result<crate::ModelOptGgmlLinear> {
+        let name = format!("{prefix}.weight");
+        let shard = self.open_shard_for_tensor(&name)?;
+        let info = shard.require_tensor(&name)?;
+        let format = crate::GgmlBlockFormat::from_shape(&info.shape)
+            .filter(|_| info.dtype == "U8")
+            .ok_or_else(|| Error::Format {
+                label: "ModelOpt GGML weight",
+                detail: format!(
+                    "{name}: expected U8 [out,blocks,34 or 66], got {} {:?}",
+                    info.dtype, info.shape
+                ),
+            })?;
+        let out_features = info.shape[0];
+        let in_features = info.shape[1]
+            .checked_mul(format.block_elements())
+            .ok_or_else(|| Error::Format {
+                label: "ModelOpt GGML weight",
+                detail: "input width overflow".into(),
+            })?;
+        let packed = shard.read_tensor_bytes(&name)?;
+        format.validate(&packed, out_features, in_features)?;
+        Ok(crate::ModelOptGgmlLinear {
+            format,
+            out_features,
+            in_features,
+            packed,
+        })
+    }
+
     /// Opens a ModelOpt checkpoint directory.
     pub fn open(root: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {

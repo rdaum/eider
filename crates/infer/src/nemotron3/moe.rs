@@ -7,7 +7,7 @@ use super::{
 };
 use eider_cuda::{
     CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer, Error, F32DenseGemm,
-    MoeSortedNvfp4Rows, MoeSortedRoutes, Result, add_f32_into_on_stream,
+    GgmlWeights, MoeSortedNvfp4Rows, MoeSortedRoutes, Result, add_f32_into_on_stream,
     lfm2_expert_gemm_pipelined_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
@@ -168,7 +168,11 @@ impl Nemotron3MoeLayer {
     }
 
     pub(super) fn has_calibrated_experts(&self) -> bool {
-        self.experts.nvfp4.is_some()
+        self.experts.calibrated()
+    }
+
+    pub(super) fn has_ggml_experts(&self) -> bool {
+        self.experts.is_ggml()
     }
 
     pub(super) fn config(&self) -> Nemotron3MoeLayerConfig {
@@ -187,12 +191,18 @@ impl Nemotron3MoeLayer {
 
     /// Allocates the scratch buffers and route pointer tables used for one token.
     pub fn workspace(&self) -> Result<Nemotron3MoeWorkspace> {
-        Nemotron3MoeWorkspace::new(&self.manifest, self.moe)
+        Nemotron3MoeWorkspace::new(&self.manifest, self.moe, self.experts.is_ggml())
     }
 
     /// Allocates scratch and route tables for a fixed flattened row count.
     pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MoeRowsWorkspace> {
-        Nemotron3MoeRowsWorkspace::new(&self.manifest, self.moe, rows, self.experts.nvfp4.is_some())
+        Nemotron3MoeRowsWorkspace::new(
+            &self.manifest,
+            self.moe,
+            rows,
+            self.experts.calibrated(),
+            self.experts.is_ggml(),
+        )
     }
 
     /// Runs one token through pre-norm, routed and shared experts, and the residual add.
@@ -286,7 +296,7 @@ impl Nemotron3MoeLayer {
             .run_rows(&workspace.normed, &mut workspace.router, rows, gemm, stream)?;
         self.latent_in
             .run_rows(&workspace.normed, &mut workspace.latent, rows, gemm, stream)?;
-        self.experts.run_rows(workspace, rows, stream)?;
+        self.experts.run_rows(workspace, rows, gemm, stream)?;
         self.latent_out.run_rows(
             &workspace.routed_latent,
             &mut workspace.routed_hidden,
@@ -350,7 +360,193 @@ impl Nemotron3MoeLayer {
     }
 }
 
-struct Nemotron3ExpertSlab {
+enum Nemotron3ExpertSlab {
+    Nvfp4(Nemotron3Nvfp4ExpertSlab),
+    Ggml(Nemotron3GgmlExperts),
+}
+
+struct Nemotron3GgmlExperts {
+    up: GgmlWeights,
+    down: GgmlWeights,
+    alpha: DeviceBuffer<f32>,
+}
+
+struct Nemotron3GgmlDecode {
+    routes: MoeSortedRoutes,
+    inputs: DeviceBuffer<DeviceAddress<f32>>,
+}
+
+impl Nemotron3ExpertSlab {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        moe: Nemotron3MoeLayerConfig,
+        mixer: &str,
+        latent: usize,
+    ) -> Result<Self> {
+        let info = checkpoint.tensor_info(&format!("{mixer}.experts.0.up_proj.weight"))?;
+        let Some(format) =
+            eider_format::GgmlBlockFormat::from_shape(&info.shape).filter(|_| info.dtype == "U8")
+        else {
+            return Ok(Self::Nvfp4(Nemotron3Nvfp4ExpertSlab::load(
+                checkpoint, moe, mixer, latent,
+            )?));
+        };
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for expert in 0..moe.routed_experts {
+            for (name, out, cols, bytes) in [
+                ("up_proj", moe.intermediate_size, latent, &mut up),
+                ("down_proj", latent, moe.intermediate_size, &mut down),
+            ] {
+                let prefix = format!("{mixer}.experts.{expert}.{name}");
+                let weight = checkpoint.load_ggml_linear(&prefix)?;
+                if weight.format != format
+                    || weight.out_features != out
+                    || weight.in_features != cols
+                {
+                    return Err(Error::Format {
+                        label: "Nemotron GGML experts",
+                        detail: format!("inconsistent format or dimensions at {prefix}"),
+                    });
+                }
+                bytes.extend_from_slice(&weight.packed);
+            }
+        }
+        Ok(Self::Ggml(Nemotron3GgmlExperts {
+            up: GgmlWeights::new(
+                format,
+                moe.routed_experts,
+                moe.intermediate_size,
+                latent,
+                &up,
+            )?,
+            down: GgmlWeights::new(
+                format,
+                moe.routed_experts,
+                latent,
+                moe.intermediate_size,
+                &down,
+            )?,
+            alpha: DeviceBuffer::from_host(&vec![1.; moe.routed_experts])?,
+        }))
+    }
+
+    fn calibrated(&self) -> bool {
+        matches!(self, Self::Nvfp4(w) if w.nvfp4.is_some())
+    }
+    fn is_ggml(&self) -> bool {
+        matches!(self, Self::Ggml(_))
+    }
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Nvfp4(w) => w.device_bytes(),
+            Self::Ggml(w) => w.up.device_bytes() + w.down.device_bytes() + w.alpha.device_bytes(),
+        }
+    }
+
+    fn run(&self, workspace: &mut Nemotron3MoeWorkspace, stream: &CudaStream) -> Result<()> {
+        let weights = match self {
+            Self::Nvfp4(weights) => return weights.run(workspace, stream),
+            Self::Ggml(weights) => weights,
+        };
+        let scratch = workspace.ggml.as_mut().ok_or_else(|| Error::Format {
+            label: "Nemotron GGML experts",
+            detail: "missing decode route workspace".into(),
+        })?;
+        scratch
+            .routes
+            .sort_on_stream(workspace.router.indices(), stream)?;
+        weights.up.run_routed(
+            &scratch.routes,
+            &scratch.inputs,
+            &workspace.up_output_table,
+            None,
+            stream,
+        )?;
+        relu_squared_f32_into_on_stream(
+            &workspace.routed_up,
+            workspace.routed_activated.output(),
+            stream,
+        )?;
+        weights.down.run_routed(
+            &scratch.routes,
+            &workspace.down_input_table,
+            &workspace.down_output_table,
+            None,
+            stream,
+        )?;
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
+            workspace.router.indices(),
+            workspace.router.weights(),
+            &workspace.down_result_table,
+            &weights.alpha,
+            workspace.routed_latent.inout(),
+            stream,
+        )
+    }
+
+    fn run_rows(
+        &self,
+        workspace: &mut Nemotron3MoeRowsWorkspace,
+        rows: usize,
+        gemm: &mut F32DenseGemm,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let weights = match self {
+            Self::Nvfp4(weights) => return weights.run_rows(workspace, rows, stream),
+            Self::Ggml(weights) => weights,
+        };
+        let routes = workspace
+            .sorted_routes
+            .as_mut()
+            .ok_or_else(|| Error::Format {
+                label: "Nemotron GGML experts",
+                detail: "missing batched route workspace".into(),
+            })?;
+        routes.sort_on_stream(workspace.router.indices(), stream)?;
+        let scratch = if rows >= 16 {
+            Some(gemm.ggml_workspace(routes.active_routes(), weights.up.in_features())?)
+        } else {
+            None
+        };
+        weights.up.run_routed(
+            routes,
+            &workspace.up_input_table,
+            &workspace.up_output_table,
+            scratch,
+            stream,
+        )?;
+        relu_squared_f32_into_on_stream(
+            &workspace.routed_up,
+            workspace.routed_activated.output(),
+            stream,
+        )?;
+        let scratch = if rows >= 16 {
+            Some(gemm.ggml_workspace(routes.active_routes(), weights.down.in_features())?)
+        } else {
+            None
+        };
+        weights.down.run_routed(
+            routes,
+            &workspace.down_input_table,
+            &workspace.down_output_table,
+            scratch,
+            stream,
+        )?;
+        moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
+            workspace.router.indices(),
+            workspace.router.weights(),
+            &workspace.down_result_table,
+            &weights.alpha,
+            workspace.routed_latent.inout(),
+            rows,
+            workspace.routes_per_row,
+            stream,
+        )
+    }
+}
+
+struct Nemotron3Nvfp4ExpertSlab {
     nvfp4: Option<Nemotron3Nvfp4Experts>,
     up_packed: DeviceBuffer<u8>,
     up_scales: DeviceBuffer<u8>,
@@ -367,7 +563,7 @@ struct Nemotron3ExpertSlab {
     intermediate: usize,
 }
 
-impl Nemotron3ExpertSlab {
+impl Nemotron3Nvfp4ExpertSlab {
     fn load(
         checkpoint: &ModelOptCheckpoint,
         moe: Nemotron3MoeLayerConfig,
@@ -847,6 +1043,7 @@ fn pointer_table(
 
 /// Reusable one-token scratch storage for a Nemotron 3 MoE layer.
 pub struct Nemotron3MoeWorkspace {
+    ggml: Option<Nemotron3GgmlDecode>,
     router: Nemotron3RouterWorkspace,
     normed: DeviceBuffer<f32>,
     latent: DeviceBuffer<f32>,
@@ -897,6 +1094,7 @@ impl Nemotron3MoeRowsWorkspace {
         moe: Nemotron3MoeLayerConfig,
         rows: usize,
         calibrated: bool,
+        ggml: bool,
     ) -> Result<Self> {
         if rows == 0 {
             return Err(Error::Shape {
@@ -927,7 +1125,8 @@ impl Nemotron3MoeRowsWorkspace {
                 .then(|| Nemotron3Nvfp4MoeWorkspace::new(moe, rows, latent))
                 .transpose()?,
             router: Nemotron3RouterRowsWorkspace::new(moe, rows)?,
-            sorted_routes: (use_nvfp4
+            sorted_routes: (ggml
+                || use_nvfp4
                 || rows >= 16
                 || (rows > 1 && latent <= 3072 && intermediate <= 3072))
                 .then(|| MoeSortedRoutes::new(routes, moe.routed_experts))
@@ -1028,7 +1227,7 @@ impl Nemotron3MoeRowsWorkspace {
 }
 
 impl Nemotron3MoeWorkspace {
-    fn new(manifest: &Nemotron3Manifest, moe: Nemotron3MoeLayerConfig) -> Result<Self> {
+    fn new(manifest: &Nemotron3Manifest, moe: Nemotron3MoeLayerConfig, ggml: bool) -> Result<Self> {
         let latent = manifest.moe_latent_size.ok_or_else(|| Error::Format {
             label: "Nemotron 3 MoE workspace",
             detail: "the current MoE execution path requires moe_latent_size".to_string(),
@@ -1042,10 +1241,20 @@ impl Nemotron3MoeWorkspace {
         let down_input_table = address_table(&routed_activated, routes, intermediate)?;
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
+        let latent_buffer = DeviceBuffer::zeroed(latent)?;
+        let ggml = ggml
+            .then(|| -> Result<_> {
+                Ok(Nemotron3GgmlDecode {
+                    routes: MoeSortedRoutes::new(routes, moe.routed_experts)?,
+                    inputs: repeated_address_table(&latent_buffer, 1, routes, latent)?,
+                })
+            })
+            .transpose()?;
         Ok(Self {
+            ggml,
             router: Nemotron3RouterWorkspace::new(moe)?,
             normed: DeviceBuffer::zeroed(manifest.hidden_size)?,
-            latent: DeviceBuffer::zeroed(latent)?,
+            latent: latent_buffer,
             routed_up,
             routed_activated,
             routed_down,
@@ -1093,7 +1302,10 @@ impl Nemotron3MoeWorkspace {
     }
 
     pub(super) fn device_bytes(&self) -> usize {
-        self.router.device_bytes()
+        self.ggml
+            .as_ref()
+            .map_or(0, |w| w.routes.device_bytes() + w.inputs.device_bytes())
+            + self.router.device_bytes()
             + self.normed.device_bytes()
             + self.latent.device_bytes()
             + self.routed_up.device_bytes()

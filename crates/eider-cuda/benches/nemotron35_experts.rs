@@ -10,9 +10,7 @@ use micromeasure::{
 };
 use std::time::Duration;
 
-const EXPERTS: usize = 512;
-
-struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
+struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize, const EXPERTS: usize = 512> {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -30,7 +28,9 @@ struct Experts<const OUT: usize, const IN: usize, const ROUTES: usize> {
     outputs: DeviceBuffer<DeviceAddress<f32>>,
 }
 
-impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, ROUTES> {
+impl<const OUT: usize, const IN: usize, const ROUTES: usize, const EXPERTS: usize>
+    Experts<OUT, IN, ROUTES, EXPERTS>
+{
     fn enqueue(&mut self, mode: usize) {
         let indices = if mode >= 4 {
             &self.repeated_indices
@@ -100,8 +100,8 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> Experts<OUT, IN, RO
     }
 }
 
-impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
-    for Experts<OUT, IN, ROUTES>
+impl<const OUT: usize, const IN: usize, const ROUTES: usize, const EXPERTS: usize> BenchContext
+    for Experts<OUT, IN, ROUTES, EXPERTS>
 {
     fn prepare(_: usize) -> Self {
         let weights = (0..EXPERTS)
@@ -247,8 +247,14 @@ impl<const OUT: usize, const IN: usize, const ROUTES: usize> BenchContext
     }
 }
 
-fn sample<const OUT: usize, const IN: usize, const MODE: usize, const ROUTES: usize>(
-    context: &mut Experts<OUT, IN, ROUTES>,
+fn sample<
+    const OUT: usize,
+    const IN: usize,
+    const MODE: usize,
+    const ROUTES: usize,
+    const EXPERTS: usize,
+>(
+    context: &mut Experts<OUT, IN, ROUTES, EXPERTS>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -290,40 +296,81 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            macro_rules! bolt_verification {
+                ($out:literal, $input:literal, $name:literal) => {
+                    runner.group::<Experts<$out, $input, 36, 496>>($name, |group| {
+                        let group = group.measurement_domain(MeasurementDomain::Gpu);
+                        group.bench_sample("SIMT", sample::<$out, $input, 0, 36, 496>);
+                        group.bench_sample(
+                            "weight reuse including sort",
+                            sample::<$out, $input, 3, 36, 496>,
+                        );
+                        group.bench_sample(
+                            "weight reuse shared experts",
+                            sample::<$out, $input, 7, 36, 496>,
+                        );
+                    });
+                };
+            }
+            bolt_verification!(2560, 1024, "Bolt verification up 4 x 9");
+            bolt_verification!(1024, 2560, "Bolt verification down 4 x 9");
+            macro_rules! bolt_prefill {
+                ($out:literal, $input:literal, $experts:literal, $name:literal) => {
+                    runner.group::<Experts<$out, $input, 18432, $experts>>($name, |group| {
+                        let group = group.measurement_domain(MeasurementDomain::Gpu);
+                        group.bench_sample(
+                            "16-row tiles",
+                            sample::<$out, $input, 1, 18432, $experts>,
+                        );
+                        group.bench_sample(
+                            "pipelined 32-row tiles",
+                            sample::<$out, $input, 2, 18432, $experts>,
+                        );
+                    });
+                };
+            }
+            bolt_prefill!(2560, 1024, 496, "Bolt up 2048 tokens x 9");
+            bolt_prefill!(1024, 2560, 496, "Bolt down 2048 tokens x 9");
             macro_rules! verification {
                 ($routes:literal, $up:literal, $down:literal) => {
                     runner.group::<Experts<2688, 1024, $routes>>($up, |group| {
                         let group = group.measurement_domain(MeasurementDomain::Gpu);
-                        group.bench_sample("SIMT", sample::<2688, 1024, 0, $routes>);
+                        group.bench_sample("SIMT", sample::<2688, 1024, 0, $routes, 512>);
                         group.bench_sample(
                             "weight reuse including sort",
-                            sample::<2688, 1024, 3, $routes>,
+                            sample::<2688, 1024, 3, $routes, 512>,
                         );
-                        group.bench_sample("SIMT shared experts", sample::<2688, 1024, 4, $routes>);
+                        group.bench_sample(
+                            "SIMT shared experts",
+                            sample::<2688, 1024, 4, $routes, 512>,
+                        );
                         group.bench_sample(
                             "weight reuse shared experts",
-                            sample::<2688, 1024, 7, $routes>,
+                            sample::<2688, 1024, 7, $routes, 512>,
                         );
                         group.bench_sample(
                             "tensor including sort",
-                            sample::<2688, 1024, 2, $routes>,
+                            sample::<2688, 1024, 2, $routes, 512>,
                         );
                     });
                     runner.group::<Experts<1024, 2688, $routes>>($down, |group| {
                         let group = group.measurement_domain(MeasurementDomain::Gpu);
-                        group.bench_sample("SIMT", sample::<1024, 2688, 0, $routes>);
+                        group.bench_sample("SIMT", sample::<1024, 2688, 0, $routes, 512>);
                         group.bench_sample(
                             "weight reuse including sort",
-                            sample::<1024, 2688, 3, $routes>,
+                            sample::<1024, 2688, 3, $routes, 512>,
                         );
-                        group.bench_sample("SIMT shared experts", sample::<1024, 2688, 4, $routes>);
+                        group.bench_sample(
+                            "SIMT shared experts",
+                            sample::<1024, 2688, 4, $routes, 512>,
+                        );
                         group.bench_sample(
                             "weight reuse shared experts",
-                            sample::<1024, 2688, 7, $routes>,
+                            sample::<1024, 2688, 7, $routes, 512>,
                         );
                         group.bench_sample(
                             "tensor including sort",
-                            sample::<1024, 2688, 2, $routes>,
+                            sample::<1024, 2688, 2, $routes, 512>,
                         );
                     });
                 };
@@ -333,15 +380,15 @@ fn main() {
             verification!(176, "verification up 8 x 22", "verification down 8 x 22");
             runner.group::<Experts<2688, 1024, 2816>>("Nemotron 3.5 up 128 tokens x 22", |group| {
                 let group = group.measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("SIMT", sample::<2688, 1024, 0, 2816>);
-                group.bench_sample("tensor including sort", sample::<2688, 1024, 2, 2816>);
+                group.bench_sample("SIMT", sample::<2688, 1024, 0, 2816, 512>);
+                group.bench_sample("tensor including sort", sample::<2688, 1024, 2, 2816, 512>);
             });
             runner.group::<Experts<1024, 2688, 2816>>(
                 "Nemotron 3.5 down 128 tokens x 22",
                 |group| {
                     let group = group.measurement_domain(MeasurementDomain::Gpu);
-                    group.bench_sample("SIMT", sample::<1024, 2688, 0, 2816>);
-                    group.bench_sample("tensor including sort", sample::<1024, 2688, 2, 2816>);
+                    group.bench_sample("SIMT", sample::<1024, 2688, 0, 2816, 512>);
+                    group.bench_sample("tensor including sort", sample::<1024, 2688, 2, 2816, 512>);
                 },
             );
             runner.group::<Experts<2688, 1024, 11264>>(
@@ -349,7 +396,7 @@ fn main() {
                 |group| {
                     group
                         .measurement_domain(MeasurementDomain::Gpu)
-                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 11264>);
+                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 11264, 512>);
                 },
             );
             runner.group::<Experts<1024, 2688, 11264>>(
@@ -357,7 +404,7 @@ fn main() {
                 |group| {
                     group
                         .measurement_domain(MeasurementDomain::Gpu)
-                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 11264>);
+                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 11264, 512>);
                 },
             );
             runner.group::<Experts<2688, 1024, 22528>>(
@@ -365,7 +412,7 @@ fn main() {
                 |group| {
                     group
                         .measurement_domain(MeasurementDomain::Gpu)
-                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 22528>);
+                        .bench_sample("tensor including sort", sample::<2688, 1024, 2, 22528, 512>);
                 },
             );
             runner.group::<Experts<1024, 2688, 22528>>(
@@ -373,7 +420,7 @@ fn main() {
                 |group| {
                     group
                         .measurement_domain(MeasurementDomain::Gpu)
-                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 22528>);
+                        .bench_sample("tensor including sort", sample::<1024, 2688, 2, 22528, 512>);
                 },
             );
         },

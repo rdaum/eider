@@ -142,7 +142,14 @@ impl Nemotron3Model {
 
     /// Enables the external LiLiCorr companion before creating any sequences.
     pub fn enable_lilicorr(&mut self, root: impl AsRef<Path>) -> Result<()> {
-        self.lilicorr = Some(LiLiCorrDraft::load(root, &self.manifest)?);
+        let draft = LiLiCorrDraft::load(root, &self.manifest)?;
+        if !draft.config().has_own_lm_head && self.lm_head.lilicorr_head().is_none() {
+            return Err(Error::Format {
+                label: "LiLiCorr shared LM head",
+                detail: "Bolt requires its target BF16 or Q8_0 LM head; retain --nemotron-bf16-storage bf16".into(),
+            });
+        }
+        self.lilicorr = Some(draft);
         Ok(())
     }
 
@@ -260,6 +267,7 @@ impl Nemotron3Model {
         }
         draft.propose(
             &self.embedding,
+            self.lm_head.lilicorr_head(),
             context,
             anchor,
             drafts,
@@ -2508,7 +2516,7 @@ impl Nemotron3Model {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nemotron3RowsShape {
     Mamba,
-    Moe(Nemotron3MoeLayerConfig, bool),
+    Moe(Nemotron3MoeLayerConfig, bool, bool),
     Attention,
 }
 
@@ -2766,9 +2774,11 @@ impl Nemotron3BlockWorkspace {
         for layer in &model.layers {
             let shape = match layer {
                 Nemotron3Layer::Mamba(_) => Nemotron3RowsShape::Mamba,
-                Nemotron3Layer::Moe(layer) => {
-                    Nemotron3RowsShape::Moe(layer.config(), layer.has_calibrated_experts())
-                }
+                Nemotron3Layer::Moe(layer) => Nemotron3RowsShape::Moe(
+                    layer.config(),
+                    layer.has_calibrated_experts(),
+                    layer.has_ggml_experts(),
+                ),
                 Nemotron3Layer::Attention(_) => Nemotron3RowsShape::Attention,
             };
             if let Some(slot) = shapes.iter().position(|existing| *existing == shape) {

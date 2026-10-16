@@ -9,6 +9,23 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn infer_split_f32_fp8_parts_on_stream(
+        input: *const f32,
+        parts: *mut u8,
+        powers: *mut f32,
+        rows: u32,
+        width: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn infer_sum_f32_fp8_parts_on_stream(
+        parts: *const f32,
+        powers: *const f32,
+        output: *mut f32,
+        rows: u32,
+        width: u32,
+        weight_scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_expand_dense_bf16_on_stream(
         weight: *const u8,
         scales: *const u8,
@@ -110,16 +127,24 @@ pub fn quantized_dense_gemm_f32_into_on_stream(
 
 /// Reusable projections from F32 rows, with BF16 decomposition or calibrated FP8 activations.
 pub struct F32DenseGemm {
+    ggml: Option<crate::GgmlGemmWorkspace>,
     row_segments: Vec<usize>,
     lt: CublasLt,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
     fp8_plans: HashMap<(usize, usize, usize), Fp8TnMatmulPlan>,
     fp8_input: DeviceBuffer<u8>,
+    fp8_parts: Option<Fp8Parts>,
     input: DeviceBuffer<u16>,
     products: DeviceBuffer<f32>,
     expanded_weight: DeviceBuffer<u16>,
     capacity: usize,
     features: usize,
+}
+
+struct Fp8Parts {
+    input: DeviceBuffer<u8>,
+    products: DeviceBuffer<f32>,
+    powers: DeviceBuffer<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +154,20 @@ enum DenseGemmWeights<'a> {
 }
 
 impl F32DenseGemm {
+    /// Reuses one activation workspace across packed dense and expert projections.
+    pub fn ggml_workspace(
+        &mut self,
+        rows: usize,
+        cols: usize,
+    ) -> Result<&mut crate::GgmlGemmWorkspace> {
+        if let Some(ws) = &mut self.ggml {
+            ws.reserve(rows, cols)?;
+        } else {
+            self.ggml = Some(crate::GgmlGemmWorkspace::new(rows, cols)?);
+        }
+        Ok(self.ggml.as_mut().unwrap())
+    }
+
     /// Allocates scratch for the largest input/output width and prompt chunk.
     /// Set max_quantized_elements to zero for BF16-only projections.
     pub fn new(capacity: usize, features: usize, max_quantized_elements: usize) -> Result<Self> {
@@ -147,11 +186,13 @@ impl F32DenseGemm {
             });
         }
         Ok(Self {
+            ggml: None,
             row_segments: Vec::new(),
             lt: CublasLt::new()?,
             plans: HashMap::new(),
             fp8_plans: HashMap::new(),
             fp8_input: DeviceBuffer::zeroed(count.unwrap() / 3)?,
+            fp8_parts: None,
             input: DeviceBuffer::zeroed(count.unwrap())?,
             products: DeviceBuffer::zeroed(count.unwrap())?,
             expanded_weight: DeviceBuffer::zeroed(max_quantized_elements)?,
@@ -174,6 +215,100 @@ impl F32DenseGemm {
         self.row_segments.clear();
         self.row_segments
             .extend(lengths.iter().map(|&n| n as usize));
+        Ok(())
+    }
+
+    /// Projects up to eight F32 rows as six scaled E4M3 residual components.
+    /// Plans and component scratch are prepared on the first call before graph capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_fp8_f32_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        mut output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        weight_scale: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > 8
+            || rows > self.capacity
+            || out == 0
+            || cols == 0
+            || out > self.features
+            || cols > self.features
+            || !out.is_multiple_of(16)
+            || !cols.is_multiple_of(16)
+            || input.len() < rows * cols
+            || output.len() < rows * out
+            || weight.len() != out * cols
+            || !weight_scale.is_finite()
+            || (!self.row_segments.is_empty() && self.row_segments.iter().sum::<usize>() != rows)
+        {
+            return Err(Error::Format {
+                label: "F32 FP8 component GEMM",
+                detail: "invalid dimensions, buffers, or row segments".into(),
+            });
+        }
+        if self.fp8_parts.is_none() {
+            let count = 6 * self.capacity.min(8) * self.features;
+            self.fp8_parts = Some(Fp8Parts {
+                input: DeviceBuffer::zeroed(count)?,
+                products: DeviceBuffer::zeroed(count)?,
+                powers: DeviceBuffer::zeroed(self.capacity.min(8))?,
+            });
+        }
+        let mut offset = 0;
+        for index in 0..self.row_segments.len().max(1) {
+            let count = self.row_segments.get(index).copied().unwrap_or(rows);
+            let key = (out, cols, 6 * count);
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.fp8_plans.entry(key) {
+                entry.insert(Fp8TnMatmulPlan::new(
+                    &self.lt,
+                    GemmShape::new(out, 6 * count, cols),
+                    4 << 20,
+                )?);
+            }
+            let parts = self.fp8_parts.as_mut().unwrap();
+            unsafe {
+                check_cuda(
+                    "infer_split_f32_fp8_parts_on_stream",
+                    infer_split_f32_fp8_parts_on_stream(
+                        input.ptr.add(offset * cols),
+                        parts.input.ptr,
+                        parts.powers.ptr,
+                        count as u32,
+                        cols as u32,
+                        stream.as_raw(),
+                    ),
+                )?;
+            }
+            self.fp8_plans[&key].run_with_alpha_on_stream(
+                &self.lt,
+                weight,
+                &parts.input,
+                parts.products.output(),
+                1.0,
+                stream,
+            )?;
+            unsafe {
+                check_cuda(
+                    "infer_sum_f32_fp8_parts_on_stream",
+                    infer_sum_f32_fp8_parts_on_stream(
+                        parts.products.ptr,
+                        parts.powers.ptr,
+                        output.buffer_mut().ptr.add(offset * out),
+                        count as u32,
+                        out as u32,
+                        weight_scale,
+                        stream.as_raw(),
+                    ),
+                )
+            }?;
+            offset += count;
+        }
         Ok(())
     }
 
@@ -574,6 +709,13 @@ impl F32DenseGemm {
     /// Returns scratch and cached plan workspace bytes on the device.
     pub fn device_bytes(&self) -> usize {
         self.input.device_bytes()
+            + self
+                .ggml
+                .as_ref()
+                .map_or(0, crate::GgmlGemmWorkspace::device_bytes)
+            + self.fp8_parts.as_ref().map_or(0, |p| {
+                p.input.device_bytes() + p.products.device_bytes() + p.powers.device_bytes()
+            })
             + self.fp8_input.device_bytes()
             + self
                 .fp8_plans

@@ -542,6 +542,26 @@ fn main() {
         .status()
         .expect("failed to run nvcc for LFM2 kernels");
     assert!(lfm2_status.success(), "nvcc failed to build LFM2 kernels");
+    let ggml_object = format!("{out_dir}/ggml_blocks.o");
+    let ggml_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/ggml_blocks.cu",
+            "-o",
+            &ggml_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for GGML block kernels");
+    assert!(
+        ggml_status.success(),
+        "nvcc failed to build GGML block kernels"
+    );
+    archive_objects.push(ggml_object.as_str());
     let lilicorr_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
         .args([
             "-std=c++17",
@@ -593,6 +613,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/ngram.cu");
     println!("cargo:rerun-if-changed=native/lfm2.cu");
+    println!("cargo:rerun-if-changed=native/ggml_blocks.cu");
     println!("cargo:rerun-if-changed=native/lilicorr.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/qwen38.cu");
