@@ -44,17 +44,105 @@ Lookup restores the longest retained prefix that matches the request.
 Restoration copies valid KV rows and convolution history into private request
 storage. LRU eviction enforces `--retained-prefix-gib`; zero disables retention.
 
+## Decisions
+
+`POST /v1/decisions` supports `noul`, `choice`, and `score` questions.
+Each request can contain 1–64 questions, with up to 64 labels per question.
+The service processes the shared state once and packs question suffixes into
+one pass through each layer. It projects only 64 selected rows from the tied BF16 output head.
+It produces no reasoning text or generated answer tokens.
+
+Dense projections and routed experts process the packed rows together.
+Convolution and attention process each segment with its own history and logical
+positions. Questions see the shared prefix and their own earlier tokens.
+All questions reuse one request-owned KV allocation, without prefix copies.
+This works with `--max-active-sequences 1`.
+
+If the token budget permits, the first pass includes the shared prefix.
+Longer prefixes use chunked prefill. Complete suffixes then run in waves bounded
+by `--decision-branch-capacity` and `--prefill-token-capacity`.
+Suffixes larger than the token budget use isolated chunks and restore convolution
+history between questions. Decision groups yield between passes for cancellation
+and other requests.
+
+The checkpoint template always opens `<think>`. The decision compiler closes
+this empty section before the answer-label prompt. Returned probabilities cover
+the supplied options. They remain uncalibrated unless an explicit, validated
+calibration profile is loaded for this deployment.
+
+Send a decision request:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "eider-lfm2.5-24b-a2b",
+    "state": "The parcel arrived yesterday. It contains a red book.",
+    "questions": {
+      "arrived": {
+        "type": "noul",
+        "instructions": "Has the parcel arrived?"
+      },
+      "colour": {
+        "type": "choice",
+        "instructions": "What colour is the book?",
+        "criteria": {"red": null, "blue": null}
+      }
+    }
+  }'
+```
+
+The full-checkpoint regression compares selected logits against the full head,
+isolated questions, and reversed question order. It also covers queued and
+active cancellation with one sequence slot.
+
+On GB10, packed execution reduced three-question HTTP latency from 417 ms to
+220 ms. Scaled FP16 expert components reduced it further to 193 ms. Each median
+covers five runs after one warm-up, with 379 logical input tokens and 1,024-token
+prefill capacity. The 64-question case fell from 5.65 seconds to 1.59 seconds,
+then 1.39 seconds, in single runs.
+
+Grouped and isolated questions produced identical answers and raw logits in
+these checks. Packed execution differed from ordinary full-head execution by
+at most `2.6e-5` logits, within the existing `2e-4` reference tolerance.
+The new expert kernel changed sampled label logits by at most `1.4e-5`.
+The packed three-question pass includes the prefix, so its server timing appears
+under `branches`. These measurements cover one factual prompt, not a task-quality
+evaluation.
+
+```sh
+checkpoint="$HOME/.cache/huggingface/hub/models--infinity-ai-institute--LFM2.5-24B-A2B-NVFP4/snapshots/2d61270a276c320af204143d3d73e524f9ef44d2"
+LFM2_MODEL_DIR="$checkpoint" cargo test --release -p eider-inference --lib \
+  lfm2_decisions_match_isolated_full_heads_and_cancel_cleanly -- \
+  --ignored --test-threads=1 --nocapture
+```
+
 ## Implementation boundary
 
 Prefill groups routes by expert and multiplies sixteen rows per tensor-core tile.
 The kernel reads the original NVFP4 weight and scale tables without expanding
 the resident weights. It applies each projection's global scale before SiLU.
-F32 activations are split into three BF16 components for tensor-core products.
-Separate accumulators limit rounding error. Asynchronous copies overlap compressed
-weight, scale, and activation loads with computation. Most dense BF16 projections
+Each routed input uses a power-of-two scale and two FP16 components.
+Matrix loads feed both components into separate tensor-core accumulators.
+The weights remain packed NVFP4; their finite scaled products are exact in FP16.
+The former three-component BF16 path remains the benchmark reference and K16-tail
+fallback. Asynchronous copies overlap weight, scale, and activation loads with
+computation. Most dense BF16 projections
 use cached cuBLASLt plans with three activation components. The two long dense
 FFN reductions retain the kernel with four high-component accumulators.
-Prefill scratch and route-sorting storage are reusable.
+Prefill scratch and route-sorting storage are reusable. The FP16 component
+buffers add about 32 MiB at 1,024-token capacity.
+
+At 1,516 routes, the focused projection benchmark measured gate/up at 0.933 ms
+versus 1.164 ms, and down at 0.919 ms versus 1.146 ms. These medians include
+route sorting and activation preparation. The request improvement is smaller because
+expert projections account for about 70% of the original decision GPU time.
+
+The checkpoint also supplies calibrated FP4 activation scales. The runtime still
+uses weight-only NVFP4. A calibrated W4A4 trial reached 149 ms on the same
+three-question request, but failed the selected-logit consistency check between
+packed and separate prefix/suffix execution. The maximum difference was 6.96.
+That trial is excluded from serving; the existing accuracy tolerance is unchanged.
 
 Head-64 prefill attention shares K/V tiles across 64 queries. Each warp computes
 eight queries and reuses its loads. Decode partitions KV rows across GPU blocks,

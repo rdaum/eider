@@ -17,8 +17,11 @@ use tracing::info;
 
 mod prefill;
 pub use prefill::Lfm2PrefillWorkspace;
+pub(crate) use prefill::Lfm2TreeWorkspace;
 mod prefix;
 pub(crate) use prefix::Lfm2PrefixCache;
+mod decision;
+pub(crate) use decision::{Lfm2DecisionReadout, Lfm2DecisionSequence};
 
 struct Bf16Linear {
     weight: DeviceBuffer<u16>,
@@ -370,6 +373,14 @@ impl Lfm2Model {
     }
 
     pub fn new_sequence(&self, capacity: usize) -> Result<Lfm2Sequence<'_>> {
+        self.new_sequence_with_readout(capacity, true)
+    }
+
+    fn new_sequence_with_readout(
+        &self,
+        capacity: usize,
+        full_readout: bool,
+    ) -> Result<Lfm2Sequence<'_>> {
         let c = &self.config;
         if capacity == 0 || capacity > c.max_position_embeddings {
             return Err(invalid("sequence capacity exceeds checkpoint context"));
@@ -394,7 +405,7 @@ impl Lfm2Model {
             token: DeviceBuffer::zeroed(1)?,
             device_position: DeviceBuffer::zeroed(1)?,
             cache_len: DeviceBuffer::zeroed(1)?,
-            split_attention: if c.head_dim() == 64 {
+            split_attention: if full_readout && c.head_dim() == 64 {
                 Some(Head64DecodeAttention::new(
                     capacity,
                     c.num_attention_heads,
@@ -431,7 +442,7 @@ impl Lfm2Model {
             expert_act: Slots::new(c.num_experts_per_tok, c.moe_intermediate_size)?,
             expert_down: Slots::new(c.num_experts_per_tok, h)?,
             unity: DeviceBuffer::from_host(&vec![1.0; c.num_experts])?,
-            logits: DeviceBuffer::zeroed(c.vocab_size)?,
+            logits: DeviceBuffer::zeroed(if full_readout { c.vocab_size } else { 0 })?,
             next_id: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
         })

@@ -786,6 +786,22 @@ unsafe extern "C" {
         in_features: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn infer_lfm2_expert_gemm_f16_parts_on_stream(
+        sorted_routes: *const u32,
+        offsets: *const u32,
+        inputs: *const *const f32,
+        prepared: *mut u16,
+        input_powers: *mut f32,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        globals: *const f32,
+        outputs: *const *mut f32,
+        routes: u32,
+        experts: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Groups sixteen routes per tensor-core tile, retaining F32 activation precision.
@@ -885,6 +901,85 @@ pub fn lfm2_expert_gemm_pipelined_into_on_stream(
                 routes.sorted_routes().as_const_ptr().cast(),
                 routes.expert_offsets().as_const_ptr().cast(),
                 inputs.ptr.cast(),
+                weights.ptr.cast(),
+                scales.ptr.cast(),
+                globals.ptr,
+                outputs.ptr.cast(),
+                routes.active_routes() as u32,
+                experts as u32,
+                out_features as u32,
+                in_features as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Projects F32 activations through two scaled FP16 components and separate
+/// accumulators. Scratch needs two elements per active input element and one
+/// power-of-two scale per route. K16 tails retain the BF16 decomposition kernel.
+/// Weight and address tables follow `lfm2_expert_gemm_pipelined_into_on_stream`.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm2_expert_gemm_f16_parts_into_on_stream(
+    routes: &MoeSortedRoutes,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    prepared: &mut DeviceBuffer<u16>,
+    input_powers: &mut DeviceBuffer<f32>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    scales: &DeviceBuffer<DeviceAddress<u8>>,
+    globals: &DeviceBuffer<f32>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let experts = weights.len();
+    if experts == 0
+        || experts > 1024
+        || scales.len() != experts
+        || globals.len() != experts
+        || routes.expert_offsets().len() != experts + 1
+        || inputs.len() < routes.active_routes()
+        || outputs.len() < routes.active_routes()
+        || out_features == 0
+        || out_features > u32::MAX as usize - 63
+        || routes
+            .active_routes()
+            .checked_mul(in_features)
+            .and_then(|n| n.checked_mul(2))
+            .is_none_or(|n| n > prepared.len())
+        || input_powers.len() < routes.active_routes()
+        || in_features == 0
+        || in_features > u32::MAX as usize
+        || !in_features.is_multiple_of(16)
+    {
+        return Err(Error::Format {
+            label: "LFM2 grouped expert GEMM",
+            detail: "expected matching route and expert tables, positive dimensions and K divisible by 16".into(),
+        });
+    }
+    if !in_features.is_multiple_of(64) {
+        return lfm2_expert_gemm_pipelined_into_on_stream(
+            routes,
+            inputs,
+            weights,
+            scales,
+            globals,
+            outputs,
+            out_features,
+            in_features,
+            stream,
+        );
+    }
+    unsafe {
+        check_cuda(
+            "infer_lfm2_expert_gemm_f16_parts_on_stream",
+            infer_lfm2_expert_gemm_f16_parts_on_stream(
+                routes.sorted_routes().as_const_ptr().cast(),
+                routes.expert_offsets().as_const_ptr().cast(),
+                inputs.ptr.cast(),
+                prepared.ptr,
+                input_powers.ptr,
                 weights.ptr.cast(),
                 scales.ptr.cast(),
                 globals.ptr,
@@ -1071,52 +1166,74 @@ mod tests {
             let weights = DeviceBuffer::from_host(&[weight.cuda_address()]).unwrap();
             let scale_table = DeviceBuffer::from_host(&[scale.cuda_address()]).unwrap();
             let global = DeviceBuffer::from_host(&[1.0f32]).unwrap();
+            let mut prepared = DeviceBuffer::zeroed(cols * 2).unwrap();
+            let mut powers = DeviceBuffer::zeroed(1).unwrap();
             let indices = DeviceBuffer::from_host(&[0u32]).unwrap();
             let mut routes = MoeSortedRoutes::new(1, 1).unwrap();
             routes.sort_on_stream(&indices, &stream).unwrap();
             let output = DeviceBuffer::<f32>::zeroed(rows).unwrap();
             let outputs = DeviceBuffer::from_host(&[output.cuda_address()]).unwrap();
             let values = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-            for nibble in 0..2 {
-                let mut input = vec![0.0f32; cols];
-                input[nibble] = 1.0;
-                let input = DeviceBuffer::from_host(&input).unwrap();
-                let inputs = DeviceBuffer::from_host(&[input.cuda_address()]).unwrap();
-                for kernel in [
-                    lfm2_expert_gemm_into_on_stream,
-                    lfm2_expert_gemm_pipelined_into_on_stream,
-                ] {
-                    kernel(
-                        &routes,
-                        &inputs,
-                        &weights,
-                        &scale_table,
-                        &global,
-                        &outputs,
-                        rows,
-                        cols,
-                        &stream,
-                    )
-                    .unwrap();
-                    let actual = output.copy_to_host(&stream).unwrap();
-                    for (row, &value) in actual.iter().enumerate() {
-                        let code = (row % 256) >> (nibble * 4) & 15;
-                        let scale = (row / 256).min(126);
-                        let exponent = (scale >> 3) as i32;
-                        let mantissa = (scale & 7) as f32;
-                        let scale = if exponent == 0 {
-                            mantissa * 2.0f32.powi(-9)
+            for magnitude in [0.0, 1.0, 2.0f32.powi(80), 2.0f32.powi(-80)] {
+                for nibble in 0..2 {
+                    let mut input = vec![0.0f32; cols];
+                    input[nibble] = magnitude;
+                    let input = DeviceBuffer::from_host(&input).unwrap();
+                    let inputs = DeviceBuffer::from_host(&[input.cuda_address()]).unwrap();
+                    for mode in 0..3 {
+                        if mode == 2 {
+                            lfm2_expert_gemm_f16_parts_into_on_stream(
+                                &routes,
+                                &inputs,
+                                &mut prepared,
+                                &mut powers,
+                                &weights,
+                                &scale_table,
+                                &global,
+                                &outputs,
+                                rows,
+                                cols,
+                                &stream,
+                            )
+                            .unwrap();
                         } else {
-                            (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
-                        };
-                        let sign = if code & 8 == 0 { 1.0 } else { -1.0 };
-                        assert_eq!(
-                            value,
-                            sign * values[code & 7] * scale,
-                            "packed byte {}, scale {}, nibble {nibble}",
-                            row % 256,
-                            row / 256
-                        );
+                            let kernel = [
+                                lfm2_expert_gemm_into_on_stream,
+                                lfm2_expert_gemm_pipelined_into_on_stream,
+                            ][mode];
+                            kernel(
+                                &routes,
+                                &inputs,
+                                &weights,
+                                &scale_table,
+                                &global,
+                                &outputs,
+                                rows,
+                                cols,
+                                &stream,
+                            )
+                            .unwrap();
+                        }
+                        let actual = output.copy_to_host(&stream).unwrap();
+                        for (row, &value) in actual.iter().enumerate() {
+                            let code = (row % 256) >> (nibble * 4) & 15;
+                            let scale = (row / 256).min(126);
+                            let exponent = (scale >> 3) as i32;
+                            let mantissa = (scale & 7) as f32;
+                            let scale = if exponent == 0 {
+                                mantissa * 2.0f32.powi(-9)
+                            } else {
+                                (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+                            };
+                            let sign = if code & 8 == 0 { 1.0 } else { -1.0 };
+                            assert_eq!(
+                                value,
+                                sign * values[code & 7] * scale * magnitude,
+                                "packed byte {}, scale {}, nibble {nibble}",
+                                row % 256,
+                                row / 256
+                            );
+                        }
                     }
                 }
             }

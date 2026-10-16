@@ -4,6 +4,9 @@ This analysis uses the pinned ModelOpt NVFP4 checkpoint from [the model guide](l
 It covers one active request on GB10, with F32 activations and KV storage.
 Expert weights retain their original NVFP4 representation. Other matrices retain BF16 weights.
 
+These profiles predate the scaled FP16 expert projection used by the decision path.
+The [model guide](lfm2.md#implementation-boundary) describes that change and its request timings.
+
 ## Hardware ceilings
 
 NVIDIA specifies 273 GB/s memory bandwidth, 128 GB unified memory, and 6,144 CUDA cores.
@@ -25,7 +28,7 @@ NVIDIA's [RTX Blackwell architecture paper](https://images.nvidia.com/aem-dam/So
 gives a ratio of eight between dense FP4 and BF16 tensor throughput with F32 accumulation.
 Applying that ratio to Spark's advertised sparse FP4 peak gives an estimated 62.5 TFLOP/s BF16 ceiling.
 This is an architectural estimate, not a separately published GB10 BF16 specification.
-The current projections use three BF16 products per F32 activation, so their arithmetic cost is roughly three times one BF16 multiplication.
+The profiled projections use three BF16 products per F32 activation, so their arithmetic cost is roughly three times one BF16 multiplication.
 
 ## Decode traffic
 
@@ -153,7 +156,7 @@ conversion, normalization, and attention consume time beyond the counted matrix 
 
 These changes preserve F32 activations and KV storage. Native W4A4 tensor execution would introduce
 activation quantization and require a separate quality comparison. Spark's sparse FP4 headline
-cannot be used as the performance ceiling for the current three-component BF16 implementation.
+cannot be used as the performance ceiling for the profiled three-component BF16 implementation.
 
 ## Remaining GPU costs
 

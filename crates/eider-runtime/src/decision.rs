@@ -310,6 +310,11 @@ impl DecisionPromptCompiler {
                 })?);
             }
             suffix.push_str(ending);
+            // Some reasoning-only templates ignore enable_thinking=false.
+            // Read answer labels after an empty reasoning section, not inside it.
+            if ending.trim_end().ends_with("<think>") {
+                suffix.push_str("</think>\n");
+            }
             suffix.push_str("Answer:\n");
             let suffix_tokens = encode(&self.template, &suffix, "decision suffix")?;
             branches.push(DecisionBranch {
@@ -865,6 +870,38 @@ mod tests {
         assert!((*score - 1.0).abs() < 1e-6);
         assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!((0.0..=1.0).contains(concentration));
+    }
+
+    #[test]
+    #[ignore = "requires LFM2_MODEL_DIR; CPU tokenizer/template check only"]
+    fn lfm2_decision_labels_follow_closed_reasoning() {
+        let root = std::env::var("LFM2_MODEL_DIR").expect("LFM2_MODEL_DIR");
+        let template = CheckpointChatTemplate::from_model_dir(root).unwrap();
+        let compiler = DecisionPromptCompiler::new(template).unwrap();
+        assert_eq!(compiler.labels().len(), 64);
+        let request = compiler
+            .prepare(DecisionPromptRequest {
+                state: json!("The shipment arrived."),
+                questions: vec![(
+                    "arrived".into(),
+                    DecisionPromptQuestion::Noul {
+                        instructions: json!("Has the shipment arrived?"),
+                        true_description: "Yes".into(),
+                        false_description: "No".into(),
+                    },
+                )],
+            })
+            .unwrap();
+        let suffix = compiler
+            .template
+            .tokenizer()
+            .decode(&request.branches[0].suffix_tokens, false)
+            .unwrap();
+        assert!(
+            suffix.ends_with("<|im_start|>assistant\n<think></think>\nAnswer:\n"),
+            "{suffix}"
+        );
+        assert!(!suffix.contains("<think>Answer:"));
     }
 
     #[test]

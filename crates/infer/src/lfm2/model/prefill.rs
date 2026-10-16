@@ -4,21 +4,38 @@ use super::*;
 use eider_cuda::{
     CudaEvent, F32DenseGemm, MoeSortedRoutes, PinnedHostBuffer, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, lfm2_dense_gemm_into_on_stream,
-    lfm2_expert_gemm_pipelined_into_on_stream, lfm2_router_batch_into_on_stream,
+    lfm2_expert_gemm_f16_parts_into_on_stream, lfm2_router_batch_into_on_stream,
     lfm2_short_conv_batch_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream,
     rope_neox_sequence_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
 };
+use std::ops::Range;
+
+/// Reusable staging for isolated mixers inside a packed decision pass. Dense
+/// projections and routed experts operate on all rows together.
+pub(crate) struct Lfm2TreeWorkspace {
+    pub(super) tokens: Vec<u32>,
+    pub(super) segments: Vec<Range<usize>>,
+    pub(super) prefix_rows: usize,
+    bcx: DeviceBuffer<f32>,
+    convolution: DeviceBuffer<f32>,
+    mixed: DeviceBuffer<f32>,
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    rope_query: DeviceBuffer<f32>,
+    rope_key: DeviceBuffer<f32>,
+}
 
 pub struct Lfm2PrefillWorkspace<'model> {
-    model: &'model Lfm2Model,
-    capacity: usize,
+    pub(super) model: &'model Lfm2Model,
+    pub(super) capacity: usize,
     dense_gemm: F32DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
     upload_done: CudaEvent,
     upload_pending: bool,
-    hidden: DeviceBuffer<f32>,
+    pub(super) hidden: DeviceBuffer<f32>,
     residual: DeviceBuffer<f32>,
     normalized: DeviceBuffer<f32>,
     mixed: DeviceBuffer<f32>,
@@ -39,6 +56,8 @@ pub struct Lfm2PrefillWorkspace<'model> {
     sorted_routes: MoeSortedRoutes,
     route_weights: DeviceBuffer<f32>,
     expert_inputs: DeviceBuffer<DeviceAddress<f32>>,
+    expert_parts: DeviceBuffer<u16>,
+    expert_powers: DeviceBuffer<f32>,
     expert_gate: Slots,
     expert_up: Slots,
     expert_act: Slots,
@@ -85,11 +104,15 @@ impl ExpertProjection {
         routes: &MoeSortedRoutes,
         inputs: &DeviceBuffer<DeviceAddress<f32>>,
         outputs: &DeviceBuffer<DeviceAddress<f32>>,
+        prepared: &mut DeviceBuffer<u16>,
+        powers: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        lfm2_expert_gemm_pipelined_into_on_stream(
+        lfm2_expert_gemm_f16_parts_into_on_stream(
             routes,
             inputs,
+            prepared,
+            powers,
             &self.weights,
             &self.scales,
             &self.global,
@@ -102,6 +125,24 @@ impl ExpertProjection {
 }
 
 impl Lfm2Model {
+    pub(crate) fn new_tree_workspace(&self, capacity: usize) -> Result<Lfm2TreeWorkspace> {
+        let h = self.config.hidden_size;
+        let kv = self.config.num_key_value_heads * self.config.head_dim();
+        Ok(Lfm2TreeWorkspace {
+            tokens: Vec::with_capacity(capacity),
+            segments: Vec::with_capacity(65),
+            prefix_rows: 0,
+            bcx: DeviceBuffer::zeroed(capacity * 3 * h)?,
+            convolution: DeviceBuffer::zeroed(h * (self.config.conv_width - 1))?,
+            mixed: DeviceBuffer::zeroed(capacity * h)?,
+            query: DeviceBuffer::zeroed(capacity * h)?,
+            key: DeviceBuffer::zeroed(capacity * kv)?,
+            value: DeviceBuffer::zeroed(capacity * kv)?,
+            rope_query: DeviceBuffer::zeroed(capacity * h)?,
+            rope_key: DeviceBuffer::zeroed(capacity * kv)?,
+        })
+    }
+
     pub fn new_prefill_workspace(&self, capacity: usize) -> Result<Lfm2PrefillWorkspace<'_>> {
         let c = &self.config;
         if capacity == 0 || capacity > c.max_position_embeddings || capacity > 65535 {
@@ -145,6 +186,8 @@ impl Lfm2Model {
             sorted_routes: MoeSortedRoutes::new(routes, c.num_experts)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
             expert_inputs,
+            expert_parts: DeviceBuffer::zeroed(routes * h.max(c.moe_intermediate_size) * 2)?,
+            expert_powers: DeviceBuffer::zeroed(routes)?,
             expert_gate: Slots::new(routes, c.moe_intermediate_size)?,
             expert_up: Slots::new(routes, c.moe_intermediate_size)?,
             expert_act: Slots::new(routes, c.moe_intermediate_size)?,
@@ -160,6 +203,16 @@ impl Lfm2Model {
         s: &mut Lfm2Sequence,
         tokens: &[u32],
     ) -> Result<()> {
+        self.prefill_with_readout(w, s, tokens, true)
+    }
+
+    pub(super) fn prefill_with_readout(
+        &self,
+        w: &mut Lfm2PrefillWorkspace,
+        s: &mut Lfm2Sequence,
+        tokens: &[u32],
+        full_readout: bool,
+    ) -> Result<()> {
         let rows = tokens.len();
         if !std::ptr::eq(self, w.model)
             || !std::ptr::eq(self, s.model)
@@ -172,20 +225,26 @@ impl Lfm2Model {
             return Err(invalid("invalid prefill model, state, tokens or capacity"));
         }
         if rows == 1 {
-            return self.decode(s, tokens[0]);
+            return if full_readout {
+                self.decode(s, tokens[0])
+            } else {
+                self.forward(s, tokens[0], false)
+            };
         }
         s.valid = false;
-        self.prefill_inner(w, s, tokens)?;
+        self.prefill_inner(w, s, tokens, full_readout, None)?;
         s.position += rows;
         s.valid = true;
         Ok(())
     }
 
-    fn prefill_inner(
+    pub(super) fn prefill_inner(
         &self,
         w: &mut Lfm2PrefillWorkspace,
         s: &mut Lfm2Sequence,
         tokens: &[u32],
+        full_readout: bool,
+        mut tree: Option<&mut Lfm2TreeWorkspace>,
     ) -> Result<()> {
         let c = &self.config;
         let stream = &self.stream;
@@ -228,16 +287,55 @@ impl Lfm2Model {
                     LayerState::Conv(state),
                 ) => {
                     input.run_rows(&w.normalized, &mut w.bcx, rows, stream, &mut w.dense_gemm)?;
-                    lfm2_short_conv_batch_into_on_stream(
-                        &w.bcx,
-                        weight,
-                        state.inout(),
-                        w.mixed.output(),
-                        h,
-                        c.conv_width,
-                        rows,
-                        stream,
-                    )?;
+                    if let Some(tree) = tree.as_deref_mut() {
+                        for (segment, range) in tree.segments.iter().enumerate() {
+                            tree.bcx.copy_range_from_device_on_stream(
+                                0,
+                                &w.bcx,
+                                range.start * 3 * h,
+                                range.len() * 3 * h,
+                                stream,
+                            )?;
+                            let history = if tree.prefix_rows != 0 && segment == 0 {
+                                &mut *state
+                            } else {
+                                tree.convolution.copy_prefix_from_device_on_stream(
+                                    state,
+                                    state.len(),
+                                    stream,
+                                )?;
+                                &mut tree.convolution
+                            };
+                            lfm2_short_conv_batch_into_on_stream(
+                                &tree.bcx,
+                                weight,
+                                history.inout(),
+                                tree.mixed.output(),
+                                h,
+                                c.conv_width,
+                                range.len(),
+                                stream,
+                            )?;
+                            w.mixed.copy_range_from_device_on_stream(
+                                range.start * h,
+                                &tree.mixed,
+                                0,
+                                range.len() * h,
+                                stream,
+                            )?;
+                        }
+                    } else {
+                        lfm2_short_conv_batch_into_on_stream(
+                            &w.bcx,
+                            weight,
+                            state.inout(),
+                            w.mixed.output(),
+                            h,
+                            c.conv_width,
+                            rows,
+                            stream,
+                        )?;
+                    }
                     output.run_rows(&w.mixed, &mut w.projected, rows, stream, &mut w.dense_gemm)?;
                 }
                 (
@@ -272,35 +370,113 @@ impl Lfm2Model {
                         c.norm_eps,
                         stream,
                     )?;
-                    rope_neox_sequence_f32_into_on_stream(
-                        rows,
-                        c.num_attention_heads,
-                        c.head_dim(),
-                        &w.q_norm,
-                        w.q_rope.output(),
-                        s.position,
-                        c.rope_parameters.rope_theta,
-                        stream,
-                    )?;
-                    rope_neox_sequence_f32_into_on_stream(
-                        rows,
-                        c.num_key_value_heads,
-                        c.head_dim(),
-                        &w.k_norm,
-                        w.k_rope.output(),
-                        s.position,
-                        c.rope_parameters.rope_theta,
-                        stream,
-                    )?;
-                    cache.append_prefix_on_stream(&w.k_rope, &w.v, rows, stream)?;
-                    cache.prefill_attention_into_on_stream(
-                        &w.q_rope,
-                        w.mixed.output(),
-                        rows,
-                        s.position,
-                        c.num_attention_heads,
-                        stream,
-                    )?;
+                    if let Some(tree) = tree.as_deref_mut() {
+                        let kv = c.num_key_value_heads * c.head_dim();
+                        let prefix_position = s.position + tree.prefix_rows;
+                        for (segment, range) in tree.segments.iter().enumerate() {
+                            let is_prefix = tree.prefix_rows != 0 && segment == 0;
+                            let position = if is_prefix {
+                                s.position
+                            } else {
+                                prefix_position
+                            };
+                            tree.query.copy_range_from_device_on_stream(
+                                0,
+                                &w.q_norm,
+                                range.start * h,
+                                range.len() * h,
+                                stream,
+                            )?;
+                            tree.key.copy_range_from_device_on_stream(
+                                0,
+                                &w.k_norm,
+                                range.start * kv,
+                                range.len() * kv,
+                                stream,
+                            )?;
+                            tree.value.copy_range_from_device_on_stream(
+                                0,
+                                &w.v,
+                                range.start * kv,
+                                range.len() * kv,
+                                stream,
+                            )?;
+                            rope_neox_sequence_f32_into_on_stream(
+                                range.len(),
+                                c.num_attention_heads,
+                                c.head_dim(),
+                                &tree.query,
+                                tree.rope_query.output(),
+                                position,
+                                c.rope_parameters.rope_theta,
+                                stream,
+                            )?;
+                            rope_neox_sequence_f32_into_on_stream(
+                                range.len(),
+                                c.num_key_value_heads,
+                                c.head_dim(),
+                                &tree.key,
+                                tree.rope_key.output(),
+                                position,
+                                c.rope_parameters.rope_theta,
+                                stream,
+                            )?;
+                            cache.append_prefix_on_stream(
+                                &tree.rope_key,
+                                &tree.value,
+                                range.len(),
+                                stream,
+                            )?;
+                            cache.prefill_attention_into_on_stream(
+                                &tree.rope_query,
+                                tree.mixed.output(),
+                                range.len(),
+                                position,
+                                c.num_attention_heads,
+                                stream,
+                            )?;
+                            w.mixed.copy_range_from_device_on_stream(
+                                range.start * h,
+                                &tree.mixed,
+                                0,
+                                range.len() * h,
+                                stream,
+                            )?;
+                            if !is_prefix {
+                                cache.truncate_len(prefix_position)?;
+                            }
+                        }
+                    } else {
+                        rope_neox_sequence_f32_into_on_stream(
+                            rows,
+                            c.num_attention_heads,
+                            c.head_dim(),
+                            &w.q_norm,
+                            w.q_rope.output(),
+                            s.position,
+                            c.rope_parameters.rope_theta,
+                            stream,
+                        )?;
+                        rope_neox_sequence_f32_into_on_stream(
+                            rows,
+                            c.num_key_value_heads,
+                            c.head_dim(),
+                            &w.k_norm,
+                            w.k_rope.output(),
+                            s.position,
+                            c.rope_parameters.rope_theta,
+                            stream,
+                        )?;
+                        cache.append_prefix_on_stream(&w.k_rope, &w.v, rows, stream)?;
+                        cache.prefill_attention_into_on_stream(
+                            &w.q_rope,
+                            w.mixed.output(),
+                            rows,
+                            s.position,
+                            c.num_attention_heads,
+                            stream,
+                        )?;
+                    }
                     output.run_rows(&w.mixed, &mut w.projected, rows, stream, &mut w.dense_gemm)?;
                 }
                 _ => return Err(invalid("mismatched prefill state")),
@@ -378,12 +554,16 @@ impl Lfm2Model {
                         &w.sorted_routes,
                         &w.expert_inputs,
                         &w.expert_gate.addresses,
+                        &mut w.expert_parts,
+                        &mut w.expert_powers,
                         stream,
                     )?;
                     moe.up.run_rows(
                         &w.sorted_routes,
                         &w.expert_inputs,
                         &w.expert_up.addresses,
+                        &mut w.expert_parts,
+                        &mut w.expert_powers,
                         stream,
                     )?;
                     silu_mul_f32_prefix_into_on_stream(
@@ -397,6 +577,8 @@ impl Lfm2Model {
                         &w.sorted_routes,
                         &w.expert_act.addresses,
                         &w.expert_down.addresses,
+                        &mut w.expert_parts,
+                        &mut w.expert_powers,
                         stream,
                     )?;
                     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
@@ -420,8 +602,14 @@ impl Lfm2Model {
                 stream,
             )?;
         }
+        if tree.is_some() {
+            return Ok(());
+        }
         s.hidden
             .copy_range_from_device_on_stream(0, &w.hidden, (rows - 1) * h, h, stream)?;
+        if !full_readout {
+            return Ok(());
+        }
         rms_norm_f32_into_on_stream(
             1,
             h,

@@ -1,14 +1,19 @@
 //! Decode-first LFM2 serving with request-owned convolution and KV state.
 
-use crate::lfm2::{Lfm2Model, Lfm2PrefillWorkspace, Lfm2PrefixCache, Lfm2Sequence};
+use crate::lfm2::{
+    Lfm2DecisionReadout, Lfm2Model, Lfm2PrefillWorkspace, Lfm2PrefixCache, Lfm2Sequence,
+    Lfm2TreeWorkspace,
+};
 use eider_cuda::{Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::decision::{DecisionRequest, validated_decision_labels};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
-    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineCapabilities,
+    EngineDecisionAdmission, EngineDecisionFailed, EngineDelta, EngineError, EngineFinished,
+    EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult, EngineService,
+    EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -16,6 +21,9 @@ use eider_runtime::scheduler::{RequestConfig, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
+
+mod decision;
+use decision::DecisionGroup;
 
 struct Request<'m, 'a> {
     prompt: Vec<u32>,
@@ -39,6 +47,10 @@ pub(crate) struct Lfm2ChatService<'m, 't> {
     next_id: u64,
     waiting: VecDeque<EngineRequestId>,
     requests: BTreeMap<EngineRequestId, Request<'m, 't>>,
+    decision_readout: Lfm2DecisionReadout,
+    decision_tree: Lfm2TreeWorkspace,
+    decisions: BTreeMap<EngineRequestId, DecisionGroup<'m>>,
+    decision_ready: VecDeque<EngineRequestId>,
 }
 
 impl<'m, 't> Lfm2ChatService<'m, 't> {
@@ -52,6 +64,11 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
         if config.max_context_tokens > model.config().max_position_embeddings {
             return Err(error("scheduler context exceeds checkpoint context"));
         }
+        let labels = validated_decision_labels(template.tokenizer())
+            .map_err(|err| error(err.to_string()))?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
         Ok(Self {
             model,
             template,
@@ -61,6 +78,10 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
+            decision_readout: model.new_decision_readout(&labels)?,
+            decision_tree: model.new_tree_workspace(config.prefill_token_capacity)?,
+            decisions: BTreeMap::new(),
+            decision_ready: VecDeque::new(),
         })
     }
 
@@ -133,6 +154,19 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
             let Some(&id) = self.waiting.front() else {
                 break;
             };
+            if self.decisions.contains_key(&id) {
+                self.waiting.pop_front();
+                if let Err(err) = self.admit_decision_sequence(id) {
+                    self.model.synchronize()?;
+                    self.decisions.remove(&id);
+                    tick.decisions_failed.push(EngineDecisionFailed {
+                        request_id: id,
+                        message: err.to_string(),
+                        released_sequence_device_bytes: 0,
+                    });
+                }
+                continue;
+            }
             let r = self.requests.get_mut(&id).expect("queued request");
             let allocation = Instant::now();
             let mut sequence = self
@@ -239,6 +273,7 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
                 prompt_position: end,
             });
         }
+        self.run_decisions(&mut tick, &mut token_budget, &mut sequence_budget)?;
         // Finish queued work before any request state can be dropped or cancelled.
         self.model.synchronize()?;
         for (id, mut reason) in done {
@@ -275,6 +310,14 @@ impl<'m, 't> Lfm2ChatService<'m, 't> {
 }
 
 impl EngineService for Lfm2ChatService<'_, '_> {
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities { decisions: true }
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        self.queue_decision(request).map_err(EngineError::new)
+    }
+
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
         self.add(request).map_err(EngineError::new)
     }
@@ -285,6 +328,13 @@ impl EngineService for Lfm2ChatService<'_, '_> {
         self.run_tick(lifecycle).map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        if let Some(group) = self.decisions.remove(&id) {
+            self.waiting.retain(|&waiting| waiting != id);
+            self.decision_ready.retain(|&ready| ready != id);
+            return EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes: group.device_bytes(),
+            };
+        }
         let Some(r) = self.requests.remove(&id) else {
             return EngineCancelOutcome::NotFound;
         };
@@ -301,6 +351,11 @@ impl EngineService for Lfm2ChatService<'_, '_> {
             .values()
             .filter(|r| r.sequence.is_some())
             .count()
+            + self
+                .decisions
+                .values()
+                .filter(|group| group.sequence.is_some())
+                .count()
     }
 }
 

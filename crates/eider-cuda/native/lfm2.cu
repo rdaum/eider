@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 __global__ void lfm2_split_bf16(const float* input, __nv_bfloat16* parts,
                                uint32_t count, uint32_t stride) {
@@ -370,9 +371,31 @@ __device__ __forceinline__ void lfm2_async4(void* destination, const void* sourc
     unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(destination));
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(address), "l"(source), "r"(valid ? 4 : 0) : "memory");
 }
+// Every finite E2M1-by-UE4M3 weight product is exactly representable in FP16.
+__device__ __forceinline__ uint32_t lfm2_half_weight_pair(uint8_t packed, uint16_t sf) {
+    unsigned pair;
+    asm("{ .reg .b8 code; cvt.u8.u32 code,%1; cvt.rn.f16x2.e2m1x2 %0,code; }"
+        : "=r"(pair) : "r"(unsigned(packed)));
+    const float scale = __uint_as_float(unsigned(sf) << 16);
+    const unsigned half = __half_as_ushort(__float2half_rn(scale));
+    const unsigned halves = half | (half << 16);
+    unsigned result;
+    asm("mul.f16x2 %0,%1,%2;" : "=r"(result) : "r"(pair), "r"(halves));
+    return result;
+}
+__device__ __forceinline__ void lfm2_half_mma(
+    float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+template <bool Prepared>
 __device__ __forceinline__ void lfm2_stage_expert(
-    uint8_t* destination_weight, uint32_t* destination_scale, float* destination_input,
-    const uint8_t* weight, const uint8_t* scale, const float* const* source,
+    uint8_t* destination_weight, uint32_t* destination_scale,
+    std::conditional_t<Prepared, uint16_t, float>* destination_input,
+    const uint8_t* weight, const uint8_t* scale,
+    const std::conditional_t<Prepared, uint16_t, float>* const* source,
     unsigned first_row, unsigned out_features, unsigned in_features, unsigned k) {
     unsigned row = threadIdx.x / 2, half = threadIdx.x & 1;
     bool valid = first_row + row < out_features;
@@ -384,25 +407,39 @@ __device__ __forceinline__ void lfm2_stage_expert(
         const uint8_t* s = scale + (valid ? size_t(first_row + row) * (in_features / 16) : 0) + k / 16;
         lfm2_async4(destination_scale + row, s, valid);
     }
-    for (unsigned i = threadIdx.x; i < 16 * 16; i += 128) {
-        row = i / 16;
-        const unsigned col = (i % 16) * 4;
-        const float* x = source[row] ? source[row] : source[0];
-        lfm2_async16(destination_input + row * 72 + col, x + k + col, source[row] != nullptr);
+    if constexpr (Prepared) {
+        for (unsigned i = threadIdx.x; i < 2 * 16 * 8; i += 128) {
+            const unsigned component = i / (16 * 8);
+            row = (i / 8) % 16;
+            const unsigned col = (i % 8) * 8;
+            const uint16_t* x = source[row] ? source[row] : source[0];
+            lfm2_async16(destination_input + (component * 16 + row) * 72 + col,
+                x + component * in_features + k + col, source[row] != nullptr);
+        }
+    } else {
+        for (unsigned i = threadIdx.x; i < 16 * 16; i += 128) {
+            row = i / 16;
+            const unsigned col = (i % 16) * 4;
+            const float* x = source[row] ? source[row] : source[0];
+            lfm2_async16(destination_input + row * 72 + col, x + k + col, source[row] != nullptr);
+        }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
+template <bool Prepared>
 __global__ void lfm2_expert_gemm_pipeline(
     const uint32_t* sorted_routes, const uint32_t* offsets,
-    const float* const* inputs, const uint8_t* const* weights,
+    const float* const* inputs, const uint16_t* prepared, const float* input_powers,
+    const uint8_t* const* weights,
     const uint8_t* const* scales, const float* globals, float* const* outputs,
     unsigned experts, unsigned out_features, unsigned in_features) {
     __shared__ unsigned expert, begin, end;
     __shared__ __align__(16) uint8_t packed[2][64][48];
     __shared__ uint32_t scale_tile[2][64];
-    __shared__ __align__(16) float input_tile[2][16][72];
-    __shared__ const float* source[16];
+    __shared__ __align__(16) std::conditional_t<Prepared, uint16_t, float>
+        input_tile[2][Prepared ? 2 : 1][16][72];
+    __shared__ const std::conditional_t<Prepared, uint16_t, float>* source[16];
     if (threadIdx.x == 0) {
         unsigned tile = blockIdx.y;
         expert = experts;
@@ -418,23 +455,27 @@ __global__ void lfm2_expert_gemm_pipeline(
     }
     __syncthreads();
     if (expert == experts) return;
-    if (threadIdx.x < 16) source[threadIdx.x] = begin + threadIdx.x < end
-        ? inputs[sorted_routes[begin + threadIdx.x]] : nullptr;
+    if (threadIdx.x < 16) {
+        if (begin + threadIdx.x >= end) source[threadIdx.x] = nullptr;
+        else if constexpr (Prepared) source[threadIdx.x] = prepared
+            + size_t(sorted_routes[begin + threadIdx.x]) * 2 * in_features;
+        else source[threadIdx.x] = inputs[sorted_routes[begin + threadIdx.x]];
+    }
     __syncthreads();
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const unsigned row0 = warp * 16 + (lane >> 2), row1 = row0 + 8;
     const unsigned pair = (lane & 3) * 2, input_row = lane >> 2;
     const uint8_t* weight = weights[expert];
     const uint8_t* scale = scales[expert];
-    lfm2_stage_expert(&packed[0][0][0], &scale_tile[0][0], &input_tile[0][0][0],
+    lfm2_stage_expert<Prepared>(&packed[0][0][0], &scale_tile[0][0], &input_tile[0][0][0][0],
         weight, scale, source, blockIdx.x * 64, out_features, in_features, 0);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     float hi[2][4][4] = {}, mid[2][4] = {}, low[2][4] = {};
     // Copy the next compressed tile while tensor cores consume this stage.
     for (unsigned base = 0, stage = 0; base < in_features; base += 64, stage ^= 1) {
-        if (base + 64 < in_features) lfm2_stage_expert(
-            &packed[stage ^ 1][0][0], &scale_tile[stage ^ 1][0], &input_tile[stage ^ 1][0][0],
+        if (base + 64 < in_features) lfm2_stage_expert<Prepared>(
+            &packed[stage ^ 1][0][0], &scale_tile[stage ^ 1][0], &input_tile[stage ^ 1][0][0][0],
             weight, scale, source, blockIdx.x * 64, out_features, in_features, base + 64);
         #pragma unroll
         for (unsigned p = 0; p < 4; ++p) {
@@ -443,27 +484,48 @@ __global__ void lfm2_expert_gemm_pipeline(
             const uint16_t s0 = lfm2_scale_bf16(uint8_t(scale_tile[stage][row0] >> (p * 8)));
             const uint16_t s1 = lfm2_scale_bf16(uint8_t(scale_tile[stage][row1] >> (p * 8)));
             const unsigned shift = (lane & 3) * 8;
-            const uint32_t a0 = lfm2_weight_pair(uint8_t(w0.x >> shift), s0);
-            const uint32_t a1 = lfm2_weight_pair(uint8_t(w1.x >> shift), s1);
-            const uint32_t a2 = lfm2_weight_pair(uint8_t(w0.y >> shift), s0);
-            const uint32_t a3 = lfm2_weight_pair(uint8_t(w1.y >> shift), s1);
-            #pragma unroll
-            for (unsigned n = 0; n < 2; ++n) {
-                const float* x = &input_tile[stage][input_row + n * 8][p * 16 + pair];
-                const float2 v0 = *reinterpret_cast<const float2*>(x);
-                const float2 v1 = *reinterpret_cast<const float2*>(x + 8);
-                float v[4] = {v0.x, v0.y, v1.x, v1.y};
-                float high[4], middle[4], tail[4];
+            const uint32_t a0 = Prepared ? lfm2_half_weight_pair(uint8_t(w0.x >> shift), s0)
+                : lfm2_weight_pair(uint8_t(w0.x >> shift), s0);
+            const uint32_t a1 = Prepared ? lfm2_half_weight_pair(uint8_t(w1.x >> shift), s1)
+                : lfm2_weight_pair(uint8_t(w1.x >> shift), s1);
+            const uint32_t a2 = Prepared ? lfm2_half_weight_pair(uint8_t(w0.y >> shift), s0)
+                : lfm2_weight_pair(uint8_t(w0.y >> shift), s0);
+            const uint32_t a3 = Prepared ? lfm2_half_weight_pair(uint8_t(w1.y >> shift), s1)
+                : lfm2_weight_pair(uint8_t(w1.y >> shift), s1);
+            if constexpr (Prepared) {
+                uint32_t parts[2][4];
                 #pragma unroll
-                for (unsigned i = 0; i < 4; ++i) {
-                    high[i] = __bfloat162float(__float2bfloat16_rn(v[i]));
-                    const float residual = v[i] - high[i];
-                    middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
-                    tail[i] = residual - middle[i];
+                for (unsigned component = 0; component < 2; ++component) {
+                    const uint16_t* ptr = &input_tile[stage][component]
+                        [(lane & 7) + (lane / 16) * 8][p * 16 + ((lane / 8) & 1) * 8];
+                    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(parts[component][0]), "=r"(parts[component][1]), "=r"(parts[component][2]), "=r"(parts[component][3]) : "r"(address));
                 }
-                lfm2_mma(hi[n][p], a0, a1, a2, a3, lfm2_pair(high[0], high[1]), lfm2_pair(high[2], high[3]));
-                lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
-                lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+                #pragma unroll
+                for (unsigned n = 0; n < 2; ++n) {
+                    lfm2_half_mma(hi[n][p], a0, a1, a2, a3, parts[0][2 * n], parts[0][2 * n + 1]);
+                    lfm2_half_mma(mid[n], a0, a1, a2, a3, parts[1][2 * n], parts[1][2 * n + 1]);
+                }
+            } else {
+                #pragma unroll
+                for (unsigned n = 0; n < 2; ++n) {
+                    const float* x = &input_tile[stage][0][input_row + n * 8][p * 16 + pair];
+                    const float2 v0 = *reinterpret_cast<const float2*>(x);
+                    const float2 v1 = *reinterpret_cast<const float2*>(x + 8);
+                    float v[4] = {v0.x, v0.y, v1.x, v1.y};
+                    float high[4], middle[4], tail[4];
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; ++i) {
+                        high[i] = __bfloat162float(__float2bfloat16_rn(v[i]));
+                        const float residual = v[i] - high[i];
+                        middle[i] = __bfloat162float(__float2bfloat16_rn(residual));
+                        tail[i] = residual - middle[i];
+                    }
+                    lfm2_mma(hi[n][p], a0, a1, a2, a3, lfm2_pair(high[0], high[1]), lfm2_pair(high[2], high[3]));
+                    lfm2_mma(mid[n], a0, a1, a2, a3, lfm2_pair(middle[0], middle[1]), lfm2_pair(middle[2], middle[3]));
+                    lfm2_mma(low[n], a0, a1, a2, a3, lfm2_pair(tail[0], tail[1]), lfm2_pair(tail[2], tail[3]));
+                }
             }
         }
         asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -478,7 +540,9 @@ __global__ void lfm2_expert_gemm_pipeline(
             const unsigned row = blockIdx.x * 64 + (i < 2 ? row0 : row1);
             if (route < end && row < out_features) {
                 const float high = (hi[n][0][i] + hi[n][1][i]) + (hi[n][2][i] + hi[n][3][i]);
-                outputs[sorted_routes[route]][row] = (high + (mid[n][i] + low[n][i])) * global;
+                if constexpr (Prepared) outputs[sorted_routes[route]][row] =
+                    ((high + mid[n][i]) * input_powers[sorted_routes[route]]) * global;
+                else outputs[sorted_routes[route]][row] = (high + (mid[n][i] + low[n][i])) * global;
             }
         }
     }
@@ -495,12 +559,61 @@ extern "C" cudaError_t infer_lfm2_expert_gemm_pipelined_on_stream(
         || in_features % 16 != 0) return cudaErrorInvalidValue;
     const dim3 grid((out_features + 63) / 64, (routes + 15) / 16 + experts - 1);
     if (in_features % 64 == 0) {
-        lfm2_expert_gemm_pipeline<<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
+        lfm2_expert_gemm_pipeline<false><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs, nullptr, nullptr,
             weights, scales, globals, outputs, experts, out_features, in_features);
     } else {
         lfm2_gemm<true, 2><<<grid, 128, 0, stream>>>(sorted_routes, offsets, inputs,
             weights, scales, globals, outputs, experts, out_features, in_features, nullptr, nullptr, nullptr, 0, nullptr, 1.0f, nullptr);
     }
+    return cudaGetLastError();
+}
+
+// Power-of-two scaling keeps the leading component near 32 and its residual
+// in FP16 range. Separate accumulators retain the low component through GEMM.
+__global__ void lfm2_prepare_expert_inputs(
+    const float* const* inputs, uint16_t* output, float* power, unsigned k) {
+    const unsigned row = blockIdx.x;
+    __shared__ float maxima[8];
+    float maximum = 0;
+    for (unsigned col = threadIdx.x; col < k; col += 256)
+        maximum = fmaxf(maximum, fabsf(inputs[row][col]));
+    for (unsigned offset = 16; offset; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    if ((threadIdx.x & 31) == 0) maxima[threadIdx.x / 32] = maximum;
+    __syncthreads();
+    maximum = 0;
+    #pragma unroll
+    for (unsigned warp = 0; warp < 8; ++warp) maximum = fmaxf(maximum, maxima[warp]);
+    int exponent;
+    frexpf(maximum, &exponent);
+    const float scale = maximum > 0 ? ldexpf(1.0f, max(-126, exponent - 6)) : 1.0f;
+    if (threadIdx.x == 0) power[row] = scale;
+    for (unsigned col = threadIdx.x; col < k; col += 256) {
+        const float x = inputs[row][col] / scale;
+        const __half high = __float2half_rn(x);
+        const __half low = __float2half_rn(x - __half2float(high));
+        output[(size_t(row) * 2) * k + col] = __half_as_ushort(high);
+        output[(size_t(row) * 2 + 1) * k + col] = __half_as_ushort(low);
+    }
+}
+
+extern "C" cudaError_t infer_lfm2_expert_gemm_f16_parts_on_stream(
+    const uint32_t* sorted_routes, const uint32_t* offsets,
+    const float* const* inputs, uint16_t* prepared, float* input_powers,
+    const uint8_t* const* weights,
+    const uint8_t* const* scales, const float* globals, float* const* outputs,
+    unsigned routes, unsigned experts, unsigned out_features, unsigned in_features,
+    cudaStream_t stream) {
+    if (!sorted_routes || !offsets || !inputs || !prepared || !input_powers || !weights || !scales || !globals
+        || !outputs || routes == 0 || experts == 0 || out_features == 0 || in_features == 0
+        || in_features % 64 != 0) return cudaErrorInvalidValue;
+    lfm2_prepare_expert_inputs<<<routes, 256, 0, stream>>>(
+        inputs, prepared, input_powers, in_features);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    const dim3 grid((out_features + 63) / 64, (routes + 15) / 16 + experts - 1);
+    lfm2_expert_gemm_pipeline<true><<<grid, 128, 0, stream>>>(sorted_routes, offsets, nullptr,
+        prepared, input_powers, weights, scales, globals, outputs, experts, out_features, in_features);
     return cudaGetLastError();
 }
 
