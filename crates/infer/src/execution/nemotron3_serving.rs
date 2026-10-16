@@ -12,10 +12,12 @@ use eider_cuda::{DeviceBuffer, Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::decision::{DecisionRequest, validated_decision_labels};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
-    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick, EngineVerificationProgress,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineCapabilities,
+    EngineDecisionAdmission, EngineDelta, EngineError, EngineFinished, EngineLifecycleEvent,
+    EnginePrefillProgress, EngineRequestId, EngineResult, EngineService, EngineTick,
+    EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -25,6 +27,10 @@ use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+mod decision;
+use crate::nemotron3::Nemotron3DecisionReadout;
+use decision::DecisionGroup;
 
 /// Stable request identity assigned by a Nemotron 3 chat service.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -124,6 +130,10 @@ pub(crate) struct Nemotron3ChatService<'model, 'template> {
     lilicorr_verification: BTreeMap<usize, Nemotron3BlockWorkspace>,
     prefill_workspaces: BTreeMap<(usize, usize, usize, usize), Nemotron3PrefillWorkspace>,
     speculative_workspaces: BTreeMap<usize, Nemotron3SpeculativeCycleWorkspace>,
+    decision_readout: Nemotron3DecisionReadout,
+    decisions: BTreeMap<Nemotron3RequestId, DecisionGroup>,
+    decision_ready: VecDeque<Nemotron3RequestId>,
+    decision_workspaces: BTreeMap<Vec<usize>, Nemotron3BlockWorkspace>,
 }
 
 impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
@@ -147,6 +157,11 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             (cache_config.max_retained_bytes != 0).then_some(cache_config.max_retained_bytes),
         )?;
         let retain_prefixes = cache_config.max_retained_bytes != 0;
+        let labels = validated_decision_labels(template.tokenizer())
+            .map_err(|err| decision::error(err.to_string()))?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
         Ok(Self {
             model,
             template,
@@ -169,6 +184,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             lilicorr_verification: BTreeMap::new(),
             prefill_workspaces: BTreeMap::new(),
             speculative_workspaces: BTreeMap::new(),
+            decision_readout: model.new_decision_readout(&labels)?,
+            decisions: BTreeMap::new(),
+            decision_ready: VecDeque::new(),
+            decision_workspaces: BTreeMap::new(),
         })
     }
 
@@ -321,7 +340,16 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .map(|(&id, _)| id)
             .take(self.config.prefill_sequence_capacity)
             .collect::<Vec<_>>();
+        let before_prefill = prefill_ids
+            .iter()
+            .map(|id| self.requests[id].prompt_position)
+            .sum::<usize>();
         self.prefill_blocks(&prefill_ids, &mut tick, on_lifecycle)?;
+        let chat_rows = prefill_ids
+            .iter()
+            .map(|id| self.requests[id].prompt_position)
+            .sum::<usize>()
+            - before_prefill;
 
         for (&id, request) in &self.requests {
             if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
@@ -331,11 +359,23 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
+        self.run_decisions(&mut tick, chat_rows, prefill_ids.len())?;
         Ok(tick)
     }
 
     /// Cancels a waiting or active request.
     fn cancel_request(&mut self, id: Nemotron3RequestId) -> Nemotron3CancelOutcome {
+        if let Some(mut group) = self.decisions.remove(&id) {
+            self.waiting.retain(|&waiting| waiting != id);
+            self.decision_ready.retain(|&ready| ready != id);
+            let bytes = group.device_bytes();
+            if let Err(error) = group.release(self.model) {
+                warn!(%error, "failed to release cancelled Nemotron decision");
+            }
+            return Nemotron3CancelOutcome::Cancelled {
+                released_sequence_device_bytes: bytes,
+            };
+        }
         let Some(request) = self.requests.remove(&id) else {
             return Nemotron3CancelOutcome::NotFound;
         };
@@ -355,23 +395,41 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         }
     }
 
-    /// Returns the number of requests currently owning device sequence state.
+    /// Returns all live chat, decision-parent, and decision-branch sequences.
     fn active_sequence_count(&self) -> usize {
         self.sequences.len()
+            + self
+                .decisions
+                .values()
+                .map(DecisionGroup::sequence_count)
+                .sum::<usize>()
+    }
+
+    fn admitted_request_count(&self) -> usize {
+        self.sequences.len()
+            + self
+                .decisions
+                .values()
+                .filter(|group| group.active())
+                .count()
     }
 
     fn admit(
         &mut self,
-        _tick: &mut EngineTick,
+        tick: &mut EngineTick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.sequences.len() < self.config.max_active_sequences {
+        while self.admitted_request_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
+            if self.decisions.contains_key(&id) {
+                self.admit_decision(id, tick)?;
+                continue;
+            }
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
             let prefix = self.sequence_cache.lookup_prefix(&request.prompt);
@@ -907,6 +965,14 @@ fn prefill_rows_before_retained_prefix(
 }
 
 impl EngineService for Nemotron3ChatService<'_, '_> {
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities { decisions: true }
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        self.queue_decision(request).map_err(EngineError::new)
+    }
+
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
         let admission =
             Nemotron3ChatService::add_request(self, request).map_err(EngineError::new)?;

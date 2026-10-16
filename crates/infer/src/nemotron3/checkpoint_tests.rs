@@ -381,6 +381,102 @@ fn variable_expert_routers_match_cpu_reference_for_decode_and_prefill() {
     );
 }
 
+#[test]
+fn decisions_fork_recurrent_state_and_unaligned_kv_with_compact_readout() {
+    use super::{Nemotron3Bf16Storage, Nemotron3Sequence, Nemotron3StorageConfig};
+    for (wrapped, storage) in [
+        (false, Nemotron3StorageConfig::default()),
+        (true, Nemotron3StorageConfig::default()),
+        (
+            false,
+            Nemotron3StorageConfig {
+                bf16: Nemotron3Bf16Storage::Nvfp4,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let fixture = Fixture::new(wrapped, 4);
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join("config.json")).unwrap()).unwrap();
+        let text = if wrapped {
+            &mut config["llm_config"]
+        } else {
+            &mut config
+        };
+        text["mamba_ssm_cache_dtype"] = json!("float32");
+        fs::write(fixture.root.join("config.json"), config.to_string()).unwrap();
+        let model = Nemotron3Model::load_with_storage(&fixture.root, storage).unwrap();
+        let labels = (0..64).map(|i| 127 - i * 2).collect::<Vec<_>>();
+        let mut head = model.new_decision_readout(&labels).unwrap();
+        let mut cache = super::new_nemotron3_decision_cache(&model, 4, 64).unwrap();
+        let mut parent = model.decision_sequence(&mut cache, 64, None).unwrap();
+        let prefix = vec![13, 7, 23, 51, 11];
+        let suffixes: [&[u32]; 2] = [&[9; 19], &[3]];
+        let mut prefix_ws = model.decision_workspace(1, prefix.len()).unwrap();
+        model
+            .forward_block(&mut [&mut parent], &[&prefix], &mut prefix_ws, &mut cache)
+            .unwrap();
+        let mut ws = model.decision_workspace(2, 20).unwrap();
+        for order in [[0, 1], [1, 0], [0, 1]] {
+            let mut children = (0..2)
+                .map(|_| {
+                    model
+                        .decision_sequence(&mut cache, 64, Some(&parent))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let chunks = order.map(|i| suffixes[i]);
+            model
+                .forward_block(
+                    &mut children.iter_mut().collect::<Vec<_>>(),
+                    &chunks,
+                    &mut ws,
+                    &mut cache,
+                )
+                .unwrap();
+            for (child, suffix) in children.into_iter().zip(chunks) {
+                let actual = head.selected_logits(&model, &child).unwrap();
+                let mut reference_cache =
+                    super::new_nemotron3_sequence_cache(&model, 1, 64).unwrap();
+                let mut reference =
+                    Nemotron3Sequence::admit(&model, &mut reference_cache, 64).unwrap();
+                let mut ref_prefix = model.prefill_workspace(1, prefix.len()).unwrap();
+                let mut ref_suffix = model.prefill_workspace(1, suffix.len()).unwrap();
+                model
+                    .forward_block(
+                        &mut [&mut reference],
+                        &[&prefix],
+                        &mut ref_prefix,
+                        &mut reference_cache,
+                    )
+                    .unwrap();
+                model
+                    .forward_block(
+                        &mut [&mut reference],
+                        &[suffix],
+                        &mut ref_suffix,
+                        &mut reference_cache,
+                    )
+                    .unwrap();
+                let expected = model.logits_to_host(&reference).unwrap();
+                for (&id, &a) in labels.iter().zip(&actual) {
+                    let b = expected[id as usize];
+                    assert!(
+                        a.is_finite() && (a - b).abs() < 1e-4 + b.abs() * 1e-5,
+                        "{a} vs {b}"
+                    );
+                }
+                child.finish(&model, &mut cache).unwrap();
+                reference.finish(&model, &mut reference_cache).unwrap();
+            }
+            assert_eq!(parent.position(), prefix.len());
+            cache.validate().unwrap();
+        }
+        parent.finish(&model, &mut cache).unwrap();
+        cache.validate().unwrap();
+    }
+}
+
 /// Small, real safetensors checkpoint. Counts deliberately differ from the global maximum.
 struct Fixture {
     root: PathBuf,

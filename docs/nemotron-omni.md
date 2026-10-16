@@ -231,3 +231,54 @@ launcher. See [LiLiCorr configuration, validation, and measurements](nemotron-li
 Vision and video execution remain unimplemented. The upstream work includes a
 RADIO encoder, a projector, position-table interpolation, and a separate temporal
 patch projection. Eider currently serves only text.
+
+## Decisions
+
+The text runtime serves `/v1/decisions` with the same question types and limits as
+Gemma and LFM. Each request processes its shared prefix once. Question branches
+share complete KV pages and copy the partial tail. Each branch owns its Mamba
+convolution and selective state, with the checkpoint's original precision.
+
+Suffix batches share expert execution. Dense projections retain each question's
+matrix shape because different reduction orders can cross FP8/FP4 quantization
+boundaries. A packed dense trial changed selected logits by up to 1.21 on the
+three-question check. That trial is excluded. Short suffix chunks run separately
+to preserve their kernel choices. Reusable CUDA graphs cover the non-attention
+layers, and the service retains at most four workspace shapes.
+
+A compact head reads the 64 answer labels from the final hidden state. Decisions
+allocate no MTP or LiLiCorr sequence state and generate no reasoning or answer
+tokens. They share admission, cancellation, and prefill limits with chat requests.
+A group holds one admission slot; `--decision-branch-capacity` bounds its internal
+branches. Probabilities remain uncalibrated unless a decision calibration profile is loaded.
+
+Start the server and run the question sweep:
+
+```sh
+EIDER_LILICORR=0 scripts/run-eider-nemotron35.sh
+scripts/questions.sh 8 eider-nemotron3.5-super
+```
+
+The normal launcher also supports decisions with LiLiCorr loaded for chat.
+Decision requests do not execute the drafter.
+
+On GB10, the three-question HTTP check took 1,043 ms median versus 2,316 ms for
+three separate requests. The median covers five runs after one warm-up. The
+request had 384 logical input tokens, including a 239-token shared prefix.
+A separate 64-question request took 8,945 ms with 2,927 logical input tokens.
+
+These runs used the launcher's BF16/FP8 dense storage, NVFP4 experts, and a loaded
+LiLiCorr companion. Prefill capacity was 1,024 tokens, branch capacity was eight,
+and admission capacity was one. Prompt retention was disabled. The complete-model
+check reported zero selected-logit error against isolated decisions and full-head
+readout. These checks cover one factual prompt, not general decision quality.
+
+The focused checkpoint test compares grouped, isolated, and full-head logits.
+It also covers reversed question order and cancellation with one admission slot.
+
+```sh
+checkpoint="$HOME/.cache/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/snapshots/7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c"
+NEMOTRON_MODEL_DIR="$checkpoint" cargo test --release -p eider-inference --lib \
+  nemotron_decisions_match_isolated_full_heads_and_cancel_cleanly -- \
+  --ignored --test-threads=1 --nocapture
+```

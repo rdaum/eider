@@ -3,11 +3,9 @@
 use super::*;
 use crate::lfm2::Lfm2DecisionSequence;
 use eider_runtime::decision::{
-    DECISION_PROMPT_FORMAT, DecisionBranchLogits, DecisionCompletion, DecisionTimings,
-    DecisionUsage, MAX_DECISION_ANSWERS, MAX_DECISION_QUESTIONS, answers_from_logits,
+    DecisionBranchLogits, DecisionCompletion, DecisionTimings, DecisionUsage, answers_from_logits,
 };
 use eider_runtime::engine::EngineDecisionFinished;
-use std::collections::BTreeSet;
 
 pub(super) struct DecisionGroup<'m> {
     request: DecisionRequest,
@@ -239,61 +237,17 @@ fn validate_request(
     vocab: usize,
     context: usize,
 ) -> Result<()> {
-    if request.prompt_format != DECISION_PROMPT_FORMAT {
-        return Err(error("unsupported decision prompt format"));
-    }
-    if request.label_token_ids != labels {
-        return Err(error("decision labels differ from the loaded label head"));
-    }
-    if request.prefix_tokens.is_empty()
-        || request
-            .prefix_tokens
-            .iter()
-            .any(|&token| token as usize >= vocab)
-        || !(1..=MAX_DECISION_QUESTIONS).contains(&request.branches.len())
-    {
-        return Err(error(
-            "decision requires a valid prefix and 1..=64 questions",
-        ));
-    }
-    let mut ids = BTreeSet::new();
-    for branch in &request.branches {
-        if branch.question_id.is_empty() || !ids.insert(&branch.question_id) {
-            return Err(error(
-                "decision question IDs must be non-empty and distinct",
-            ));
-        }
-        let count = branch.label_token_ids.len();
-        if !(2..=MAX_DECISION_ANSWERS).contains(&count)
-            || count > labels.len()
-            || branch.label_token_ids != labels[..count]
-            || branch.option_keys != branch.question.option_keys()
-            || branch.option_keys.len() != count
-        {
-            return Err(error("decision options must match the fixed label prefix"));
-        }
-        if branch.suffix_tokens.is_empty()
-            || branch
-                .suffix_tokens
-                .iter()
-                .any(|&token| token as usize >= vocab)
-            || request
-                .prefix_tokens
-                .len()
-                .checked_add(branch.suffix_tokens.len())
-                .is_none_or(|n| n > context)
-        {
-            return Err(error("invalid decision suffix tokens or context capacity"));
-        }
-    }
-    Ok(())
+    request
+        .validate(labels, vocab, context)
+        .map_err(|err| error(err.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use eider_runtime::decision::{
-        DecisionBranch, DecisionPromptCompiler, DecisionPromptQuestion, DecisionPromptRequest,
+        DECISION_PROMPT_FORMAT, DecisionBranch, DecisionPromptCompiler, DecisionPromptQuestion,
+        DecisionPromptRequest,
     };
     use serde_json::json;
 

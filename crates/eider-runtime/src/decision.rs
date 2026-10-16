@@ -132,6 +132,71 @@ pub struct DecisionRequest {
 }
 
 impl DecisionRequest {
+    /// Checks a compiled request against the loaded label head and context bounds.
+    pub fn validate(
+        &self,
+        labels: &[u32],
+        vocab: usize,
+        context: usize,
+    ) -> Result<(), DecisionPromptError> {
+        if self.prompt_format != DECISION_PROMPT_FORMAT {
+            return Err(DecisionPromptError::new(
+                "unsupported decision prompt format",
+            ));
+        }
+        if self.label_token_ids != labels {
+            return Err(DecisionPromptError::new(
+                "decision labels differ from the loaded label head",
+            ));
+        }
+        if self.prefix_tokens.is_empty()
+            || self
+                .prefix_tokens
+                .iter()
+                .any(|&token| token as usize >= vocab)
+            || !(1..=MAX_DECISION_QUESTIONS).contains(&self.branches.len())
+        {
+            return Err(DecisionPromptError::new(
+                "decision requires a valid prefix and 1..=64 questions",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for branch in &self.branches {
+            if branch.question_id.is_empty() || !ids.insert(&branch.question_id) {
+                return Err(DecisionPromptError::new(
+                    "decision question IDs must be non-empty and distinct",
+                ));
+            }
+            let count = branch.label_token_ids.len();
+            if !(2..=MAX_DECISION_ANSWERS).contains(&count)
+                || count > labels.len()
+                || branch.label_token_ids != labels[..count]
+                || branch.option_keys != branch.question.option_keys()
+                || branch.option_keys.len() != count
+            {
+                return Err(DecisionPromptError::new(
+                    "decision options must match the fixed label prefix",
+                ));
+            }
+            if branch.suffix_tokens.is_empty()
+                || branch
+                    .suffix_tokens
+                    .iter()
+                    .any(|&token| token as usize >= vocab)
+                || self
+                    .prefix_tokens
+                    .len()
+                    .checked_add(branch.suffix_tokens.len())
+                    .is_none_or(|n| n > context)
+            {
+                return Err(DecisionPromptError::new(
+                    "invalid decision suffix tokens or context capacity",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns logical input tokens with the shared prefix counted once.
     pub fn logical_input_tokens(&self) -> usize {
         self.prefix_tokens.len()

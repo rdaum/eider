@@ -233,6 +233,55 @@ impl Nemotron3Linear {
         }
     }
 
+    /// Copies selected output channels without changing their stored precision or scales.
+    pub(super) fn select_rows(&self, ids: &[u32], stream: &CudaStream) -> Result<Self> {
+        fn gather<T: eider_cuda::DeviceRepr>(
+            source: &DeviceBuffer<T>,
+            width: usize,
+            ids: &[u32],
+            stream: &CudaStream,
+        ) -> Result<DeviceBuffer<T>> {
+            let mut selected = DeviceBuffer::zeroed(ids.len() * width)?;
+            for (row, &id) in ids.iter().enumerate() {
+                selected.copy_range_from_device_on_stream(
+                    row * width,
+                    source,
+                    id as usize * width,
+                    width,
+                    stream,
+                )?;
+            }
+            Ok(selected)
+        }
+        Ok(match self {
+            Self::Bf16(w) => Self::Bf16(Nemotron3Bf16Linear {
+                weight: gather(&w.weight, w.cols, ids, stream)?,
+                rows: ids.len(),
+                cols: w.cols,
+            }),
+            Self::Fp8(w) => Self::Fp8(Nemotron3Fp8Linear {
+                weight: gather(&w.weight, w.cols, ids, stream)?,
+                channel_weight_scale: w
+                    .channel_weight_scale
+                    .as_ref()
+                    .map(|s| gather(s, 1, ids, stream))
+                    .transpose()?,
+                rows: ids.len(),
+                cols: w.cols,
+                weight_scale: w.weight_scale,
+                input_scale: w.input_scale,
+            }),
+            Self::Nvfp4(w) => Self::Nvfp4(Nemotron3Nvfp4Linear {
+                packed_weight: gather(&w.packed_weight, w.cols / 2, ids, stream)?,
+                weight_scale: gather(&w.weight_scale, w.cols / 16, ids, stream)?,
+                prepared_rows: None,
+                rows: ids.len(),
+                cols: w.cols,
+                weight_scale_2: w.weight_scale_2,
+            }),
+        })
+    }
+
     pub(super) fn dense_workspace<'a>(
         rows: usize,
         weights: impl Iterator<Item = &'a Self>,

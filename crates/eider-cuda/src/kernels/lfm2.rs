@@ -110,6 +110,7 @@ pub fn quantized_dense_gemm_f32_into_on_stream(
 
 /// Reusable projections from F32 rows, with BF16 decomposition or calibrated FP8 activations.
 pub struct F32DenseGemm {
+    row_segments: Vec<usize>,
     lt: CublasLt,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
     fp8_plans: HashMap<(usize, usize, usize), Fp8TnMatmulPlan>,
@@ -121,6 +122,7 @@ pub struct F32DenseGemm {
     features: usize,
 }
 
+#[derive(Clone, Copy)]
 enum DenseGemmWeights<'a> {
     Bf16(&'a DeviceBuffer<u16>),
     Quantized(&'a DeviceBuffer<u8>),
@@ -145,6 +147,7 @@ impl F32DenseGemm {
             });
         }
         Ok(Self {
+            row_segments: Vec::new(),
             lt: CublasLt::new()?,
             plans: HashMap::new(),
             fp8_plans: HashMap::new(),
@@ -157,6 +160,23 @@ impl F32DenseGemm {
         })
     }
 
+    /// Preserves each sequence's reduction shape before activation quantization.
+    /// An empty slice treats all rows as one matrix.
+    pub fn set_row_segments(&mut self, lengths: &[u32]) -> Result<()> {
+        if lengths.contains(&0)
+            || lengths.iter().map(|&n| n as usize).sum::<usize>() > self.capacity
+        {
+            return Err(Error::Format {
+                label: "dense GEMM row segments",
+                detail: "invalid row lengths or capacity".into(),
+            });
+        }
+        self.row_segments.clear();
+        self.row_segments
+            .extend(lengths.iter().map(|&n| n as usize));
+        Ok(())
+    }
+
     /// Uses a checkpoint's calibrated FP8 activation scale and resident FP8 weights.
     /// Plans use the exact row count; callers retain one workspace per batch shape.
     #[allow(clippy::too_many_arguments)]
@@ -164,7 +184,7 @@ impl F32DenseGemm {
         &mut self,
         input: &DeviceBuffer<f32>,
         weight: &DeviceBuffer<u8>,
-        output: DeviceOutput<'_, f32>,
+        mut output: DeviceOutput<'_, f32>,
         rows: usize,
         out: usize,
         cols: usize,
@@ -190,40 +210,68 @@ impl F32DenseGemm {
                 detail: "invalid shape, buffers, or scales".into(),
             });
         }
-        let key = (out, cols, rows);
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.fp8_plans.entry(key) {
-            entry.insert(Fp8TnMatmulPlan::new(
+        if !self.row_segments.is_empty() && self.row_segments.iter().sum::<usize>() != rows {
+            return Err(Error::Format {
+                label: "dense GEMM row segments",
+                detail: "row count differs from configured segments".into(),
+            });
+        }
+        let mut offset = 0;
+        for index in 0..self.row_segments.len().max(1) {
+            let count = self.row_segments.get(index).copied().unwrap_or(rows);
+            let key = (out, cols, count);
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.fp8_plans.entry(key) {
+                entry.insert(Fp8TnMatmulPlan::new(
+                    &self.lt,
+                    GemmShape {
+                        m: out,
+                        n: count,
+                        k: cols,
+                    },
+                    if count < 8 { 4 << 20 } else { 1 << 20 },
+                )?);
+            }
+            unsafe {
+                check_cuda(
+                    "infer_quantize_fp8_e4m3_f32_on_stream",
+                    crate::ffi::infer_quantize_fp8_e4m3_f32_on_stream(
+                        input.ptr.add(offset * cols),
+                        self.fp8_input.ptr,
+                        (count * cols) as u32,
+                        input_scale,
+                        stream.as_raw(),
+                    ),
+                )?;
+            }
+            if count == rows {
+                self.fp8_plans[&key].run_with_alpha_on_stream(
+                    &self.lt,
+                    weight,
+                    &self.fp8_input,
+                    output,
+                    weight_scale * input_scale,
+                    stream,
+                )?;
+                return Ok(());
+            }
+            self.fp8_plans[&key].run_with_alpha_on_stream(
                 &self.lt,
-                GemmShape {
-                    m: out,
-                    n: rows,
-                    k: cols,
-                },
-                // A larger allowance improves skinny FP8 plan selection on GB10,
-                // even when the selected plan needs no workspace.
-                if rows < 8 { 4 << 20 } else { 1 << 20 },
-            )?);
-        }
-        unsafe {
-            check_cuda(
-                "infer_quantize_fp8_e4m3_f32_on_stream",
-                crate::ffi::infer_quantize_fp8_e4m3_f32_on_stream(
-                    input.ptr,
-                    self.fp8_input.ptr,
-                    (rows * cols) as u32,
-                    input_scale,
-                    stream.as_raw(),
-                ),
+                weight,
+                &self.fp8_input,
+                self.products.output(),
+                weight_scale * input_scale,
+                stream,
             )?;
+            output.buffer_mut().copy_range_from_device_on_stream(
+                offset * out,
+                &self.products,
+                0,
+                count * out,
+                stream,
+            )?;
+            offset += count;
         }
-        self.fp8_plans[&key].run_with_alpha_on_stream(
-            &self.lt,
-            weight,
-            &self.fp8_input,
-            output,
-            weight_scale * input_scale,
-            stream,
-        )
+        Ok(())
     }
 
     /// Projects active rows, preserving F32 activation residuals in three products.
@@ -397,6 +445,63 @@ impl F32DenseGemm {
                 detail: "invalid projection dimensions or buffers".into(),
             });
         }
+        let mut offset = 0;
+        if self.row_segments.is_empty() {
+            return self.run_segment(
+                input,
+                weight,
+                block_scales,
+                channel_scales,
+                global_scale,
+                output,
+                rows,
+                out,
+                cols,
+                0,
+                stream,
+            );
+        }
+        if self.row_segments.iter().sum::<usize>() != rows {
+            return Err(Error::Format {
+                label: "dense GEMM row segments",
+                detail: "row count differs from configured segments".into(),
+            });
+        }
+        for index in 0..self.row_segments.len() {
+            let count = self.row_segments[index];
+            self.run_segment(
+                input,
+                weight,
+                block_scales,
+                channel_scales,
+                global_scale,
+                output.buffer_mut().output(),
+                count,
+                out,
+                cols,
+                offset,
+                stream,
+            )?;
+            offset += count;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_segment(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        weight: DenseGemmWeights<'_>,
+        block_scales: Option<&DeviceBuffer<u8>>,
+        channel_scales: Option<&DeviceBuffer<f32>>,
+        global_scale: f32,
+        mut output: DeviceOutput<'_, f32>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
         // Power-of-two row buckets bound the plan cache across prompt lengths.
         let padded_rows = rows.next_power_of_two();
         let shape = (out, cols, padded_rows);
@@ -416,7 +521,7 @@ impl F32DenseGemm {
             check_cuda(
                 "infer_lfm2_split_bf16_on_stream",
                 infer_lfm2_split_bf16_on_stream(
-                    input.ptr,
+                    input.ptr.add(offset * cols),
                     self.input.ptr,
                     (rows * cols) as u32,
                     (padded_rows * cols) as u32,
@@ -455,7 +560,7 @@ impl F32DenseGemm {
                 "infer_lfm2_sum_parts_on_stream",
                 infer_lfm2_sum_parts_on_stream(
                     self.products.ptr,
-                    output.buffer_mut().ptr,
+                    output.buffer_mut().ptr.add(offset * out),
                     (rows * out) as u32,
                     (padded_rows * out) as u32,
                     channel_scales.map_or(std::ptr::null(), |s| s.ptr),
@@ -1147,6 +1252,107 @@ impl Head64DecodeAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn segmented_dense_rows_match_independent_bf16_and_calibrated_fp8() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let (cols, out, rows) = (4096, 512, 145);
+        let input_host = (0..rows * cols)
+            .map(|i| ((i * 31 % 1009) as f32 / 137.137).sin())
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input_host).unwrap();
+        let bf16 = DeviceBuffer::from_host(
+            &(0..out * cols)
+                .map(|i| ((((i * 71 % 1021) as f32 - 510.) / 1024.).to_bits() >> 16) as u16)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let fp8 = DeviceBuffer::from_host(
+            &(0..out * cols)
+                .map(|i| ((i * 31 % 96) | ((i % 3 == 0) as usize * 128)) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut packed = F32DenseGemm::new(rows, cols, 0).unwrap();
+        let mut actual = DeviceBuffer::zeroed(rows * out).unwrap();
+        for lengths in [[41, 42, 62], [62, 42, 41]] {
+            packed.set_row_segments(&lengths).unwrap();
+            for calibrated in [false, true] {
+                if calibrated {
+                    packed
+                        .run_calibrated_fp8_on_stream(
+                            &input,
+                            &fp8,
+                            actual.output(),
+                            rows,
+                            out,
+                            cols,
+                            0.125,
+                            0.03125,
+                            &stream,
+                        )
+                        .unwrap();
+                } else {
+                    packed
+                        .run_on_stream(&input, &bf16, actual.output(), rows, out, cols, &stream)
+                        .unwrap();
+                }
+                let actual = actual.copy_to_host(&stream).unwrap().into_vec();
+                let mut offset = 0;
+                for count in lengths {
+                    let count = count as usize;
+                    let source = DeviceBuffer::from_host(
+                        &input_host[offset * cols..(offset + count) * cols],
+                    )
+                    .unwrap();
+                    let mut expected = DeviceBuffer::zeroed(count * out).unwrap();
+                    let mut isolated = F32DenseGemm::new(count, cols, 0).unwrap();
+                    if calibrated {
+                        isolated
+                            .run_calibrated_fp8_on_stream(
+                                &source,
+                                &fp8,
+                                expected.output(),
+                                count,
+                                out,
+                                cols,
+                                0.125,
+                                0.03125,
+                                &stream,
+                            )
+                            .unwrap();
+                    } else {
+                        isolated
+                            .run_on_stream(
+                                &source,
+                                &bf16,
+                                expected.output(),
+                                count,
+                                out,
+                                cols,
+                                &stream,
+                            )
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        &actual[offset * out..(offset + count) * out],
+                        expected.copy_to_host(&stream).unwrap().as_ref(),
+                        "calibrated={calibrated} offset={offset}"
+                    );
+                    offset += count;
+                }
+            }
+        }
+        assert!(packed.set_row_segments(&[0]).is_err());
+        assert!(packed.set_row_segments(&[146]).is_err());
+        packed.set_row_segments(&[41]).unwrap();
+        assert!(
+            packed
+                .run_on_stream(&input, &bf16, actual.output(), rows, out, cols, &stream)
+                .is_err()
+        );
+    }
 
     #[test]
     #[serial_test::serial]

@@ -28,6 +28,9 @@ use eider_runtime::sampling::{Sampler, TokenHistory};
 use std::path::Path;
 use tracing::info;
 
+mod decision;
+pub(crate) use decision::Nemotron3DecisionReadout;
+
 const NEMOTRON3_SPECULATIVE_DRAFTS: usize = 3;
 const NEMOTRON3_SPECULATIVE_ROWS: usize = NEMOTRON3_SPECULATIVE_DRAFTS + 1;
 
@@ -336,6 +339,21 @@ impl Nemotron3Model {
 
     /// Allocates recurrent, KV-cache, and scratch state for one sequence.
     pub(crate) fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3DecodeState> {
+        self.sequence_state_impl(max_tokens, true)
+    }
+
+    pub(crate) fn decision_sequence_state(
+        &self,
+        max_tokens: usize,
+    ) -> Result<Nemotron3DecodeState> {
+        self.sequence_state_impl(max_tokens, false)
+    }
+
+    fn sequence_state_impl(
+        &self,
+        max_tokens: usize,
+        generation: bool,
+    ) -> Result<Nemotron3DecodeState> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             layers.push(layer.sequence_state()?);
@@ -357,17 +375,23 @@ impl Nemotron3Model {
             rollback_tokens: 0,
             append_pending: false,
             final_hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
-            logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
+            logits: DeviceBuffer::zeroed(if generation {
+                self.manifest.vocab_size
+            } else {
+                0
+            })?,
             next_token: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
             lilicorr: self
                 .lilicorr
                 .as_ref()
+                .filter(|_| generation)
                 .map(LiLiCorrDraft::new_sequence)
                 .transpose()?,
             captured_features: self
                 .lilicorr
                 .as_ref()
+                .filter(|_| generation)
                 .map(|d| {
                     DeviceBuffer::zeroed(
                         self.manifest.hidden_size * d.config().target_layers().len(),
@@ -377,6 +401,7 @@ impl Nemotron3Model {
             mtp: self
                 .mtp
                 .as_ref()
+                .filter(|_| generation)
                 .map(|mtp| mtp.sequence_state(max_tokens))
                 .transpose()?,
             compact_attention: self
@@ -818,6 +843,18 @@ impl Nemotron3Model {
         Nemotron3BlockWorkspace::new_impl(self, sequence_count, rows, None, true)
     }
 
+    pub(crate) fn decision_workspace(
+        &self,
+        sequences: usize,
+        rows: usize,
+    ) -> Result<Nemotron3BlockWorkspace> {
+        let mut workspace = self.prefill_workspace(sequences, rows)?;
+        workspace.captured_features = None;
+        workspace.capture_graphs = true;
+        workspace.segment_dense_rows = true;
+        Ok(workspace)
+    }
+
     /// Allocates an exact-shape workspace for transactional speculative
     /// verification. Each active sequence contributes `draft_count` rows.
     pub fn speculative_workspace(
@@ -1150,6 +1187,12 @@ impl Nemotron3Model {
         reservations: &[seqcache::AppendReservation],
         page_tables: &[&DeviceBuffer<u32>],
     ) -> Result<()> {
+        if workspace.segment_dense_rows && workspace.dense_row_lengths != lengths {
+            workspace.graphs.iter_mut().for_each(|graph| *graph = None);
+            workspace.graph_warm = false;
+            workspace.dense_gemm.set_row_segments(lengths)?;
+            workspace.dense_row_lengths = lengths.to_vec();
+        }
         let sequence_count = states.len();
         let rows = workspace.rows;
         let mut conv_ptrs = Vec::with_capacity(workspace.mamba_layers * sequence_count);
@@ -1228,7 +1271,7 @@ impl Nemotron3Model {
         } else {
             self.enqueue_block_head(workspace, &self.stream)?;
         }
-        workspace.graph_warm = workspace.draft_count.is_some();
+        workspace.graph_warm = workspace.capture_graphs;
         if commit_all {
             for (sequence, state) in states.iter_mut().enumerate() {
                 let last_row = offsets[sequence] as usize + lengths[sequence] as usize - 1;
@@ -1240,6 +1283,9 @@ impl Nemotron3Model {
                     state.final_hidden.output(),
                     &self.stream,
                 )?;
+                if state.logits.is_empty() {
+                    continue;
+                }
                 if workspace.last_logits_only {
                     self.lm_head
                         .run(&state.final_hidden, &mut state.logits, &self.stream)?;
@@ -2624,6 +2670,9 @@ impl Nemotron3LayerRowsWorkspace {
 pub struct Nemotron3BlockWorkspace {
     graphs: Vec<Option<CudaGraphExec>>,
     graph_warm: bool,
+    capture_graphs: bool,
+    segment_dense_rows: bool,
+    dense_row_lengths: Vec<u32>,
     dense_gemm: F32DenseGemm,
     host_tokens: PinnedHostBuffer<u32>,
     host_offsets: PinnedHostBuffer<u32>,
@@ -2782,6 +2831,9 @@ impl Nemotron3BlockWorkspace {
         let workspace = Self {
             graphs: (0..=model.layers.len()).map(|_| None).collect(),
             graph_warm: false,
+            capture_graphs: draft_count.is_some(),
+            segment_dense_rows: false,
+            dense_row_lengths: Vec::new(),
             dense_gemm: Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?,
             host_tokens: PinnedHostBuffer::zeroed(rows)?,
             host_offsets: PinnedHostBuffer::zeroed(sequence_count)?,

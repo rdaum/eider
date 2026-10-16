@@ -35,12 +35,12 @@ pub use linear::{
 pub use mamba::{
     Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace,
 };
-pub(crate) use model::Nemotron3DecodeState;
 pub use model::{
     Nemotron3BlockWorkspace, Nemotron3Model, Nemotron3SequenceSnapshot,
     Nemotron3SpeculativeCycleResult, Nemotron3SpeculativeCycleWorkspace,
     Nemotron3SpeculativeResult,
 };
+pub(crate) use model::{Nemotron3DecisionReadout, Nemotron3DecodeState};
 pub use moe::{Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace};
 pub use mtp::Nemotron3MtpWorkspace;
 pub use router::{Nemotron3Router, Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace};
@@ -48,7 +48,9 @@ pub use sequence::{
     Nemotron3CacheContext, Nemotron3Page, Nemotron3PageBackend, Nemotron3Sequence,
     Nemotron3SequenceCache, new_nemotron3_sequence_cache,
 };
-pub(crate) use sequence::{nemotron3_cache_error, new_nemotron3_sequence_cache_with_budget};
+pub(crate) use sequence::{
+    nemotron3_cache_error, new_nemotron3_decision_cache, new_nemotron3_sequence_cache_with_budget,
+};
 
 /// Mixer used by one Nemotron 3 backbone layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -119,6 +119,30 @@ pub(crate) fn new_nemotron3_sequence_cache_with_budget(
     max_context_tokens: usize,
     prefix_budget_bytes: Option<usize>,
 ) -> Result<Nemotron3SequenceCache> {
+    new_sequence_cache(
+        model,
+        sequence_capacity,
+        max_context_tokens,
+        prefix_budget_bytes,
+        false,
+    )
+}
+
+pub(crate) fn new_nemotron3_decision_cache(
+    model: &Nemotron3Model,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+) -> Result<Nemotron3SequenceCache> {
+    new_sequence_cache(model, sequence_capacity, max_context_tokens, None, true)
+}
+
+fn new_sequence_cache(
+    model: &Nemotron3Model,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+    prefix_budget_bytes: Option<usize>,
+    decisions: bool,
+) -> Result<Nemotron3SequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {
             label: "Nemotron 3 sequence cache",
@@ -143,7 +167,11 @@ pub(crate) fn new_nemotron3_sequence_cache_with_budget(
     )?;
     let page_bytes = probe.page_bytes();
     let (private_bytes, snapshot_capacity) = {
-        let state = model.sequence_state(max_context_tokens)?;
+        let state = if decisions {
+            model.decision_sequence_state(max_context_tokens)?
+        } else {
+            model.sequence_state(max_context_tokens)?
+        };
         (state.device_bytes(), state.snapshot_capacity_bytes())
     };
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
