@@ -44,6 +44,8 @@ fi
 add_default --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-$speculative_drafts}"
 add_default --nemotron-bf16-storage bf16
 add_default --nemotron-fp8-storage fp8
+add_default --nemotron-compute-precision bf16
+add_default --nemotron-mamba-ssm-dtype bf16
 
 exec cargo run --release \
   --manifest-path "$repo_dir/Cargo.toml" \

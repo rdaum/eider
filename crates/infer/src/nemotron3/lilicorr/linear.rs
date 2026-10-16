@@ -1,10 +1,10 @@
 //! Mixed BF16/NVFP4 projections with BF16 activation and output semantics.
 
 use eider_cuda::{
-    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmShape, Result,
-    Sm121W4A16Linear, Sm121W4A16LinearBatchWorkspace, bf16_linear_logits_f32_batch_into_on_stream,
-    f32_to_bf16_prefix_into_on_stream, lilicorr, rms_norm_f32_into_on_stream,
-    round_f32_to_bf16_prefix_in_place_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmPrecision, GemmShape,
+    GgmlGemmWorkspace, Result, Sm121W4A16Linear, Sm121W4A16LinearBatchWorkspace,
+    bf16_linear_logits_f32_batch_into_on_stream, f32_to_bf16_prefix_into_on_stream, lilicorr,
+    rms_norm_f32_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ pub(super) struct Linear {
 }
 
 pub(super) struct LinearWorkspace {
+    pub(super) ggml: GgmlGemmWorkspace,
     lt: CublasLt,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
     input: DeviceBuffer<u16>,
@@ -31,7 +32,10 @@ pub(super) struct LinearWorkspace {
 
 impl LinearWorkspace {
     pub(super) fn new(capacity: usize, max_input: usize, max_features: usize) -> Result<Self> {
+        let mut ggml = GgmlGemmWorkspace::new(capacity, max_input)?;
+        ggml.set_precision(GemmPrecision::Bf16);
         Ok(Self {
+            ggml,
             lt: CublasLt::new()?,
             plans: HashMap::new(),
             input: DeviceBuffer::zeroed(capacity * max_input)?,

@@ -30,7 +30,7 @@ fn main() -> eider_cuda::Result<()> {
         .collect::<Vec<_>>();
     let hidden = DeviceBuffer::from_host(&hidden)?;
     let stream = CudaStream::new_non_blocking()?;
-    weights.run_one_token(&hidden, &mut workspace, &mut state, &stream)?;
+    weights.run_one_token(&hidden, &mut workspace, &mut state, None, &stream)?;
     let output = weights.output(&workspace).copy_to_host(&stream)?;
     if output.iter().any(|value| !value.is_finite()) {
         return Err(eider_cuda::Error::Format {

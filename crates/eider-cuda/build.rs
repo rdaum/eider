@@ -608,6 +608,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/fp4_oracle.cpp");
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
+    println!("cargo:rerun-if-changed=native/nemotron3_ssd.cuh");
     println!("cargo:rerun-if-changed=native/bitnet.cu");
     println!("cargo:rerun-if-changed=native/ternary_g64.cu");
     println!("cargo:rerun-if-changed=native/deepseek4.cu");

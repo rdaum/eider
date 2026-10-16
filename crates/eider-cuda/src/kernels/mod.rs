@@ -27,3 +27,5 @@ pub(crate) mod sm12x_kv_cache_oxide;
 pub(crate) mod sm12x_mma;
 #[cfg(feature = "cuda-oxide")]
 pub(crate) mod w4a16_matvec_oxide;
+
+pub(crate) mod nemotron3_ssd;

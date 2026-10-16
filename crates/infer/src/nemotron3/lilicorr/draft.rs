@@ -595,9 +595,13 @@ impl LiLiCorrDraft {
                     h,
                     stream,
                 )?,
-                LiLiCorrTargetHead::Q8(head) => {
-                    head.run_rows(&ws.sample_hidden, ws.logits.output(), drafts, None, stream)?
-                }
+                LiLiCorrTargetHead::Q8(head) => head.run_rows(
+                    &ws.sample_hidden,
+                    ws.logits.output(),
+                    drafts,
+                    Some(&mut ws.linear.ggml),
+                    stream,
+                )?,
             }
             lilicorr::bias_activation(&mut ws.logits, None, drafts, c.vocab_size, false, stream)?;
         }

@@ -1,15 +1,17 @@
 //! Nemotron 3 Mamba-2 weights, recurrent state, and execution.
 
-use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
+use super::linear::{
+    Nemotron3Linear, load_bf16, load_bf16_as_f32, norm, residual_add, round_activation,
+};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, Result, add_f32_into_on_stream,
-    nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, GemmPrecision,
+    Nemotron3SsdWorkspace, Result, nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
     nemotron3_mamba_state_update_f32_chunks_into_on_stream,
     nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream,
-    nemotron3_mamba_state_update_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    nemotron3_mamba_state_update_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 
@@ -139,8 +141,10 @@ impl Nemotron3MambaLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaWorkspace,
         state: &mut Nemotron3MambaState,
+        mut gemm: Option<&mut F32DenseGemm>,
         stream: &CudaStream,
     ) -> Result<()> {
+        let precision = gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision());
         if hidden.len() != self.manifest.hidden_size {
             return Err(Error::Shape {
                 label: "Nemotron 3 Mamba hidden state",
@@ -150,7 +154,8 @@ impl Nemotron3MambaLayer {
         }
         workspace.require_manifest(&self.manifest)?;
         state.require_manifest(&self.manifest)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            precision,
             1,
             self.manifest.hidden_size,
             hidden,
@@ -159,8 +164,12 @@ impl Nemotron3MambaLayer {
             self.manifest.norm_epsilon,
             stream,
         )?;
-        self.in_proj
-            .run(&workspace.normed, &mut workspace.projected, stream)?;
+        self.in_proj.run(
+            &workspace.normed,
+            &mut workspace.projected,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
         nemotron3_mamba_conv_update_f32_into_on_stream(
             &workspace.projected,
             &self.conv_weight,
@@ -172,6 +181,7 @@ impl Nemotron3MambaLayer {
             self.manifest.mamba_conv_kernel,
             stream,
         )?;
+        round_activation(precision, &mut workspace.conv_output, stream)?;
         nemotron3_mamba_state_update_f32_into_on_stream(
             &workspace.projected,
             &workspace.conv_output,
@@ -186,16 +196,23 @@ impl Nemotron3MambaLayer {
             self.manifest.mamba_groups,
             self.manifest.mamba_state_size,
             self.manifest.mamba_ssm_dtype,
-            1.0e-4,
+            precision,
+            if precision == GemmPrecision::Bf16 {
+                0.0
+            } else {
+                1.0e-4
+            },
             self.manifest.norm_epsilon,
             stream,
         )?;
         self.out_proj.run(
             &workspace.mixer_output,
             &mut workspace.projected_output,
+            gemm,
             stream,
         )?;
-        add_f32_into_on_stream(
+        residual_add(
+            precision,
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -295,7 +312,8 @@ impl Nemotron3MambaLayer {
             });
         }
         workspace.require_manifest(&self.manifest, rows)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            gemm.precision(),
             rows,
             self.manifest.hidden_size,
             hidden,
@@ -330,6 +348,7 @@ impl Nemotron3MambaLayer {
                 self.manifest.mamba_conv_kernel,
                 stream,
             )?;
+            round_activation(gemm.precision(), &mut workspace.conv_output, stream)?;
             nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 &workspace.projected,
                 &workspace.conv_output,
@@ -351,7 +370,12 @@ impl Nemotron3MambaLayer {
                 self.manifest.mamba_groups,
                 self.manifest.mamba_state_size,
                 self.manifest.mamba_ssm_dtype,
-                1.0e-4,
+                gemm.precision(),
+                if gemm.precision() == GemmPrecision::Bf16 {
+                    0.0
+                } else {
+                    1.0e-4
+                },
                 self.manifest.norm_epsilon,
                 stream,
             )?;
@@ -372,30 +396,70 @@ impl Nemotron3MambaLayer {
                 self.manifest.mamba_conv_kernel,
                 stream,
             )?;
-            nemotron3_mamba_state_update_f32_chunks_into_on_stream(
-                &workspace.projected,
-                &workspace.conv_output,
-                &self.a_log,
-                &self.d,
-                &self.dt_bias,
-                &self.mixer_norm,
-                ssm_state_table,
-                state_table_offset,
-                sequence_offsets,
-                sequence_lengths,
-                workspace.mixer_output.output(),
-                workspace.coefficients.output(),
-                sequence_count,
-                rows,
-                self.manifest.mamba_heads,
-                self.manifest.mamba_head_dim,
-                self.manifest.mamba_groups,
-                self.manifest.mamba_state_size,
-                self.manifest.mamba_ssm_dtype,
-                1.0e-4,
-                self.manifest.norm_epsilon,
-                stream,
-            )?;
+            round_activation(gemm.precision(), &mut workspace.conv_output, stream)?;
+            if gemm.precision() == GemmPrecision::Bf16
+                && rows >= 64
+                && self.manifest.mamba_head_dim == 64
+                && self.manifest.mamba_state_size == 128
+            {
+                // Prefill workspaces are warmed before graph capture and shared by layer shape.
+                if workspace.ssd.is_none() {
+                    workspace.ssd = Some(Nemotron3SsdWorkspace::new(
+                        rows,
+                        sequence_count,
+                        self.manifest.mamba_heads,
+                        self.manifest.mamba_groups,
+                    )?);
+                }
+                workspace.ssd.as_mut().unwrap().run(
+                    &workspace.projected,
+                    &workspace.conv_output,
+                    &self.a_log,
+                    &self.d,
+                    &self.dt_bias,
+                    &self.mixer_norm,
+                    ssm_state_table,
+                    state_table_offset,
+                    sequence_offsets,
+                    sequence_lengths,
+                    sequence_count,
+                    rows,
+                    self.manifest.mamba_ssm_dtype,
+                    self.manifest.norm_epsilon,
+                    workspace.mixer_output.output(),
+                    stream,
+                )?;
+            } else {
+                nemotron3_mamba_state_update_f32_chunks_into_on_stream(
+                    &workspace.projected,
+                    &workspace.conv_output,
+                    &self.a_log,
+                    &self.d,
+                    &self.dt_bias,
+                    &self.mixer_norm,
+                    ssm_state_table,
+                    state_table_offset,
+                    sequence_offsets,
+                    sequence_lengths,
+                    workspace.mixer_output.output(),
+                    workspace.coefficients.output(),
+                    sequence_count,
+                    rows,
+                    self.manifest.mamba_heads,
+                    self.manifest.mamba_head_dim,
+                    self.manifest.mamba_groups,
+                    self.manifest.mamba_state_size,
+                    self.manifest.mamba_ssm_dtype,
+                    gemm.precision(),
+                    if gemm.precision() == GemmPrecision::Bf16 {
+                        0.0
+                    } else {
+                        1.0e-4
+                    },
+                    self.manifest.norm_epsilon,
+                    stream,
+                )?;
+            }
         }
         self.out_proj.run_rows(
             &workspace.mixer_output,
@@ -404,7 +468,8 @@ impl Nemotron3MambaLayer {
             gemm,
             stream,
         )?;
-        add_f32_into_on_stream(
+        residual_add(
+            gemm.precision(),
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -526,6 +591,7 @@ pub struct Nemotron3MambaRowsWorkspace {
     conv_output: DeviceBuffer<f32>,
     mixer_output: DeviceBuffer<f32>,
     coefficients: DeviceBuffer<f32>,
+    ssd: Option<Nemotron3SsdWorkspace>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
 }
@@ -545,6 +611,7 @@ impl Nemotron3MambaRowsWorkspace {
             conv_output: DeviceBuffer::zeroed(rows * manifest.mamba_conv_channels())?,
             mixer_output: DeviceBuffer::zeroed(rows * manifest.mamba_intermediate_size())?,
             coefficients: DeviceBuffer::zeroed(rows * manifest.mamba_heads * 2)?,
+            ssd: None,
             projected_output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
             output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
         })
@@ -578,6 +645,10 @@ impl Nemotron3MambaRowsWorkspace {
             + self.conv_output.device_bytes()
             + self.mixer_output.device_bytes()
             + self.coefficients.device_bytes()
+            + self
+                .ssd
+                .as_ref()
+                .map_or(0, Nemotron3SsdWorkspace::device_bytes)
             + self.projected_output.device_bytes()
             + self.output.device_bytes()
     }

@@ -142,6 +142,10 @@ name = "nemotron35_dense"
 harness = false
 
 [[bench]]
+name = "nemotron35_fp8_bf16"
+harness = false
+
+[[bench]]
 name = "ngram_embedding"
 harness = false
 

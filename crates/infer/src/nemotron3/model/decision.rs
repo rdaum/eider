@@ -91,7 +91,7 @@ impl Nemotron3DecisionReadout {
     pub(crate) fn selected_logits(
         &mut self,
         model: &Nemotron3Model,
-        sequence: &Nemotron3Sequence,
+        sequence: &mut Nemotron3Sequence,
     ) -> Result<Vec<f32>> {
         if sequence.position() == 0 {
             return Err(decision_error("readout requires a non-empty sequence"));
@@ -99,6 +99,7 @@ impl Nemotron3DecisionReadout {
         self.weight.run(
             &sequence.state.final_hidden,
             &mut self.logits,
+            sequence.state.dense_gemm.as_mut(),
             &model.stream,
         )?;
         Ok(self.logits.copy_to_host(&model.stream)?.into_vec())

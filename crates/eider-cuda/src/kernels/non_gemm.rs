@@ -116,6 +116,75 @@ pub fn moe_weighted_accumulate_contiguous_f32_batch_on_stream(
     }
 }
 
+/// BF16 model normalization with F32 variance and BF16 rounding before and after the weight product.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_bf16_norm_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let count = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || count > u32::MAX as usize
+        || input.len() < count
+        || output.len() < count
+        || weight.len() != cols
+        || !eps.is_finite()
+        || eps <= 0.
+    {
+        return Err(Error::Format {
+            label: "Nemotron BF16 normalization",
+            detail: "invalid dimensions, epsilon or buffers".into(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_bf16_norm",
+            ffi::infer_nemotron3_bf16_norm(
+                input.ptr,
+                weight.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+/// Adds a BF16 branch to the BF16 residual, retaining the F32 sum for the next normalization.
+pub fn nemotron3_bf16_residual_into_on_stream(
+    residual: &DeviceBuffer<f32>,
+    branch: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let count = residual.len();
+    if count == 0 || count > u32::MAX as usize || branch.len() != count || output.len() != count {
+        return Err(Error::Format {
+            label: "Nemotron BF16 residual",
+            detail: "buffer dimensions differ".into(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_bf16_residual",
+            ffi::infer_nemotron3_bf16_residual(
+                residual.ptr,
+                branch.ptr,
+                output.buffer_mut().ptr,
+                count as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues row-wise RMSNorm into an existing output buffer on `stream`.
 pub fn rms_norm_f32_into_on_stream(
     rows: usize,
@@ -7271,6 +7340,7 @@ pub fn ragged_paged_gqa_attention_f32_into_on_stream(
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    stable_reduction: bool,
     stream: &CudaStream,
 ) -> Result<()> {
     let query_width = q_heads.saturating_mul(head_dim);
@@ -7336,6 +7406,7 @@ pub fn ragged_paged_gqa_attention_f32_into_on_stream(
                 q_heads as u32,
                 kv_heads as u32,
                 head_dim as u32,
+                i32::from(stable_reduction),
                 stream.as_raw(),
             ),
         )
@@ -14583,6 +14654,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
     groups: usize,
     state_size: usize,
     state_dtype: MambaSsmDtype,
+    precision: crate::GemmPrecision,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14617,7 +14689,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
         || groups > u32::MAX as usize
         || state_size > u32::MAX as usize
         || !dt_floor.is_finite()
-        || dt_floor <= 0.0
+        || dt_floor < 0.0
         || !eps.is_finite()
         || eps <= 0.0
         || projected.len() != projection_size
@@ -14664,6 +14736,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
                 groups as u32,
                 state_size as u32,
                 i32::from(state_dtype == MambaSsmDtype::F32),
+                i32::from(precision == crate::GemmPrecision::Bf16),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -14696,6 +14769,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     groups: usize,
     state_size: usize,
     state_dtype: MambaSsmDtype,
+    precision: crate::GemmPrecision,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14731,7 +14805,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
         || groups > u32::MAX as usize
         || state_size > u32::MAX as usize
         || !dt_floor.is_finite()
-        || dt_floor <= 0.0
+        || dt_floor < 0.0
         || !eps.is_finite()
         || eps <= 0.0
         || projected.len() != projected_len
@@ -14794,6 +14868,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 groups as u32,
                 state_size as u32,
                 i32::from(state_dtype == MambaSsmDtype::F32),
+                i32::from(precision == crate::GemmPrecision::Bf16),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -14827,6 +14902,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     groups: usize,
     state_size: usize,
     state_dtype: MambaSsmDtype,
+    precision: crate::GemmPrecision,
     dt_floor: f32,
     eps: f32,
     stream: &CudaStream,
@@ -14860,7 +14936,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
         || groups > u32::MAX as usize
         || state_size > u32::MAX as usize
         || !dt_floor.is_finite()
-        || dt_floor <= 0.0
+        || dt_floor < 0.0
         || !eps.is_finite()
         || eps <= 0.0
         || projected.len() != total_tokens.saturating_mul(projection_size)
@@ -14923,6 +14999,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 groups as u32,
                 state_size as u32,
                 i32::from(state_dtype == MambaSsmDtype::F32),
+                i32::from(precision == crate::GemmPrecision::Bf16),
                 dt_floor,
                 eps,
                 stream.as_raw(),
@@ -16025,97 +16102,110 @@ mod tests {
         let initial_ssm = (0..INTERMEDIATE * STATE_SIZE)
             .map(|index| f32_to_bf16(((index % 11) as f32 - 5.0) * 0.009))
             .collect::<Vec<_>>();
-        let mut expected_ssm = initial_ssm
-            .iter()
-            .copied()
-            .map(bf16_to_f32)
-            .collect::<Vec<_>>();
-        let mut expected_output = vec![0.0; INTERMEDIATE];
-        let heads_per_group = HEADS / GROUPS;
-        let group_width = heads_per_group * HEAD_DIM;
-        for group in 0..GROUPS {
-            for group_index in 0..group_width {
-                let flat = group * group_width + group_index;
-                let head = flat / HEAD_DIM;
-                let raw_dt =
-                    projected[INTERMEDIATE + CONV_CHANNELS + head] + bf16_to_f32(dt_bias[head]);
-                let dt = (1.0 + raw_dt.exp()).ln().max(DT_FLOOR);
-                let decay = (-dt * bf16_to_f32(a_log[head]).exp()).exp();
-                let x = actual_conv[flat];
-                let b = &actual_conv
-                    [INTERMEDIATE + group * STATE_SIZE..INTERMEDIATE + (group + 1) * STATE_SIZE];
-                let c_offset = INTERMEDIATE + BC_WIDTH + group * STATE_SIZE;
-                let c = &actual_conv[c_offset..c_offset + STATE_SIZE];
-                let state = &mut expected_ssm[flat * STATE_SIZE..(flat + 1) * STATE_SIZE];
-                let mut y = bf16_to_f32(d[head]) * x;
-                for state_index in 0..STATE_SIZE {
-                    let updated = state[state_index] * decay + dt * b[state_index] * x;
-                    state[state_index] = bf16_to_f32(f32_to_bf16(updated));
-                    y += updated * c[state_index];
-                }
-                let gate = projected[flat];
-                expected_output[flat] = y * gate / (1.0 + (-gate).exp());
-            }
-            let values = &expected_output[group * group_width..(group + 1) * group_width];
-            let mean_square =
-                values.iter().map(|value| value * value).sum::<f32>() / group_width as f32;
-            let inv_rms = (mean_square + EPS).sqrt().recip();
-            for group_index in 0..group_width {
-                let flat = group * group_width + group_index;
-                expected_output[flat] *= inv_rms * bf16_to_f32(norm_weight[flat]);
-            }
-        }
-
-        let a_log_device = DeviceBuffer::from_host(&a_log).expect("A log");
-        let d_device = DeviceBuffer::from_host(&d).expect("D");
-        let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
-        let norm_weight_device = DeviceBuffer::from_host(&norm_weight).expect("norm weight");
-        let mut ssm_state_device = DeviceBuffer::from_host(
-            &initial_ssm
-                .iter()
-                .flat_map(|x| x.to_ne_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .expect("SSM state");
-        let mut output_device = DeviceBuffer::zeroed(INTERMEDIATE).expect("Mamba output");
-        nemotron3_mamba_state_update_f32_into_on_stream(
-            &projected_device,
-            &conv_output_device,
-            &a_log_device,
-            &d_device,
-            &dt_bias_device,
-            &norm_weight_device,
-            ssm_state_device.inout(),
-            output_device.output(),
-            HEADS,
-            HEAD_DIM,
-            GROUPS,
-            STATE_SIZE,
-            MambaSsmDtype::Bf16,
-            DT_FLOOR,
-            EPS,
-            &stream,
-        )
-        .expect("Mamba state update");
-        assert_close(
-            &output_device
-                .copy_to_host(&stream)
-                .expect("Mamba output download"),
-            &expected_output,
-            3.0e-5,
-            "Mamba output",
-        );
-        assert_eq!(
-            ssm_state_device
-                .copy_to_host(&stream)
-                .expect("SSM state download"),
-            expected_ssm
+        for precision in [crate::GemmPrecision::F32, crate::GemmPrecision::Bf16] {
+            let mut expected_ssm = initial_ssm
                 .iter()
                 .copied()
-                .map(f32_to_bf16)
-                .flat_map(u16::to_ne_bytes)
-                .collect::<Vec<_>>()
-        );
+                .map(bf16_to_f32)
+                .collect::<Vec<_>>();
+            let mut expected_output = vec![0.0; INTERMEDIATE];
+            let heads_per_group = HEADS / GROUPS;
+            let group_width = heads_per_group * HEAD_DIM;
+            for group in 0..GROUPS {
+                for group_index in 0..group_width {
+                    let flat = group * group_width + group_index;
+                    let head = flat / HEAD_DIM;
+                    let raw_dt =
+                        projected[INTERMEDIATE + CONV_CHANNELS + head] + bf16_to_f32(dt_bias[head]);
+                    let dt = (1.0 + raw_dt.exp()).ln().max(DT_FLOOR);
+                    let decay = (-dt * bf16_to_f32(a_log[head]).exp()).exp();
+                    let x = actual_conv[flat];
+                    let b = &actual_conv[INTERMEDIATE + group * STATE_SIZE
+                        ..INTERMEDIATE + (group + 1) * STATE_SIZE];
+                    let c_offset = INTERMEDIATE + BC_WIDTH + group * STATE_SIZE;
+                    let c = &actual_conv[c_offset..c_offset + STATE_SIZE];
+                    let state = &mut expected_ssm[flat * STATE_SIZE..(flat + 1) * STATE_SIZE];
+                    let mut y = bf16_to_f32(d[head]) * x;
+                    for state_index in 0..STATE_SIZE {
+                        let updated = state[state_index] * decay + dt * b[state_index] * x;
+                        state[state_index] = bf16_to_f32(f32_to_bf16(updated));
+                        y += updated * c[state_index];
+                    }
+                    if precision == crate::GemmPrecision::Bf16 {
+                        y = bf16_to_f32(f32_to_bf16(y));
+                    }
+                    let gate = projected[flat];
+                    expected_output[flat] = y * gate / (1.0 + (-gate).exp());
+                }
+                let values = &expected_output[group * group_width..(group + 1) * group_width];
+                let mean_square =
+                    values.iter().map(|value| value * value).sum::<f32>() / group_width as f32;
+                let inv_rms = (mean_square + EPS).sqrt().recip();
+                for group_index in 0..group_width {
+                    let flat = group * group_width + group_index;
+                    expected_output[flat] = if precision == crate::GemmPrecision::Bf16 {
+                        bf16_to_f32(f32_to_bf16(
+                            bf16_to_f32(f32_to_bf16(expected_output[flat] * inv_rms))
+                                * bf16_to_f32(norm_weight[flat]),
+                        ))
+                    } else {
+                        expected_output[flat] * inv_rms * bf16_to_f32(norm_weight[flat])
+                    };
+                }
+            }
+
+            let a_log_device = DeviceBuffer::from_host(&a_log).expect("A log");
+            let d_device = DeviceBuffer::from_host(&d).expect("D");
+            let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+            let norm_weight_device = DeviceBuffer::from_host(&norm_weight).expect("norm weight");
+            let mut ssm_state_device = DeviceBuffer::from_host(
+                &initial_ssm
+                    .iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("SSM state");
+            let mut output_device = DeviceBuffer::zeroed(INTERMEDIATE).expect("Mamba output");
+            nemotron3_mamba_state_update_f32_into_on_stream(
+                &projected_device,
+                &conv_output_device,
+                &a_log_device,
+                &d_device,
+                &dt_bias_device,
+                &norm_weight_device,
+                ssm_state_device.inout(),
+                output_device.output(),
+                HEADS,
+                HEAD_DIM,
+                GROUPS,
+                STATE_SIZE,
+                MambaSsmDtype::Bf16,
+                precision,
+                DT_FLOOR,
+                EPS,
+                &stream,
+            )
+            .expect("Mamba state update");
+            assert_close(
+                &output_device
+                    .copy_to_host(&stream)
+                    .expect("Mamba output download"),
+                &expected_output,
+                3.0e-5,
+                "Mamba output",
+            );
+            assert_eq!(
+                ssm_state_device
+                    .copy_to_host(&stream)
+                    .expect("SSM state download"),
+                expected_ssm
+                    .iter()
+                    .copied()
+                    .map(f32_to_bf16)
+                    .flat_map(u16::to_ne_bytes)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[serial]
@@ -16301,6 +16391,7 @@ mod tests {
                     GROUPS,
                     STATE_SIZE,
                     MambaSsmDtype::Bf16,
+                    crate::GemmPrecision::F32,
                     1.0e-4,
                     1.0e-5,
                     &stream,
@@ -16346,6 +16437,7 @@ mod tests {
             GROUPS,
             STATE_SIZE,
             MambaSsmDtype::Bf16,
+            crate::GemmPrecision::F32,
             1.0e-4,
             1.0e-5,
             &stream,
@@ -16464,6 +16556,7 @@ mod tests {
                 GROUPS,
                 STATE,
                 dtype,
+                crate::GemmPrecision::F32,
                 1.0e-4,
                 1.0e-5,
                 &stream,
@@ -16557,6 +16650,7 @@ mod tests {
                     GROUPS,
                     STATE,
                     dtype,
+                    crate::GemmPrecision::F32,
                     1.0e-4,
                     1.0e-5,
                     &stream,
@@ -20805,28 +20899,31 @@ mod tests {
             .expect("ragged paged KV append");
             let mut paged_output =
                 DeviceBuffer::zeroed(tokens * query_width).expect("paged output");
-            ragged_paged_gqa_attention_f32_into_on_stream(
-                &query_device,
-                &paged_keys,
-                &paged_values,
-                &page_table_ptrs,
-                &offsets_device,
-                &lengths_device,
-                &starts_device,
-                paged_output.output(),
-                SEQUENCES,
-                tokens,
-                PAGE_TOKENS,
-                Q_HEADS,
-                KV_HEADS,
-                head_dim,
-                &stream,
-            )
-            .expect("ragged paged GQA");
-            let paged_output = paged_output
-                .copy_to_host(&stream)
-                .expect("paged output download");
-            assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
+            for stable_reduction in [false, true] {
+                ragged_paged_gqa_attention_f32_into_on_stream(
+                    &query_device,
+                    &paged_keys,
+                    &paged_values,
+                    &page_table_ptrs,
+                    &offsets_device,
+                    &lengths_device,
+                    &starts_device,
+                    paged_output.output(),
+                    SEQUENCES,
+                    tokens,
+                    PAGE_TOKENS,
+                    Q_HEADS,
+                    KV_HEADS,
+                    head_dim,
+                    stable_reduction,
+                    &stream,
+                )
+                .expect("ragged paged GQA");
+                let paged_output = paged_output
+                    .copy_to_host(&stream)
+                    .expect("paged output download");
+                assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
+            }
         }
     }
 

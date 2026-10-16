@@ -103,6 +103,7 @@ impl<const ROWS: usize> Mamba<ROWS> {
                 GROUPS,
                 STATE,
                 self.dtype,
+                eider_cuda::GemmPrecision::F32,
                 1e-4,
                 1e-5,
                 &self.stream,
@@ -129,6 +130,7 @@ impl<const ROWS: usize> Mamba<ROWS> {
                 GROUPS,
                 STATE,
                 self.dtype,
+                eider_cuda::GemmPrecision::F32,
                 1e-4,
                 1e-5,
                 &self.stream,
@@ -178,6 +180,121 @@ fn sample<const ROWS: usize, const REFERENCE: bool>(
         "ms/call",
     ))
 }
+struct Ssd<const ROWS: usize> {
+    recurrent: Mamba<ROWS>,
+    workspace: eider_cuda::Nemotron3SsdWorkspace,
+}
+impl<const ROWS: usize> Ssd<ROWS> {
+    fn run(&mut self) {
+        let c = &mut self.recurrent;
+        self.workspace
+            .run(
+                &c.projected,
+                &c.convolved,
+                &c.a_log,
+                &c.d,
+                &c.dt_bias,
+                &c.norm,
+                &c.table,
+                1,
+                &c.offsets,
+                &c.lengths,
+                1,
+                ROWS,
+                c.dtype,
+                1e-5,
+                c.output.output(),
+                &c.stream,
+            )
+            .unwrap();
+    }
+}
+impl<const ROWS: usize> BenchContext for Ssd<ROWS> {
+    fn prepare(_: usize) -> Self {
+        let bf = |x: f32| {
+            f32::from_bits((x.to_bits() + 0x7fff + ((x.to_bits() >> 16) & 1)) & 0xffff0000)
+        };
+        let mut c = Mamba::new(MambaSsmDtype::Bf16);
+        let x = bf(0.3);
+        let b = bf(0.004);
+        let cv = bf(0.01);
+        let mut conv = vec![x; CONV];
+        conv[INNER..INNER + GROUPS * STATE].fill(b);
+        conv[INNER + GROUPS * STATE..].fill(cv);
+        c.convolved = DeviceBuffer::from_host(&conv.repeat(ROWS)).unwrap();
+        c.projected = DeviceBuffer::from_host(&vec![0.5; ROWS * PROJECTION]).unwrap();
+        let mut context = Self {
+            recurrent: c,
+            workspace: eider_cuda::Nemotron3SsdWorkspace::new(ROWS, 1, HEADS, GROUPS).unwrap(),
+        };
+        context.run();
+        // This uniform fixture has one scalar state per channel and an analytic chunk sum.
+        let dt = (-0.5_f32).exp().ln_1p();
+        let mut state = 0.125_f32;
+        for begin in (0..ROWS).step_by(64) {
+            let count = 64.min(ROWS - begin);
+            let mut prefix = Vec::new();
+            let mut sum = 0_f32;
+            for _ in 0..count {
+                sum -= dt;
+                prefix.push(sum);
+            }
+            let mut contribution = 0_f32;
+            for &value in &prefix {
+                contribution = x.mul_add(bf(b * ((sum - value).exp() * dt)), contribution);
+            }
+            state = sum.exp().mul_add(state, contribution);
+        }
+        let bytes = context.recurrent.states[1]
+            .copy_to_host(&context.recurrent.stream)
+            .unwrap();
+        for v in bytes.as_chunks::<2>().0 {
+            let actual = f32::from_bits(u32::from(u16::from_ne_bytes(*v)) << 16);
+            assert!(
+                (actual - bf(state)).abs() < 2e-5,
+                "SSD scalar state: {actual} vs {}",
+                bf(state)
+            );
+        }
+        for &value in context
+            .recurrent
+            .output
+            .copy_to_host(&context.recurrent.stream)
+            .unwrap()
+            .iter()
+        {
+            assert!((value - 1.).abs() <= 0.008, "SSD normalized output {value}");
+        }
+        context
+    }
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+fn sample_ssd<const ROWS: usize>(c: &mut Ssd<ROWS>, count: usize, _: usize) -> BenchSampleResult {
+    c.recurrent
+        .start
+        .record_on_stream(&c.recurrent.stream)
+        .unwrap();
+    for _ in 0..count {
+        c.run();
+    }
+    c.recurrent
+        .stop
+        .record_on_stream(&c.recurrent.stream)
+        .unwrap();
+    c.recurrent.stop.synchronize().unwrap();
+    BenchSampleResult::operations(count as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        c.recurrent
+            .start
+            .elapsed_ms_until(&c.recurrent.stop)
+            .unwrap() as f64
+            / count as f64,
+        "ms/call",
+    ))
+}
+
 fn main() {
     Mamba::<17>::new(MambaSsmDtype::Bf16).validate();
     Mamba::<17>::new(MambaSsmDtype::F32).validate();
@@ -195,6 +312,14 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<Ssd<1024>>("BF16 SSD 1024 tokens", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("chunked tensor cores", sample_ssd::<1024>);
+            });
+            runner.group::<Ssd<2048>>("BF16 SSD 2048 tokens", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("chunked tensor cores", sample_ssd::<2048>);
+            });
             runner.group::<Mamba<128>>("Mamba 128 tokens", |g| {
                 let g = g.measurement_domain(MeasurementDomain::Gpu);
                 g.bench_sample("stored state with initial snapshot", sample::<128, true>);

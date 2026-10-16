@@ -295,7 +295,7 @@ impl Nemotron3ChatService<'_, '_> {
         self.model.synchronize()?;
         let mut slot = 0;
         while slot < execution.branches.len() {
-            let branch = &execution.branches[slot];
+            let branch = &mut execution.branches[slot];
             let question = &group.request.branches[branch.index];
             if branch.position < question.suffix_tokens.len() {
                 slot += 1;
@@ -303,7 +303,7 @@ impl Nemotron3ChatService<'_, '_> {
             }
             let logits = self
                 .decision_readout
-                .selected_logits(self.model, &branch.sequence)?;
+                .selected_logits(self.model, &mut branch.sequence)?;
             group.logits[branch.index] = Some(DecisionBranchLogits {
                 question_id: question.question_id.clone(),
                 logits: logits[..question.label_token_ids.len()].to_vec(),

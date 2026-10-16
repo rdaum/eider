@@ -277,7 +277,7 @@ impl GgmlWeights {
         let (prepared, powers, tiles) = match workspace {
             Some(ws) => {
                 let pointers = ws.pointers(rows, self.cols)?;
-                if self.format == GgmlBlockFormat::Iq2Xxs && (2..=8).contains(&rows) {
+                if self.format == GgmlBlockFormat::Iq2Xxs && (1..=8).contains(&rows) {
                     // The first warm-up reserves partials; captured replays reuse them.
                     let count = rows
                         .checked_mul(self.out)
@@ -434,7 +434,7 @@ mod tests {
     fn dense_packed_matvec_and_tensor_match_cpu() {
         let stream = CudaStream::new_non_blocking().unwrap();
         for format in [GgmlBlockFormat::Q8, GgmlBlockFormat::Iq2Xxs] {
-            let (out, cols, rows) = (65, 512, 33);
+            let (out, cols, rows) = (65, 512, 129);
             let bytes = packed(format, out, cols);
             let unpacked = format.dequantize(&bytes, out, cols).unwrap();
             let mut weights = GgmlWeights::new(format, 1, out, cols, &bytes).unwrap();
@@ -448,7 +448,7 @@ mod tests {
             let mut output = DeviceBuffer::zeroed(rows * out).unwrap();
             let reference = reference(&unpacked, &host, out, cols);
             let mut ws = GgmlGemmWorkspace::new(rows, cols).unwrap();
-            for count in [1, 4, 8, 16, 33, 3] {
+            for count in [1, 4, 8, 16, 33, 129, 3] {
                 weights
                     .run_rows(&input, output.output(), count, None, &stream)
                     .unwrap();
@@ -483,7 +483,7 @@ mod tests {
             );
             let rounded_input: Vec<_> = host.iter().copied().map(bf16).collect();
             let bf16_reference = self::reference(&rounded_weight, &rounded_input, out, cols);
-            for count in [1, 4, 8, 16, 33, 3] {
+            for count in [1, 4, 8, 16, 33, 129, 3] {
                 weights
                     .run_rows(&input, output.output(), count, Some(&mut ws), &stream)
                     .unwrap();
@@ -594,7 +594,10 @@ mod tests {
                     &output.copy_to_host(&stream).unwrap()[..count * out],
                     &bf16_expected[..count * out],
                 );
-                let activated: Vec<_> = host.iter().map(|&x| bf16(x.max(0.) * x.max(0.))).collect();
+                let activated: Vec<_> = host
+                    .iter()
+                    .map(|&x| bf16(bf16(x).max(0.) * bf16(x).max(0.)))
+                    .collect();
                 let ids = indices.copy_to_host(&stream).unwrap();
                 let fused_expected: Vec<_> = (0..count)
                     .flat_map(|r| {

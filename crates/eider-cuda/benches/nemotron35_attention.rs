@@ -45,6 +45,7 @@ impl<const PREFIX: usize, const ROWS: usize> Attention<PREFIX, ROWS> {
                 Q_HEADS,
                 KV_HEADS,
                 DIM,
+                false,
                 &self.stream,
             )
             .unwrap();

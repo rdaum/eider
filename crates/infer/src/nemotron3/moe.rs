@@ -1,21 +1,20 @@
 //! Nemotron 3 latent-MoE weights and execution workspaces.
 
-use super::linear::{Nemotron3Linear, load_bf16_as_f32};
+use super::linear::{Nemotron3Linear, load_bf16_as_f32, norm, residual_add, round_activation};
 use super::{
     Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig, Nemotron3Router,
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use eider_cuda::{
     CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer, Error, F32DenseGemm,
-    GgmlWeights, MoeSortedNvfp4Rows, MoeSortedRoutes, Result, add_f32_into_on_stream,
-    lfm2_expert_gemm_pipelined_into_on_stream,
+    GemmPrecision, GgmlWeights, MoeSortedNvfp4Rows, MoeSortedRoutes, Result,
+    add_f32_into_on_stream, lfm2_expert_gemm_pipelined_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
     nvfp4_w4a16_reuse_matvec_into_on_stream, relu_squared_f32_into_on_stream,
-    rms_norm_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt};
 
@@ -215,8 +214,10 @@ impl Nemotron3MoeLayer {
         &self,
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MoeWorkspace,
+        mut gemm: Option<&mut F32DenseGemm>,
         stream: &CudaStream,
     ) -> Result<()> {
+        let precision = gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision());
         if hidden.len() != self.manifest.hidden_size {
             return Err(Error::Shape {
                 label: "Nemotron 3 MoE hidden state",
@@ -225,7 +226,8 @@ impl Nemotron3MoeLayer {
             });
         }
         workspace.require_manifest(&self.manifest, self.moe)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            precision,
             1,
             self.manifest.hidden_size,
             hidden,
@@ -236,25 +238,36 @@ impl Nemotron3MoeLayer {
         )?;
         self.router
             .run(&workspace.normed, &mut workspace.router, stream)?;
-        self.latent_in
-            .run(&workspace.normed, &mut workspace.latent, stream)?;
-        self.experts.run(workspace, stream)?;
+        self.latent_in.run(
+            &workspace.normed,
+            &mut workspace.latent,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
+        self.experts.run(workspace, gemm.as_deref_mut(), stream)?;
         self.latent_out.run(
             &workspace.routed_latent,
             &mut workspace.routed_hidden,
+            gemm.as_deref_mut(),
             stream,
         )?;
 
-        self.shared_up
-            .run(&workspace.normed, &mut workspace.shared_projected, stream)?;
+        self.shared_up.run(
+            &workspace.normed,
+            &mut workspace.shared_projected,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
         relu_squared_f32_into_on_stream(
             &workspace.shared_projected,
             workspace.shared_activated.output(),
             stream,
         )?;
+        round_activation(precision, &mut workspace.shared_activated, stream)?;
         self.shared_down.run(
             &workspace.shared_activated,
             &mut workspace.shared_hidden,
+            gemm,
             stream,
         )?;
         add_f32_into_on_stream(
@@ -263,7 +276,9 @@ impl Nemotron3MoeLayer {
             workspace.combined.output(),
             stream,
         )?;
-        add_f32_into_on_stream(
+        round_activation(precision, &mut workspace.combined, stream)?;
+        residual_add(
+            precision,
             hidden,
             &workspace.combined,
             workspace.output.output(),
@@ -288,7 +303,8 @@ impl Nemotron3MoeLayer {
             });
         }
         workspace.require_manifest(&self.manifest, self.moe, rows)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            gemm.precision(),
             rows,
             self.manifest.hidden_size,
             hidden,
@@ -322,6 +338,7 @@ impl Nemotron3MoeLayer {
             workspace.shared_activated.output(),
             stream,
         )?;
+        round_activation(gemm.precision(), &mut workspace.shared_activated, stream)?;
         self.shared_down.run_rows(
             &workspace.shared_activated,
             &mut workspace.shared_hidden,
@@ -335,7 +352,9 @@ impl Nemotron3MoeLayer {
             workspace.combined.output(),
             stream,
         )?;
-        add_f32_into_on_stream(
+        round_activation(gemm.precision(), &mut workspace.combined, stream)?;
+        residual_add(
+            gemm.precision(),
             hidden,
             &workspace.combined,
             workspace.output.output(),
@@ -449,9 +468,20 @@ impl Nemotron3ExpertSlab {
         }
     }
 
-    fn run(&self, workspace: &mut Nemotron3MoeWorkspace, stream: &CudaStream) -> Result<()> {
+    fn run(
+        &self,
+        workspace: &mut Nemotron3MoeWorkspace,
+        mut gemm: Option<&mut F32DenseGemm>,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let weights = match self {
-            Self::Nvfp4(weights) => return weights.run(workspace, stream),
+            Self::Nvfp4(weights) => {
+                return weights.run(
+                    workspace,
+                    gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision()),
+                    stream,
+                );
+            }
             Self::Ggml(weights) => weights,
         };
         let scratch = workspace.ggml.as_mut().ok_or_else(|| Error::Format {
@@ -461,25 +491,35 @@ impl Nemotron3ExpertSlab {
         scratch
             .routes
             .sort_on_stream(workspace.router.indices(), stream)?;
+        let precision = gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision());
+        let prepared = gemm
+            .as_deref_mut()
+            .map(|g| g.ggml_workspace(scratch.routes.active_routes(), weights.up.in_features()))
+            .transpose()?;
         weights.up.run_routed(
             &scratch.routes,
             &scratch.inputs,
             &workspace.up_output_table,
             false,
-            None,
+            prepared,
             stream,
         )?;
+        round_activation(precision, &mut workspace.routed_up, stream)?;
         relu_squared_f32_into_on_stream(
             &workspace.routed_up,
             workspace.routed_activated.output(),
             stream,
         )?;
+        round_activation(precision, &mut workspace.routed_activated, stream)?;
+        let prepared = gemm
+            .map(|g| g.ggml_workspace(scratch.routes.active_routes(), weights.down.in_features()))
+            .transpose()?;
         weights.down.run_routed(
             &scratch.routes,
             &workspace.down_input_table,
             &workspace.down_output_table,
             false,
-            None,
+            prepared,
             stream,
         )?;
         moe_weighted_accumulate_slot_addresses_f32_on_stream(
@@ -489,7 +529,8 @@ impl Nemotron3ExpertSlab {
             &weights.alpha,
             workspace.routed_latent.inout(),
             stream,
-        )
+        )?;
+        round_activation(precision, &mut workspace.routed_latent, stream)
     }
 
     fn run_rows(
@@ -500,7 +541,9 @@ impl Nemotron3ExpertSlab {
         stream: &CudaStream,
     ) -> Result<()> {
         let weights = match self {
-            Self::Nvfp4(weights) => return weights.run_rows(workspace, rows, stream),
+            Self::Nvfp4(weights) => {
+                return weights.run_rows(workspace, rows, gemm.precision(), stream);
+            }
             Self::Ggml(weights) => weights,
         };
         let routes = workspace
@@ -510,7 +553,7 @@ impl Nemotron3ExpertSlab {
                 label: "Nemotron GGML experts",
                 detail: "missing batched route workspace".into(),
             })?;
-        let fused = rows >= 16 && gemm.precision() == eider_cuda::GemmPrecision::Bf16;
+        let fused = gemm.precision() == GemmPrecision::Bf16;
         if fused != workspace.fused_activation {
             return Err(Error::Format {
                 label: "Nemotron GGML experts",
@@ -518,7 +561,7 @@ impl Nemotron3ExpertSlab {
             });
         }
         routes.sort_on_stream(workspace.router.indices(), stream)?;
-        let scratch = if rows >= 16 {
+        let scratch = if rows >= 16 || gemm.precision() == GemmPrecision::Bf16 {
             Some(gemm.ggml_workspace(routes.active_routes(), weights.up.in_features())?)
         } else {
             None
@@ -538,7 +581,7 @@ impl Nemotron3ExpertSlab {
                 stream,
             )?;
         }
-        let scratch = if rows >= 16 {
+        let scratch = if rows >= 16 || gemm.precision() == GemmPrecision::Bf16 {
             Some(gemm.ggml_workspace(routes.active_routes(), weights.down.in_features())?)
         } else {
             None
@@ -564,7 +607,8 @@ impl Nemotron3ExpertSlab {
             rows,
             workspace.routes_per_row,
             stream,
-        )
+        )?;
+        round_activation(gemm.precision(), &mut workspace.routed_latent, stream)
     }
 }
 
@@ -682,7 +726,12 @@ impl Nemotron3Nvfp4ExpertSlab {
         })
     }
 
-    fn run(&self, workspace: &mut Nemotron3MoeWorkspace, stream: &CudaStream) -> Result<()> {
+    fn run(
+        &self,
+        workspace: &mut Nemotron3MoeWorkspace,
+        precision: GemmPrecision,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let indices = workspace.router.indices();
         nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             indices,
@@ -695,11 +744,13 @@ impl Nemotron3Nvfp4ExpertSlab {
             self.latent,
             stream,
         )?;
+        round_activation(precision, &mut workspace.routed_up, stream)?;
         relu_squared_f32_into_on_stream(
             &workspace.routed_up,
             workspace.routed_activated.output(),
             stream,
         )?;
+        round_activation(precision, &mut workspace.routed_activated, stream)?;
         nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.down_input_table,
@@ -718,13 +769,15 @@ impl Nemotron3Nvfp4ExpertSlab {
             &self.expert_alpha,
             workspace.routed_latent.inout(),
             stream,
-        )
+        )?;
+        round_activation(precision, &mut workspace.routed_latent, stream)
     }
 
     fn run_rows(
         &self,
         workspace: &mut Nemotron3MoeRowsWorkspace,
         rows: usize,
+        precision: GemmPrecision,
         stream: &CudaStream,
     ) -> Result<()> {
         let indices = workspace.router.indices();
@@ -811,11 +864,13 @@ impl Nemotron3Nvfp4ExpertSlab {
                 self.latent,
                 stream,
             )?;
+            round_activation(precision, &mut workspace.routed_up, stream)?;
             relu_squared_f32_into_on_stream(
                 &workspace.routed_up,
                 workspace.routed_activated.output(),
                 stream,
             )?;
+            round_activation(precision, &mut workspace.routed_activated, stream)?;
             project(
                 routes,
                 &workspace.down_input_table,
@@ -839,11 +894,13 @@ impl Nemotron3Nvfp4ExpertSlab {
                 self.latent,
                 stream,
             )?;
+            round_activation(precision, &mut workspace.routed_up, stream)?;
             relu_squared_f32_into_on_stream(
                 &workspace.routed_up,
                 workspace.routed_activated.output(),
                 stream,
             )?;
+            round_activation(precision, &mut workspace.routed_activated, stream)?;
             nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
                 indices,
                 &workspace.down_input_table,
@@ -865,7 +922,8 @@ impl Nemotron3Nvfp4ExpertSlab {
             rows,
             workspace.routes_per_row,
             stream,
-        )
+        )?;
+        round_activation(precision, &mut workspace.routed_latent, stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -1136,7 +1194,7 @@ impl Nemotron3MoeRowsWorkspace {
         let intermediate = moe.intermediate_size;
         let latent_buffer = DeviceBuffer::zeroed(rows * latent)?;
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
-        let fused_activation = ggml && rows >= 16 && precision == eider_cuda::GemmPrecision::Bf16;
+        let fused_activation = ggml && precision == GemmPrecision::Bf16;
         let routed_activated = DeviceBuffer::zeroed(if fused_activation {
             0
         } else {

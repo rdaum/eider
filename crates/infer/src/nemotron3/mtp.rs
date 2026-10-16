@@ -560,7 +560,11 @@ impl Nemotron3MtpWorkspace {
             .chain(mtp.attention.dense_linears())
             .chain(mtp.moe.dense_linears());
         Ok(Self {
-            dense_gemm: Nemotron3Linear::dense_workspace(rows, weights)?,
+            dense_gemm: Nemotron3Linear::dense_workspace(
+                rows,
+                eider_cuda::GemmPrecision::F32,
+                weights,
+            )?,
             tokens: DeviceBuffer::zeroed(rows)?,
             next_tokens: DeviceBuffer::zeroed(rows)?,
             next_values: DeviceBuffer::zeroed(rows)?,

@@ -287,9 +287,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::F32)]
     nemotron_kv_cache: NemotronKvCacheStorageArg,
 
-    /// Matrix arithmetic for Nemotron prompt batches (decode retains F32).
+    /// Model arithmetic for Nemotron prefill, decode, and verification.
     #[arg(long, value_enum, default_value_t = NemotronPrecisionArg::F32)]
-    nemotron_prefill_precision: NemotronPrecisionArg,
+    nemotron_compute_precision: NemotronPrecisionArg,
 
     /// Override Nemotron recurrent-state storage; defaults to checkpoint metadata.
     #[arg(long, value_enum)]
@@ -434,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bf16: args.nemotron_bf16_storage.into(),
         fp8: args.nemotron_fp8_storage.into(),
         kv_cache: args.nemotron_kv_cache.into(),
-        prefill_precision: args.nemotron_prefill_precision.into(),
+        compute_precision: args.nemotron_compute_precision.into(),
         mamba_ssm_dtype: args.nemotron_mamba_ssm_dtype.map(Into::into),
     };
     let actor = InferenceActor::spawn(actor_config)

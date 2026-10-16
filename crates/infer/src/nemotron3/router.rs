@@ -123,7 +123,8 @@ impl Nemotron3Router {
             });
         }
         workspace.require_shape(self.moe)?;
-        self.weight.run(hidden, &mut workspace.logits, stream)?;
+        self.weight
+            .run(hidden, &mut workspace.logits, None, stream)?;
         nemotron3_sigmoid_topk_f32_into_on_stream(
             &workspace.logits,
             &self.correction_bias,
@@ -155,8 +156,12 @@ impl Nemotron3Router {
             });
         }
         workspace.require_shape(self.moe, rows)?;
-        self.weight
-            .run_rows(hidden, &mut workspace.logits, rows, gemm, stream)?;
+        // Routing retains F32 inputs even when the surrounding projections use
+        // BF16. Small verification batches also use the serial reduction order.
+        let Nemotron3Linear::Bf16(weight) = &self.weight else {
+            unreachable!("router weights are always BF16");
+        };
+        weight.run_rows_f32(hidden, &mut workspace.logits, rows, gemm, stream)?;
         nemotron3_sigmoid_topk_f32_batch_into_on_stream(
             &workspace.logits,
             &self.correction_bias,

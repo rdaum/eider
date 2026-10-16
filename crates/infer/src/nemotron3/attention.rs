@@ -1,15 +1,14 @@
 //! Nemotron 3 attention weights, cache state, and execution workspaces.
 
 use super::Nemotron3PageBackend;
-use super::linear::{Nemotron3Linear, load_bf16_as_f32};
+use super::linear::{Nemotron3Linear, load_bf16_as_f32, norm, residual_add, round_activation};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::execution::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
-    append_ragged_kv_f32_into_on_stream, append_ragged_paged_kv_f32_into_on_stream,
-    ragged_gqa_attention_f32_into_on_stream, ragged_paged_gqa_attention_f32_into_on_stream,
-    rms_norm_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32DenseGemm, GemmPrecision, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, append_ragged_kv_f32_into_on_stream,
+    append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
+    ragged_paged_gqa_attention_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use seqcache::AppendReservations;
@@ -224,8 +223,10 @@ impl Nemotron3AttentionLayer {
         workspace: &mut Nemotron3AttentionWorkspace,
         cache: &mut Nemotron3AttentionCache,
         compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
+        mut gemm: Option<&mut F32DenseGemm>,
         stream: &CudaStream,
     ) -> Result<()> {
+        let precision = gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision());
         if hidden.len() != self.manifest.hidden_size {
             return Err(Error::Shape {
                 label: "Nemotron 3 attention hidden state",
@@ -234,7 +235,8 @@ impl Nemotron3AttentionLayer {
             });
         }
         workspace.require_manifest(&self.manifest)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            precision,
             1,
             self.manifest.hidden_size,
             hidden,
@@ -243,12 +245,24 @@ impl Nemotron3AttentionLayer {
             self.manifest.norm_epsilon,
             stream,
         )?;
-        self.query
-            .run(&workspace.normed, &mut workspace.query, stream)?;
-        self.key
-            .run(&workspace.normed, &mut workspace.key, stream)?;
-        self.value
-            .run(&workspace.normed, &mut workspace.value, stream)?;
+        self.query.run(
+            &workspace.normed,
+            &mut workspace.query,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
+        self.key.run(
+            &workspace.normed,
+            &mut workspace.key,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
+        self.value.run(
+            &workspace.normed,
+            &mut workspace.value,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
         match cache {
             Nemotron3AttentionCache::F32(cache) => {
                 cache.append_on_stream(&workspace.key, &workspace.value, stream)?;
@@ -275,9 +289,15 @@ impl Nemotron3AttentionLayer {
                 )?;
             }
         }
-        self.output
-            .run(&workspace.attended, &mut workspace.projected_output, stream)?;
-        add_f32_into_on_stream(
+        round_activation(precision, &mut workspace.attended, stream)?;
+        self.output.run(
+            &workspace.attended,
+            &mut workspace.projected_output,
+            gemm,
+            stream,
+        )?;
+        residual_add(
+            precision,
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -295,10 +315,13 @@ impl Nemotron3AttentionLayer {
         page_table: &DeviceBuffer<u32>,
         position: usize,
         compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
+        mut gemm: Option<&mut F32DenseGemm>,
         stream: &CudaStream,
     ) -> Result<()> {
+        let precision = gemm.as_ref().map_or(GemmPrecision::F32, |g| g.precision());
         workspace.require_manifest(&self.manifest)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            precision,
             1,
             self.manifest.hidden_size,
             hidden,
@@ -307,12 +330,24 @@ impl Nemotron3AttentionLayer {
             self.manifest.norm_epsilon,
             stream,
         )?;
-        self.query
-            .run(&workspace.normed, &mut workspace.query, stream)?;
-        self.key
-            .run(&workspace.normed, &mut workspace.key, stream)?;
-        self.value
-            .run(&workspace.normed, &mut workspace.value, stream)?;
+        self.query.run(
+            &workspace.normed,
+            &mut workspace.query,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
+        self.key.run(
+            &workspace.normed,
+            &mut workspace.key,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
+        self.value.run(
+            &workspace.normed,
+            &mut workspace.value,
+            gemm.as_deref_mut(),
+            stream,
+        )?;
         let page = pages.iter().next().ok_or_else(|| Error::Format {
             label: "Nemotron 3 one-token append",
             detail: "reservation contains no physical page".to_string(),
@@ -358,6 +393,7 @@ impl Nemotron3AttentionLayer {
                     self.manifest.attention_heads,
                     self.manifest.kv_heads,
                     self.manifest.attention_head_dim,
+                    precision == GemmPrecision::Bf16,
                     stream,
                 )?;
             }
@@ -390,9 +426,15 @@ impl Nemotron3AttentionLayer {
                     )?;
             }
         }
-        self.output
-            .run(&workspace.attended, &mut workspace.projected_output, stream)?;
-        add_f32_into_on_stream(
+        round_activation(precision, &mut workspace.attended, stream)?;
+        self.output.run(
+            &workspace.attended,
+            &mut workspace.projected_output,
+            gemm,
+            stream,
+        )?;
+        residual_add(
+            precision,
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -425,7 +467,8 @@ impl Nemotron3AttentionLayer {
             });
         }
         workspace.require_manifest(&self.manifest, rows)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            gemm.precision(),
             rows,
             self.manifest.hidden_size,
             hidden,
@@ -470,6 +513,7 @@ impl Nemotron3AttentionLayer {
             self.manifest.attention_head_dim,
             stream,
         )?;
+        round_activation(gemm.precision(), &mut workspace.attended, stream)?;
         self.output.run_rows(
             &workspace.attended,
             &mut workspace.projected_output,
@@ -477,7 +521,8 @@ impl Nemotron3AttentionLayer {
             gemm,
             stream,
         )?;
-        add_f32_into_on_stream(
+        residual_add(
+            gemm.precision(),
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -507,7 +552,8 @@ impl Nemotron3AttentionLayer {
         stream: &CudaStream,
     ) -> Result<()> {
         workspace.require_manifest(&self.manifest, rows)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            gemm.precision(),
             rows,
             self.manifest.hidden_size,
             hidden,
@@ -557,6 +603,8 @@ impl Nemotron3AttentionLayer {
                     self.manifest.attention_heads,
                     self.manifest.kv_heads,
                     self.manifest.attention_head_dim,
+                    gemm.precision() == GemmPrecision::Bf16
+                        && sequence_lengths_host.iter().all(|&n| n <= 8),
                     stream,
                 )?;
             }
@@ -630,6 +678,7 @@ impl Nemotron3AttentionLayer {
                 }
             }
         }
+        round_activation(gemm.precision(), &mut workspace.attended, stream)?;
         self.output.run_rows(
             &workspace.attended,
             &mut workspace.projected_output,
@@ -637,7 +686,8 @@ impl Nemotron3AttentionLayer {
             gemm,
             stream,
         )?;
-        add_f32_into_on_stream(
+        residual_add(
+            gemm.precision(),
             hidden,
             &workspace.projected_output,
             workspace.output.output(),
@@ -670,7 +720,8 @@ impl Nemotron3AttentionLayer {
             });
         }
         workspace.require_manifest(&self.manifest, rows)?;
-        rms_norm_f32_into_on_stream(
+        norm(
+            gemm.precision(),
             rows,
             self.manifest.hidden_size,
             hidden,

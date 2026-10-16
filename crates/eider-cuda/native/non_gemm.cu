@@ -6956,6 +6956,7 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
     std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
+    int stable_reduction,
     cudaStream_t stream) {
     constexpr int kThreads = 256;
     if (query == nullptr || key_pool == nullptr || value_pool == nullptr ||
@@ -6964,6 +6965,12 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
         total_tokens == 0 || page_tokens == 0 || q_heads == 0 || kv_heads == 0 ||
         head_dim == 0 || head_dim > kThreads || q_heads % kv_heads != 0) {
         return cudaErrorInvalidValue;
+    }
+    if (stable_reduction && head_dim == 128) {
+        infer_ragged_paged_gqa_head128_f32_kernel<8><<<dim3(total_tokens,q_heads),256,0,stream>>>(
+            query,key_pool,value_pool,page_tables,sequence_offsets,sequence_lengths,start_positions,
+            output,sequence_count,page_tokens,q_heads,kv_heads);
+        return cudaGetLastError();
     }
     if (head_dim == 128 && total_tokens >= 32 && sequence_count <= 65535) {
         constexpr unsigned kSharedBytes = (128 * 33 + 32 * 128 + 64 * (128 + 32)) * sizeof(float);
@@ -12339,6 +12346,39 @@ infer_nemotron3_mamba_conv_update_f32_chunks_snapshot_on_stream(
     return cudaGetLastError();
 }
 
+// Compiled BF16 RMSNorm rounds the normalized value before the weight product.
+__global__ void nemotron3_bf16_norm(const float* x, const float* w, float* y,
+    unsigned width, float eps) {
+    const unsigned base = blockIdx.x * width;
+    float square = 0.f;
+    for (unsigned c = threadIdx.x; c < width; c += blockDim.x)
+        square = fmaf(x[base+c], x[base+c], square);
+    const float sum = infer_block_reduce_sum(square);
+    __shared__ float inv;
+    if (threadIdx.x == 0) inv = rsqrtf(sum / width + eps);
+    __syncthreads();
+    for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+        const float normalized = __bfloat162float(__float2bfloat16_rn(x[base+c] * inv));
+        y[base+c] = __bfloat162float(__float2bfloat16_rn(normalized * w[c]));
+    }
+}
+extern "C" cudaError_t infer_nemotron3_bf16_norm(const float* x, const float* w,
+    float* y, unsigned rows, unsigned width, float eps, cudaStream_t stream) {
+    nemotron3_bf16_norm<<<rows,256,0,stream>>>(x,w,y,width,eps);
+    return cudaGetLastError();
+}
+// Retain the unrounded sum for the next norm; the residual operand itself is BF16.
+__global__ void nemotron3_bf16_residual(const float* residual, const float* branch,
+    float* output, unsigned count) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) output[i] = __bfloat162float(__float2bfloat16_rn(residual[i])) + branch[i];
+}
+extern "C" cudaError_t infer_nemotron3_bf16_residual(const float* residual,
+    const float* branch, float* output, unsigned count, cudaStream_t stream) {
+    nemotron3_bf16_residual<<<(count+255)/256,256,0,stream>>>(residual,branch,output,count);
+    return cudaGetLastError();
+}
+
 template <typename State>
 __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     const float* projected,
@@ -12353,7 +12393,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
-    float dt_floor) {
+    float dt_floor, int bf16_compute) {
     constexpr std::uint32_t kWarpsPerBlock = 8;
     const std::uint32_t warp = threadIdx.x >> 5;
     const std::uint32_t lane = threadIdx.x & 31U;
@@ -12409,6 +12449,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     y = infer_warp_reduce_sum(y);
     if (lane == 0) {
         y += d * x;
+        if (bf16_compute) y = __bfloat162float(__float2bfloat16_rn(y));
         const float silu_gate = gate / (1.0f + expf(-gate));
         output[flat] = y * silu_gate;
     }
@@ -12418,7 +12459,7 @@ __global__ void infer_nemotron3_group_rms_norm_f32_kernel(
     float* output,
     const std::uint16_t* norm_weight_bf16,
     std::uint32_t group_width,
-    float eps) {
+    float eps, int bf16_compute) {
     const std::uint32_t group_begin = blockIdx.x * group_width;
     float sum_squares = 0.0f;
     for (std::uint32_t group_index = threadIdx.x; group_index < group_width;
@@ -12437,7 +12478,13 @@ __global__ void infer_nemotron3_group_rms_norm_f32_kernel(
         const std::uint32_t flat = group_begin + group_index;
         const float weight = __bfloat162float(
             *reinterpret_cast<const __nv_bfloat16*>(norm_weight_bf16 + flat));
-        output[flat] *= inv_rms * weight;
+        if (bf16_compute) {
+            float value = output[flat] * inv_rms;
+            if (bf16_compute > 1) value = __bfloat162float(__float2bfloat16_rn(value));
+            output[flat] = __bfloat162float(__float2bfloat16_rn(value * weight));
+        } else {
+            output[flat] *= inv_rms * weight;
+        }
     }
 }
 
@@ -12446,7 +12493,7 @@ __global__ void infer_nemotron3_group_rms_norm_f32_chunks_kernel(
     const std::uint16_t* norm_weight_bf16,
     std::uint32_t groups,
     std::uint32_t group_width,
-    float eps) {
+    float eps, int bf16_compute) {
     const std::uint32_t row = blockIdx.x / groups;
     const std::uint32_t group = blockIdx.x % groups;
     const std::uint32_t intermediate_size = groups * group_width;
@@ -12469,7 +12516,13 @@ __global__ void infer_nemotron3_group_rms_norm_f32_chunks_kernel(
         const std::uint32_t flat = group * group_width + group_index;
         const float weight = __bfloat162float(
             *reinterpret_cast<const __nv_bfloat16*>(norm_weight_bf16 + flat));
-        output[group_begin + group_index] *= inv_rms * weight;
+        if (bf16_compute) {
+            float value = output[group_begin + group_index] * inv_rms;
+            if (bf16_compute > 1) value = __bfloat162float(__float2bfloat16_rn(value));
+            output[group_begin + group_index] = __bfloat162float(__float2bfloat16_rn(value * weight));
+        } else {
+            output[group_begin + group_index] *= inv_rms * weight;
+        }
     }
 }
 
@@ -12486,6 +12539,8 @@ __global__ void nemotron3_mamba_coefficients(const float* projected, const uint1
     const float a = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(a_log + head));
     output[i] = make_float2(dt, expf(-dt * expf(a)));
 }
+
+#include "nemotron3_ssd.cuh"
 
 template <typename State, unsigned RegisterStateSize = 0, bool Prepared = false>
 __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
@@ -12506,7 +12561,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
-    float dt_floor) {
+    float dt_floor, int bf16_compute) {
     constexpr std::uint32_t kWarpsPerBlock = 8;
     const std::uint32_t sequence = blockIdx.x;
     const std::uint32_t warp = threadIdx.x >> 5;
@@ -12611,6 +12666,7 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
         y = infer_warp_reduce_sum(y);
         if (lane == 0) {
             y += d * x;
+            if (bf16_compute) y = __bfloat162float(__float2bfloat16_rn(y));
             const float silu_gate = gate / (1.0f + expf(-gate));
             output[static_cast<std::size_t>(row) * intermediate_size + flat] =
                 y * silu_gate;
@@ -12637,6 +12693,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
     std::uint32_t groups,
     std::uint32_t state_size,
     int ssm_fp32,
+    int bf16_compute,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12644,7 +12701,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
         d_bf16 == nullptr || dt_bias_bf16 == nullptr || norm_weight_bf16 == nullptr ||
         ssm_state == nullptr || output == nullptr || heads == 0 || head_dim == 0 ||
         groups == 0 || state_size == 0 || heads % groups != 0 ||
-        !(dt_floor > 0.0f) || !(eps > 0.0f)) {
+        !(dt_floor >= 0.0f) || !(eps > 0.0f)) {
         return cudaErrorInvalidValue;
     }
     constexpr std::uint32_t kThreads = 256;
@@ -12667,7 +12724,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
             head_dim,
             groups,
             state_size,
-            dt_floor);
+            dt_floor, bf16_compute);
     };
     if (ssm_fp32) {
         launch(float{});
@@ -12680,7 +12737,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
     }
     const std::uint32_t group_width = intermediate_size / groups;
     infer_nemotron3_group_rms_norm_f32_kernel<<<groups, kThreads, 0, stream>>>(
-        output, norm_weight_bf16, group_width, eps);
+        output, norm_weight_bf16, group_width, eps, bf16_compute ? (groups > 1 ? 2 : 1) : 0);
     return cudaGetLastError();
 }
 
@@ -12704,6 +12761,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     std::uint32_t groups,
     std::uint32_t state_size,
     int ssm_fp32,
+    int bf16_compute,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12713,7 +12771,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
         sequence_lengths == nullptr || output == nullptr || coefficients == nullptr || sequence_count == 0 ||
         total_tokens == 0 || projection_size == 0 || heads == 0 || head_dim == 0 ||
         groups == 0 || state_size == 0 || heads % groups != 0 ||
-        !(dt_floor > 0.0f) || !(eps > 0.0f)) {
+        !(dt_floor >= 0.0f) || !(eps > 0.0f)) {
         return cudaErrorInvalidValue;
     }
     constexpr std::uint32_t kThreads = 256;
@@ -12747,7 +12805,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
             head_dim,
             groups,
             state_size,
-            dt_floor);
+            dt_floor, bf16_compute);
         } else {
         infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element), 0, true><<<
             blocks, kThreads, 0, stream>>>(
@@ -12768,7 +12826,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
             head_dim,
             groups,
             state_size,
-            dt_floor);
+            dt_floor, bf16_compute);
         }
     };
     if (ssm_fp32) {
@@ -12784,7 +12842,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     const std::uint32_t norm_blocks = total_tokens * groups;
     infer_nemotron3_group_rms_norm_f32_chunks_kernel<<<
         norm_blocks, kThreads, 0, stream>>>(
-        output, norm_weight_bf16, groups, group_width, eps);
+        output, norm_weight_bf16, groups, group_width, eps, bf16_compute ? (groups > 1 ? 2 : 1) : 0);
     return cudaGetLastError();
 }
 
@@ -12810,6 +12868,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     std::uint32_t groups,
     std::uint32_t state_size,
     int ssm_fp32,
+    int bf16_compute,
     float dt_floor,
     float eps,
     cudaStream_t stream) {
@@ -12820,7 +12879,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
         state_snapshots == nullptr || sequence_count == 0 ||
         total_tokens == 0 || snapshot_slots == 0 || projection_size == 0 ||
         heads == 0 || head_dim == 0 || groups == 0 || state_size == 0 ||
-        heads % groups != 0 || !(dt_floor > 0.0f) || !(eps > 0.0f)) {
+        heads % groups != 0 || !(dt_floor >= 0.0f) || !(eps > 0.0f)) {
         return cudaErrorInvalidValue;
     }
     constexpr std::uint32_t kThreads = 256;
@@ -12849,7 +12908,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
             head_dim,
             groups,
             state_size,
-            dt_floor);
+            dt_floor, bf16_compute);
     };
     if (ssm_fp32) {
         launch(float{});
@@ -12864,7 +12923,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
     const std::uint32_t norm_blocks = total_tokens * groups;
     infer_nemotron3_group_rms_norm_f32_chunks_kernel<<<
         norm_blocks, kThreads, 0, stream>>>(
-        output, norm_weight_bf16, groups, group_width, eps);
+        output, norm_weight_bf16, groups, group_width, eps, bf16_compute ? (groups > 1 ? 2 : 1) : 0);
     return cudaGetLastError();
 }
 

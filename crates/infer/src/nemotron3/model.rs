@@ -3,7 +3,7 @@
 use super::lilicorr::{
     LiLiCorrDraft, LiLiCorrProposal, LiLiCorrSequence, LiLiCorrSnapshot, LiLiCorrWorkspace,
 };
-use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
+use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32, norm};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{
     Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
@@ -20,8 +20,8 @@ use eider_cuda::{
     argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
-    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
-    select_mamba_ssm_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
+    select_bf16_state_snapshot_into_on_stream, select_mamba_ssm_state_snapshot_into_on_stream,
+    speculative_accept_argmax_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -44,7 +44,7 @@ pub struct Nemotron3Model {
     mtp: Option<Nemotron3Mtp>,
     lilicorr: Option<LiLiCorrDraft>,
     compact_kv_cache: bool,
-    prefill_precision: eider_cuda::GemmPrecision,
+    compute_precision: eider_cuda::GemmPrecision,
     stream: CudaStream,
 }
 
@@ -130,7 +130,7 @@ impl Nemotron3Model {
             mtp,
             lilicorr: None,
             compact_kv_cache: storage.kv_cache == Nemotron3KvCacheStorage::Nvfp4,
-            prefill_precision: storage.prefill_precision,
+            compute_precision: storage.compute_precision,
             stream: CudaStream::new_non_blocking()?,
         })
     }
@@ -380,7 +380,29 @@ impl Nemotron3Model {
                 _ => None,
             });
         }
+        let dense_gemm = if self.compute_precision == eider_cuda::GemmPrecision::Bf16 {
+            let mut weights = Vec::new();
+            for layer in &self.layers {
+                match layer {
+                    Nemotron3Layer::Mamba(l) => weights.extend(l.dense_linears()),
+                    Nemotron3Layer::Moe(l) => weights.extend(l.dense_linears()),
+                    Nemotron3Layer::Attention(l) => weights.extend(l.dense_linears()),
+                }
+            }
+            if generation {
+                weights.push(&self.lm_head);
+            }
+            Some(Nemotron3Linear::dense_workspace(
+                1,
+                self.compute_precision,
+                weights.into_iter(),
+            )?)
+        } else {
+            None
+        };
         Ok(Nemotron3DecodeState {
+            dense_gemm,
+            decode_warm: false,
             decode_graphs: (0..=self.layers.len()).map(|_| None).collect(),
             hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             layers,
@@ -1300,8 +1322,12 @@ impl Nemotron3Model {
                     continue;
                 }
                 if workspace.last_logits_only {
-                    self.lm_head
-                        .run(&state.final_hidden, &mut state.logits, &self.stream)?;
+                    self.lm_head.run(
+                        &state.final_hidden,
+                        &mut state.logits,
+                        state.dense_gemm.as_mut(),
+                        &self.stream,
+                    )?;
                 } else {
                     copy_row_f32_into_on_stream(
                         rows,
@@ -1323,7 +1349,8 @@ impl Nemotron3Model {
         stream: &CudaStream,
     ) -> Result<()> {
         let rows = workspace.rows;
-        rms_norm_f32_into_on_stream(
+        norm(
+            self.compute_precision,
             rows,
             self.manifest.hidden_size,
             &workspace.hidden,
@@ -2320,6 +2347,19 @@ impl Nemotron3Model {
             state.hidden.output(),
             &self.stream,
         )?;
+        if state.dense_gemm.is_some() && !state.decode_warm {
+            self.enqueue_decode_layers(
+                state,
+                cache,
+                reservation,
+                page_table,
+                0,
+                self.layers.len(),
+            )?;
+            self.enqueue_decode_head(state)?;
+            state.decode_warm = true;
+            return Ok(());
+        }
         let mut start = 0;
         while start < self.layers.len() {
             if matches!(self.layers[start], Nemotron3Layer::Attention(_)) {
@@ -2378,12 +2418,26 @@ impl Nemotron3Model {
             match (&self.layers[layer], &mut current[0]) {
                 (
                     Nemotron3Layer::Mamba(weights),
-                    Nemotron3LayerState::Mamba { workspace, state },
+                    Nemotron3LayerState::Mamba {
+                        workspace,
+                        state: recurrent,
+                    },
                 ) => {
-                    weights.run_one_token(input, workspace, state, &self.stream)?;
+                    weights.run_one_token(
+                        input,
+                        workspace,
+                        recurrent,
+                        state.dense_gemm.as_mut(),
+                        &self.stream,
+                    )?;
                 }
                 (Nemotron3Layer::Moe(weights), Nemotron3LayerState::Moe(workspace)) => {
-                    weights.run_one_token(input, workspace, &self.stream)?;
+                    weights.run_one_token(
+                        input,
+                        workspace,
+                        state.dense_gemm.as_mut(),
+                        &self.stream,
+                    )?;
                 }
                 (
                     Nemotron3Layer::Attention(weights),
@@ -2399,6 +2453,7 @@ impl Nemotron3Model {
                                 page_table,
                                 state.tokens,
                                 state.compact_attention.as_mut(),
+                                state.dense_gemm.as_mut(),
                                 &self.stream,
                             )
                         })
@@ -2441,7 +2496,8 @@ impl Nemotron3Model {
                 detail: "model has no layers".to_string(),
             })?
             .output();
-        rms_norm_f32_into_on_stream(
+        norm(
+            self.compute_precision,
             1,
             self.manifest.hidden_size,
             last,
@@ -2450,8 +2506,12 @@ impl Nemotron3Model {
             self.manifest.norm_epsilon,
             &self.stream,
         )?;
-        self.lm_head
-            .run(&state.final_hidden, &mut state.logits, &self.stream)?;
+        self.lm_head.run(
+            &state.final_hidden,
+            &mut state.logits,
+            state.dense_gemm.as_mut(),
+            &self.stream,
+        )?;
         Ok(())
     }
 
@@ -2773,11 +2833,7 @@ impl Nemotron3BlockWorkspace {
             .count();
         // Row temporaries are reused by shape. Only recurrent and KV state is
         // layer-specific; hidden carries each residual to the next layer.
-        let precision = if draft_count.is_none() && rows > 8 {
-            model.prefill_precision
-        } else {
-            eider_cuda::GemmPrecision::F32
-        };
+        let precision = model.compute_precision;
         let mut layers = Vec::new();
         let mut shapes = Vec::new();
         let mut layer_slots = Vec::with_capacity(model.layers.len());
@@ -2848,7 +2904,8 @@ impl Nemotron3BlockWorkspace {
         if !last_logits_only {
             dense_weights.push(&model.lm_head);
         }
-        let mut dense_gemm = Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?;
+        let mut dense_gemm =
+            Nemotron3Linear::dense_workspace(rows, precision, dense_weights.into_iter())?;
         dense_gemm.set_precision(precision);
         let workspace = Self {
             graphs: (0..=model.layers.len()).map(|_| None).collect(),
@@ -3108,6 +3165,8 @@ impl seqcache::RetainedSnapshot for Nemotron3SequenceSnapshot {
 pub(crate) struct Nemotron3DecodeState {
     // Graphs contain addresses owned by this sequence and the resident model.
     decode_graphs: Vec<Option<CudaGraphExec>>,
+    decode_warm: bool,
+    dense_gemm: Option<F32DenseGemm>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerState>,
     rollback_mamba: Vec<Option<Nemotron3MambaState>>,
@@ -3153,6 +3212,10 @@ impl Nemotron3DecodeState {
     /// Returns bytes owned by this sequence's device-resident state and scratch.
     pub fn device_bytes(&self) -> usize {
         self.hidden.device_bytes()
+            + self
+                .dense_gemm
+                .as_ref()
+                .map_or(0, F32DenseGemm::device_bytes)
             + self
                 .lilicorr
                 .as_ref()
@@ -3247,29 +3310,69 @@ mod lilicorr_tests {
     #[test]
     #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
     fn lilicorr_commits_match_serial_target() {
-        check_lilicorr_commits(Nemotron3StorageConfig::default());
+        check_lilicorr_commits(Nemotron3StorageConfig::default(), 1, false);
     }
 
     #[test]
     #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
-    fn lilicorr_bf16_prefill_commits_match_serial_target() {
-        check_lilicorr_commits(Nemotron3StorageConfig {
-            prefill_precision: eider_cuda::GemmPrecision::Bf16,
-            mamba_ssm_dtype: Some(eider_cuda::MambaSsmDtype::Bf16),
-            ..Nemotron3StorageConfig::default()
-        });
+    fn lilicorr_bf16_commits_match_serial_target() {
+        check_lilicorr_commits(
+            Nemotron3StorageConfig {
+                compute_precision: eider_cuda::GemmPrecision::Bf16,
+                mamba_ssm_dtype: Some(eider_cuda::MambaSsmDtype::Bf16),
+                ..Nemotron3StorageConfig::default()
+            },
+            1,
+            false,
+        );
     }
 
     #[test]
     #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
     fn lilicorr_bf16_matrices_f32_state_commits_match_serial_target() {
-        check_lilicorr_commits(Nemotron3StorageConfig {
-            prefill_precision: eider_cuda::GemmPrecision::Bf16,
-            ..Nemotron3StorageConfig::default()
-        });
+        check_lilicorr_commits(
+            Nemotron3StorageConfig {
+                compute_precision: eider_cuda::GemmPrecision::Bf16,
+                ..Nemotron3StorageConfig::default()
+            },
+            1,
+            false,
+        );
     }
 
-    fn check_lilicorr_commits(storage: Nemotron3StorageConfig) {
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_bf16_ssd_prefill_commits_match_serial_target() {
+        check_lilicorr_commits(
+            Nemotron3StorageConfig {
+                compute_precision: eider_cuda::GemmPrecision::Bf16,
+                mamba_ssm_dtype: Some(eider_cuda::MambaSsmDtype::Bf16),
+                ..Nemotron3StorageConfig::default()
+            },
+            3,
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_bf16_trailing_space_commits_match_serial_target() {
+        check_lilicorr_commits(
+            Nemotron3StorageConfig {
+                compute_precision: eider_cuda::GemmPrecision::Bf16,
+                mamba_ssm_dtype: Some(eider_cuda::MambaSsmDtype::Bf16),
+                ..Nemotron3StorageConfig::default()
+            },
+            1,
+            true,
+        );
+    }
+
+    fn check_lilicorr_commits(
+        storage: Nemotron3StorageConfig,
+        prompt_repetitions: usize,
+        trailing_space: bool,
+    ) {
         let root = std::env::var("NEMOTRON_MODEL_DIR").unwrap();
         let mut model = Nemotron3Model::load_with_storage(&root, storage).unwrap();
         model
@@ -3277,7 +3380,7 @@ mod lilicorr_tests {
             .unwrap();
         let tokenizer =
             tokenizers::Tokenizer::from_file(Path::new(&root).join("tokenizer.json")).unwrap();
-        let prompt = tokenizer.encode("The capital of Canada is Ottawa. Explain briefly why Ottawa was selected as the capital, and name the province in which it is located.",true).unwrap();
+        let prompt = tokenizer.encode("The capital of Canada is Ottawa. Explain briefly why Ottawa was selected as the capital, and name the province in which it is located.".repeat(prompt_repetitions) + if trailing_space { " " } else { "" },true).unwrap();
         let tokens = prompt.get_ids();
         let mut cache = new_nemotron3_sequence_cache(&model, 2, 1024).unwrap();
         let mut serial = Nemotron3Sequence::admit(&model, &mut cache, 1024).unwrap();

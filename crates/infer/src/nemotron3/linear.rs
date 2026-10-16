@@ -1,14 +1,59 @@
 //! Nemotron 3 dense-linear storage choices and device operations.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, F32DenseGemm, GgmlWeights, Result,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    fp8_linear_channel_scaled_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, F32DenseGemm, GemmPrecision, GgmlWeights, Result,
+    bf16_linear_exact_rows_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
     fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
     nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
+
+pub(super) fn round_activation(
+    precision: GemmPrecision,
+    values: &mut DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if precision == GemmPrecision::Bf16 {
+        round_f32_to_bf16_in_place_on_stream(values.inout(), stream)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn norm(
+    precision: GemmPrecision,
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    output: eider_cuda::DeviceOutput<'_, f32>,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let kernel = if precision == GemmPrecision::Bf16 {
+        eider_cuda::nemotron3_bf16_norm_into_on_stream
+    } else {
+        eider_cuda::rms_norm_f32_into_on_stream
+    };
+    kernel(rows, cols, input, weight, output, eps, stream)
+}
+pub(super) fn residual_add(
+    precision: GemmPrecision,
+    residual: &DeviceBuffer<f32>,
+    branch: &DeviceBuffer<f32>,
+    output: eider_cuda::DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let kernel = if precision == GemmPrecision::Bf16 {
+        eider_cuda::nemotron3_bf16_residual_into_on_stream
+    } else {
+        eider_cuda::add_f32_into_on_stream
+    };
+    kernel(residual, branch, output, stream)
+}
 
 /// Device format used when the checkpoint stores a dense linear in BF16.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -48,8 +93,8 @@ pub struct Nemotron3StorageConfig {
     pub bf16: Nemotron3Bf16Storage,
     pub fp8: Nemotron3Fp8Storage,
     pub kv_cache: Nemotron3KvCacheStorage,
-    /// Matrix arithmetic for prompt batches; verification and decode retain F32.
-    pub prefill_precision: eider_cuda::GemmPrecision,
+    /// Model arithmetic for projections, activations, and residuals.
+    pub compute_precision: eider_cuda::GemmPrecision,
     /// Override the checkpoint recurrent-state dtype when explicitly selected.
     pub mamba_ssm_dtype: Option<eider_cuda::MambaSsmDtype>,
 }
@@ -95,14 +140,7 @@ impl Nemotron3Linear {
                         detail: format!("unexpected dimensions for {prefix}"),
                     });
                 }
-                let mut linear = GgmlWeights::new(weight.format, 1, rows, cols, &weight.packed)?;
-                if storage.prefill_precision == eider_cuda::GemmPrecision::Bf16
-                    && !prefix.ends_with("lm_head")
-                {
-                    let stream = CudaStream::new_blocking()?;
-                    linear.prepare_bf16(&stream)?;
-                    stream.synchronize()?;
-                }
+                let linear = GgmlWeights::new(weight.format, 1, rows, cols, &weight.packed)?;
                 Ok(Self::Ggml(linear))
             }
             "BF16" => match storage.bf16 {
@@ -138,8 +176,12 @@ impl Nemotron3Linear {
         &self,
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
+        gemm: Option<&mut F32DenseGemm>,
         stream: &CudaStream,
     ) -> Result<()> {
+        if let Some(gemm) = gemm {
+            return self.run_rows(input, output, 1, gemm, stream);
+        }
         match self {
             Self::Ggml(linear) => linear.run_rows(input, output.output(), 1, None, stream),
             Self::Bf16(linear) => linear.run(input, output, stream),
@@ -156,6 +198,77 @@ impl Nemotron3Linear {
         gemm: &mut F32DenseGemm,
         stream: &CudaStream,
     ) -> Result<()> {
+        if gemm.precision() == GemmPrecision::Bf16 {
+            match self {
+                Self::Ggml(linear) => linear.run_rows(
+                    input,
+                    output.output(),
+                    batch_rows,
+                    Some(gemm.ggml_workspace(batch_rows, linear.in_features())?),
+                    stream,
+                ),
+                Self::Bf16(linear) => gemm.run_on_stream(
+                    input,
+                    &linear.weight,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+                // Model inputs are BF16 at projection boundaries. E2M1 times UE4M3
+                // is exactly representable in BF16; keep small batches packed.
+                Self::Nvfp4(linear) if batch_rows <= 8 => {
+                    nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+                        input,
+                        &linear.packed_weight,
+                        &linear.weight_scale,
+                        output.output(),
+                        batch_rows,
+                        linear.rows,
+                        linear.cols,
+                        linear.weight_scale_2,
+                        stream,
+                    )
+                }
+                Self::Nvfp4(linear) if linear.prepared_rows.is_some() => gemm
+                    .run_prepared_quantized_on_stream(
+                        input,
+                        linear.prepared_rows.as_ref().unwrap(),
+                        output.output(),
+                        batch_rows,
+                        linear.rows,
+                        linear.cols,
+                        linear.weight_scale_2,
+                        stream,
+                    ),
+                Self::Nvfp4(linear) => gemm.run_quantized_on_stream(
+                    input,
+                    &linear.packed_weight,
+                    Some(&linear.weight_scale),
+                    None,
+                    linear.weight_scale_2,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+                Self::Fp8(linear) => gemm.run_quantized_on_stream(
+                    input,
+                    &linear.weight,
+                    None,
+                    linear.channel_weight_scale.as_ref(),
+                    linear.weight_scale,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                ),
+            }?;
+            return round_f32_to_bf16_in_place_on_stream(output.inout(), stream);
+        }
         if (2..=8).contains(&batch_rows)
             && let Self::Ggml(linear) = self
             && linear.format() == eider_format::GgmlBlockFormat::Iq2Xxs
@@ -208,20 +321,6 @@ impl Nemotron3Linear {
         }
         if batch_rows > 8 {
             return match self {
-                Self::Ggml(linear)
-                    if gemm.precision() == eider_cuda::GemmPrecision::Bf16
-                        && linear.prepared_bf16().is_some() =>
-                {
-                    gemm.run_on_stream(
-                        input,
-                        linear.prepared_bf16().unwrap(),
-                        output.output(),
-                        batch_rows,
-                        linear.out_features(),
-                        linear.in_features(),
-                        stream,
-                    )
-                }
                 Self::Ggml(linear) => linear.run_rows(
                     input,
                     output.output(),
@@ -376,15 +475,16 @@ impl Nemotron3Linear {
 
     pub(super) fn dense_workspace<'a>(
         rows: usize,
+        precision: GemmPrecision,
         weights: impl Iterator<Item = &'a Self>,
     ) -> Result<F32DenseGemm> {
-        if rows < 2 {
+        if rows < 2 && precision == GemmPrecision::F32 {
             return F32DenseGemm::new(1, 1, 0);
         }
         let mut features = 1;
         let mut elements = 0;
         for weight in weights {
-            if rows <= 8 {
+            if rows <= 8 && precision == GemmPrecision::F32 {
                 let Self::Fp8(w) = weight else {
                     continue;
                 };
@@ -399,27 +499,30 @@ impl Nemotron3Linear {
             }
 
             let (out, cols, quantized) = match weight {
-                Self::Ggml(w) if w.prepared_bf16().is_some() => {
-                    (w.out_features(), w.in_features(), false)
-                }
                 Self::Ggml(_) => continue,
                 Self::Bf16(w) => (w.rows, w.cols, false),
                 Self::Fp8(w) => (
                     w.rows,
                     w.cols,
-                    w.input_scale.is_none()
-                        || w.channel_weight_scale.is_some()
-                        || !w.rows.is_multiple_of(16)
-                        || !w.cols.is_multiple_of(16),
+                    // Small BF16 batches read FP8 weights directly. Prefill
+                    // expands them even when calibrated FP8 scales exist.
+                    rows > 8
+                        && (precision == GemmPrecision::Bf16
+                            || w.input_scale.is_none()
+                            || w.channel_weight_scale.is_some()
+                            || !w.rows.is_multiple_of(16)
+                            || !w.cols.is_multiple_of(16)),
                 ),
-                Self::Nvfp4(w) => (w.rows, w.cols, true),
+                Self::Nvfp4(w) => (w.rows, w.cols, w.prepared_rows.is_none()),
             };
             features = features.max(out).max(cols);
             if quantized {
                 elements = elements.max(out * cols);
             }
         }
-        F32DenseGemm::new(rows, features, elements)
+        let mut gemm = F32DenseGemm::new(rows, features, elements)?;
+        gemm.set_precision(precision);
+        Ok(gemm)
     }
 
     pub(super) fn device_bytes(&self) -> usize {
@@ -479,6 +582,37 @@ impl Nemotron3Bf16Linear {
 
     pub(super) fn device_bytes(&self) -> usize {
         self.weight.device_bytes()
+    }
+
+    pub(super) fn run_rows_f32(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        gemm: &mut F32DenseGemm,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows <= 8 {
+            return bf16_linear_exact_rows_f32_into_on_stream(
+                input,
+                &self.weight,
+                output.output(),
+                rows,
+                self.rows,
+                self.cols,
+                stream,
+            );
+        }
+        gemm.run_with_precision_on_stream(
+            input,
+            &self.weight,
+            output.output(),
+            rows,
+            self.rows,
+            self.cols,
+            GemmPrecision::F32,
+            stream,
+        )
     }
 }
 
@@ -762,4 +896,116 @@ pub(super) fn load_bf16_host(
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrated_fp8_weights_support_bf16_prefill_and_decode() {
+        let (cols, out, capacity) = (128, 64, 128);
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let round = |value| eider_cuda::format::bf16_to_f32(eider_cuda::format::f32_to_bf16(value));
+        let input: Vec<_> = (0..capacity * cols)
+            .map(|i| 0.5 + (i * 31 % 101) as f32 / 128.0 + 0.0001)
+            .collect();
+        let weights: Vec<_> = (0..out * cols)
+            .map(|i| (0x20 + i % 32) as u8 | if i % 3 == 0 { 0x80 } else { 0 })
+            .collect();
+        let weight_scale = 0.125;
+        let linear = Nemotron3Linear::Fp8(Nemotron3Fp8Linear {
+            weight: DeviceBuffer::from_host(&weights).unwrap(),
+            channel_weight_scale: None,
+            rows: out,
+            cols,
+            weight_scale,
+            input_scale: Some(0.03125),
+        });
+        for rows in [1, 4, 17, capacity] {
+            let mut gemm = Nemotron3Linear::dense_workspace(
+                rows,
+                GemmPrecision::Bf16,
+                std::iter::once(&linear),
+            )
+            .unwrap();
+            let device_input = DeviceBuffer::from_host(&input[..rows * cols]).unwrap();
+            let mut output = DeviceBuffer::zeroed(rows * out).unwrap();
+            linear
+                .run_rows(&device_input, &mut output, rows, &mut gemm, &stream)
+                .unwrap();
+            let actual = output.copy_to_host(&stream).unwrap();
+            for row in 0..rows {
+                for channel in 0..out {
+                    let expected = (0..cols)
+                        .map(|k| {
+                            f64::from(round(input[row * cols + k]))
+                                * f64::from(eider_cuda::format::e4m3_value(
+                                    weights[channel * cols + k],
+                                ))
+                        })
+                        .sum::<f64>() as f32;
+                    assert_eq!(
+                        actual[row * out + channel],
+                        round(expected * weight_scale),
+                        "rows={rows}, row={row}, channel={channel}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn router_projection_retains_f32_inputs_and_serial_reduction() {
+        let (cols, out, capacity) = (4096, 240, 17);
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let input: Vec<_> = (0..capacity * cols)
+            .map(|i| ((i * 31 % 1009) as f32 - 504.) / 137.137)
+            .collect();
+        let weights: Vec<_> = (0..out * cols)
+            .map(|i| eider_cuda::format::f32_to_bf16(((i * 71 % 1021) as f32 - 510.) / 4096.))
+            .collect();
+        let linear = Nemotron3Bf16Linear {
+            weight: DeviceBuffer::from_host(&weights).unwrap(),
+            rows: out,
+            cols,
+        };
+        let mut gemm = F32DenseGemm::new(capacity, cols, 0).unwrap();
+        gemm.set_precision(GemmPrecision::Bf16);
+        for rows in [1, 4, 8, 17] {
+            let device_input = DeviceBuffer::from_host(&input[..rows * cols]).unwrap();
+            let mut output = DeviceBuffer::zeroed(rows * out).unwrap();
+            linear
+                .run_rows_f32(&device_input, &mut output, rows, &mut gemm, &stream)
+                .unwrap();
+            assert_eq!(gemm.precision(), GemmPrecision::Bf16);
+            let actual = output.copy_to_host(&stream).unwrap();
+            for row in 0..rows {
+                if rows <= 8 {
+                    let one =
+                        DeviceBuffer::from_host(&input[row * cols..(row + 1) * cols]).unwrap();
+                    let mut expected = DeviceBuffer::zeroed(out).unwrap();
+                    linear.run(&one, &mut expected, &stream).unwrap();
+                    assert_eq!(
+                        &actual[row * out..(row + 1) * out],
+                        &*expected.copy_to_host(&stream).unwrap(),
+                        "serial routing differs at batch {rows}, row {row}",
+                    );
+                } else {
+                    for channel in 0..out {
+                        let expected: f64 = (0..cols)
+                            .map(|k| {
+                                f64::from(input[row * cols + k])
+                                    * f64::from(eider_cuda::format::bf16_to_f32(
+                                        weights[channel * cols + k],
+                                    ))
+                            })
+                            .sum();
+                        let error = (f64::from(actual[row * out + channel]) - expected).abs();
+                        assert!(error < 2e-4 + expected.abs() * 2e-5, "router error {error}");
+                    }
+                }
+            }
+        }
+    }
 }

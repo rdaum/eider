@@ -531,8 +531,8 @@ fn decisions_fork_recurrent_state_and_unaligned_kv_with_compact_readout() {
                     &mut cache,
                 )
                 .unwrap();
-            for (child, suffix) in children.into_iter().zip(chunks) {
-                let actual = head.selected_logits(&model, &child).unwrap();
+            for (mut child, suffix) in children.into_iter().zip(chunks) {
+                let actual = head.selected_logits(&model, &mut child).unwrap();
                 let mut reference_cache =
                     super::new_nemotron3_sequence_cache(&model, 1, 64).unwrap();
                 let mut reference =

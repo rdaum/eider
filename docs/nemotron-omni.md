@@ -183,67 +183,144 @@ Their common dense work limits the benefit from reducing the routed parameter co
 The Bolt launcher selects this official snapshot by default. Set
 `NEMOTRON35_BOLT_MODEL` or `--model-dir` to use the community conversion.
 
-### BF16 prefill evaluation
+### BF16 model execution
 
-The server can select BF16 matrix arithmetic and recurrent state independently:
+Both launchers select BF16 computation and recurrent state by default:
 
-```sh
-scripts/run-eider-nemotron35-bolt.sh \
-  --nemotron-prefill-precision bf16 \
-  --nemotron-mamba-ssm-dtype bf16
-```
+| Launcher | Model | Recurrent-state dtype |
+| --- | --- | --- |
+| `scripts/run-eider-nemotron35.sh` | Super | BF16, overriding the checkpoint's F32 setting |
+| `scripts/run-eider-nemotron35-bolt.sh` | Bolt | BF16, as measured below |
 
-Both settings are experimental and explicit. The server defaults to F32 matrix inputs and the
-checkpoint's recurrent-state dtype. Omit the state override to evaluate BF16
-matrices with F32 recurrent state.
+The compute setting covers prefill, single-token decode, and speculative verification.
+The generic server default remains F32. Recurrent-state storage can be selected independently.
+Explicit `--nemotron-compute-precision` and `--nemotron-mamba-ssm-dtype` arguments override the launcher defaults.
+Super's BF16 generation replay is recorded below.
 
-BF16 prefill rounds matrix inputs and dequantized IQ2/Q8 weights to BF16.
-Matrix accumulation, residuals, and attention remain F32. Verification and
-single-token decode retain their existing matrix arithmetic. This implements
-part of NVIDIA's BF16 serving recipe; it does not reproduce that entire backend.
+IQ2/Q8 projections keep their packed checkpoint weights. Dense projections no longer
+retain the additional 4.44 GiB of expanded BF16 copies. Mamba's existing prepared
+NVFP4 weights remain resident. Projections use BF16 inputs and dequantized weights,
+with F32 accumulation and BF16 output rounding. The router retains F32 arithmetic.
+Small BF16 cuBLAS projections share an eight-row reduction shape across decode
+and verification. Paged attention also shares one reduction shape for these batches.
+These choices prevent batch-dependent rounding from changing acceptance.
+NVFP4 decode and verification read packed weights; large prompt batches use the prepared Mamba copies.
 
-Dense IQ2/Q8 projections retain prepared BF16 copies for prefill. This adds
-4.44 GiB to the official target, bringing resident text weights to about
-33.5 GiB before drafter weights and workspaces. Routed experts remain packed.
-Their BF16 path fuses ReLU-squared with input preparation. Sequential dense
-projections share cuBLAS scratch, and fused expert workspaces omit the unused
-activation intermediate.
+Residual operands use BF16. Their F32 sum feeds the next normalization before
+rounding the stored residual. Normalization rounds the normalized value before
+multiplication by its BF16 weight. Mamba rounds its SSM output before F32 gating
+and grouped normalization. These boundaries follow vLLM's compiled BF16 path.
 
-The same 7,051-token request used 2,048-token prefill chunks, three LiLiCorr
-drafts, and 256 greedy output tokens. Two separate BF16 runs exceeded twice
-the starting prefill throughput:
+For prefill batches of at least 64 tokens, Mamba uses 64-token SSD chunks.
+Tensor-core products compute chunk states, C-B products, and outputs. Inter-chunk
+state passing retains F32 arithmetic and writes the configured state dtype.
+One bounded workspace is shared by all Mamba layers. Partial chunks and ragged
+sequences retain separate initial and final states. Decode and speculative
+verification retain the recurrent kernels and per-token rollback snapshots.
 
-| Setting | Prefill tokens/s | Prefill time | Time to first token | Complete request |
+### BF16 generation replay
+
+The complete BF16 path uses the same three-request replay described above.
+These runs used three drafts, 2,048-token prefill batches, and 256 greedy output tokens.
+The F32 row is the previous reference run. Generated text differs between precision modes.
+
+| Mode | Long prefill tokens/s | Long decode tokens/s | Long request | Cached request |
 | --- | ---: | ---: | ---: | ---: |
-| Starting F32 baseline | 568 | 12.42 s | 12.88 s | 19.76 s |
-| Final F32 reference | 574 | 12.27 s | 12.68 s | 19.62 s |
-| BF16 matrices and state, run 1 | 1,153 | 6.11 s | 6.44 s | 13.71 s |
-| BF16 matrices and state, run 2 | 1,155 | 6.11 s | 6.43 s | 13.71 s |
+| Previous F32 reference | 574 | 36.8 | 19.62 s | 6.86 s |
+| BF16 throughout, packed IQ2/Q8, chunked SSD | 1,006 | 33.7 | 14.91 s | 7.47 s |
 
-Prefill improved by 2.03 times against the starting baseline and 2.01 times
-against the final F32 reference. Complete-request latency fell by about 31%.
-Long-request decode measured 35.0–35.1 tokens/s, compared with 37.1 at baseline.
-The short prompt reached 992–1,002 prefill tokens/s. Prefix reuse retained
-7,040 tokens and completed the cached request in 6.48–6.49 seconds.
+The short request fell from 11.15 s to 8.71 s. Its BF16 decode rate was 39.7 tokens/s.
+Long-prompt prefill improved by 1.75 times; it has not reached the two-times target.
+The cached request was 9% slower. The Bolt launcher now selects BF16 despite this measured tradeoff.
+The earlier prefill-only experiment reached 1,155 tokens/s but retained 4.44 GiB of extra dense-weight copies.
+The current implementation removes those copies and covers decode and verification with the same BF16 boundaries.
 
-BF16 output can differ from F32. Focused checks cover arithmetic, deduplication,
-dependency ordering, crash recovery, and retrieval from a 480-record prompt.
-All five passed in both modes. Repeated BF16 runs produced identical text for
-all three replay requests. Final F32 text matched the starting baseline.
-These checks do not establish broad quality parity.
+Seven drafts reduced decode to 16–18 tokens/s across these requests.
+Its higher acceptance did not offset verification cost, so the launcher retains three drafts.
+Both draft settings passed the five arithmetic, deduplication, ordering, crash-recovery, and retrieval checks.
+These checks are smoke coverage, not an accuracy comparison against NVIDIA's runtime.
 
-The strict LiLiCorr comparison remains a known failure with BF16 prefill.
-Serial and speculative generation first chose different tokens at output token
-34, with either F32 or BF16 recurrent state. The default F32 configuration
-matched all 64 tokens. Both BF16 checkpoint tests retain the exact assertion;
-this result is a reason to keep the new mode experimental.
+Focused GB10 measurements explain the dispatch choices:
 
-Kernel checks compare each precision mode against its corresponding CPU
-reference without relaxed tolerances. Focused GGML, dense projection, Mamba,
-and stream-initialization checks passed. The broader CUDA suite reported
-242 passes, two ignored tests, and one failure in the untouched Qwen3.6
-long-chunk recurrence test. Formatting and Clippy completed; existing warnings
-remain.
+| Operation | Previous path | Current BF16 path |
+| --- | ---: | ---: |
+| Mamba recurrence, 1,024 rows | 4.98 ms | 2.75 ms, chunked SSD |
+| Packed IQ2 shared up, 2,048 rows | 3.85 ms, 32-token BF16 tiles | 2.65 ms, 128-token BF16 tiles |
+| Q8 output head, four rows | 5.16 ms, BF16 tensor cores | 3.22 ms, packed BF16 matvec |
+
+Large dense tiles reuse packed weights across more tokens. Small Q8 and routed
+projections use SIMT with BF16 operands and F32 accumulation. Shared IQ2 verification
+retains tensor cores with a split reduction. CPU comparisons retain the existing numerical tolerances.
+
+### Super BF16 packed FP8 decode
+
+Super's small BF16 batches previously expanded every FP8 matrix before projection.
+The packed kernel reads each weight once and reuses it across up to eight rows.
+Inputs round to BF16; accumulation remains F32. Channel scales retain their existing meaning.
+Prefill batches above eight rows retain the cuBLAS path and reserve expansion scratch.
+
+The October 16 replay used BF16 computation and recurrent state, three drafts,
+2,048-token prefill batches, and 256 greedy output tokens on one GB10.
+Both runs used the same prompts and checkpoint. No other model ran concurrently.
+
+| Request | Previous decode tok/s | Packed decode tok/s | Previous HTTP seconds | Packed HTTP seconds |
+| --- | ---: | ---: | ---: | ---: |
+| 1,795-token prompt | 16.65 | 30.88 | 17.88 | 10.59 |
+| 7,051-token prompt | 15.31 | 30.35 | 24.38 | 15.94 |
+| 7,061 tokens, 7,040 cached | 14.38 | 26.82 | 18.28 | 9.92 |
+
+Long-prompt prefill changed from 948 to 963 tok/s. Removing expansion scratch
+saved 1 GiB from the decode workspace; first-request state fell from 1.533 to 0.533 GiB.
+Generated responses changed with the reduction order.
+
+The `nemotron35_fp8_bf16` micromeasure checks numerical agreement before timing.
+Four-row Mamba input takes 0.320 ms versus 0.667 ms for prepared BF16 cuBLAS.
+The four-row LM head takes 2.251 ms versus 4.730 ms. These cuBLAS figures exclude expansion.
+CPU-reference tests cover scalar and channel scales. Serial, batched, and segmented
+projections match exactly for one through eight rows.
+
+Replay artifacts are `/tmp/bolt-perf-super-bf16-fp8-before` and
+`/tmp/bolt-perf-super-bf16-fp8-after`. The semantic probes passed four of five cases;
+the deduplication prompt returned a total of 34 instead of 24.
+The previous BF16 projection path returned the same incorrect result for that prompt.
+That comparison is recorded in `/tmp/super-fp8-dedup-reference/response.json`.
+
+### NVIDIA implementation comparison
+
+The reference is NVIDIA's Bolt serving recipe and its pinned vLLM revision
+`77154ca6116ae34cbfe314beef1016bde9b63989`.
+The [b12x backend](https://github.com/vllm-project/vllm/blob/77154ca6116ae34cbfe314beef1016bde9b63989/docs/features/quantization/b12x.md)
+keeps IQ2/Q8 matrices packed and uses BF16 activations. The
+[Nemotron router](https://github.com/vllm-project/vllm/blob/77154ca6116ae34cbfe314beef1016bde9b63989/vllm/model_executor/models/nemotron_h.py)
+explicitly requests FP32 computation and output.
+
+| Component | NVIDIA recipe | Eider BF16 mode |
+| --- | --- | --- |
+| IQ2/Q8 projections | Packed weights, BF16 activations | Packed weights, BF16 activations throughout generation |
+| Residual stream | BF16 model dtype | BF16 operands, F32 sum before normalization |
+| Recurrent state | BF16 override | BF16 override available |
+| Mamba prefill | Chunked SSD scan | 64-token SSD chunks for 64-channel, 128-state heads |
+| Attention cache | FP8 | F32 by default; optional NVFP4 |
+
+vLLM's [compiled normalization](https://github.com/vllm-project/vllm/blob/77154ca6116ae34cbfe314beef1016bde9b63989/vllm/ir/ops/layernorm.py)
+normalizes the F32 residual sum. Its eager CUDA kernel rounds that sum first.
+Eider follows the compiled path. The
+[SSD implementation](https://github.com/vllm-project/vllm/blob/77154ca6116ae34cbfe314beef1016bde9b63989/vllm/model_executor/layers/mamba/ops/ssd_combined.py)
+also separates chunk matrix products from state passing. This alignment does
+not imply bitwise output parity with vLLM or matching attention-cache precision.
+
+Focused CPU comparisons cover packed projections, residual normalization, Mamba
+output rounding, ragged SSD chunks, both state dtypes, and rollback snapshots.
+The real Bolt checkpoint matches 64 serial target tokens under LiLiCorr
+verification with BF16 execution. Separate cases cover SSD prefill, F32 recurrent
+state, and a trailing-space prompt that exposed batch-dependent attention rounding.
+
+The focused Nemotron CUDA checks, router check, and four full-model comparisons pass.
+Formatting and Clippy complete; Clippy reports existing warnings in other code.
+Strict warning-as-error Clippy stops in the unchanged safetensors reader.
+A broader non-GEMM run has one unresolved Qwen long-recurrence test failure:
+`actual=0`, `expected=-0.00003282092`, `tolerance=0.00003`.
+It also fails in isolation; no clean-HEAD comparison was made. No tolerance was changed.
 
 ## Released checkpoint
 

@@ -1374,6 +1374,22 @@ unsafe extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_nemotron3_bf16_norm(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        rows: u32,
+        width: u32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn infer_nemotron3_bf16_residual(
+        residual: *const f32,
+        branch: *const f32,
+        output: *mut f32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
     pub(crate) fn infer_rms_norm_f32_on_stream(
         input: *const f32,
         weight: *const f32,
@@ -2620,6 +2636,7 @@ unsafe extern "C" {
         q_heads: u32,
         kv_heads: u32,
         head_dim: u32,
+        stable_reduction: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_bf16_linear_argmax_f32_on_stream(
@@ -4004,6 +4021,7 @@ unsafe extern "C" {
         groups: u32,
         state_size: u32,
         ssm_fp32: i32,
+        bf16_compute: i32,
         dt_floor: f32,
         eps: f32,
         stream: cudaStream_t,
@@ -4028,6 +4046,7 @@ unsafe extern "C" {
         groups: u32,
         state_size: u32,
         ssm_fp32: i32,
+        bf16_compute: i32,
         dt_floor: f32,
         eps: f32,
         stream: cudaStream_t,
@@ -4053,6 +4072,7 @@ unsafe extern "C" {
         groups: u32,
         state_size: u32,
         ssm_fp32: i32,
+        bf16_compute: i32,
         dt_floor: f32,
         eps: f32,
         stream: cudaStream_t,

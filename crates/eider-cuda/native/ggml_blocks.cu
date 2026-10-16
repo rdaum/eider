@@ -68,14 +68,26 @@ __device__ __forceinline__ uint32_t tensor_pair(const uint8_t* block, unsigned k
         | (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(__half2float(__ushort_as_half(pair >> 16)) * scale))) << 16);
 }
 
-// Dense and routed decode retain compressed weights, F32 inputs and a fixed
-// warp reduction. Four rows reuse each weight load and dequantization.
-template<unsigned Format, bool Routed, unsigned Routes = 4>
+// Packed decode uses F32 buffers and a fixed warp reduction. BF16 mode rounds
+// operands before accumulation; dense rows share weight loads and dequantization.
+template<bool Bf16>
+__device__ __forceinline__ float matvec_input(float x, bool relu_squared) {
+    if constexpr (Bf16) {
+        x = __bfloat162float(__float2bfloat16_rn(x));
+        if (relu_squared) {
+            x = fmaxf(x, 0.f);
+            x = __bfloat162float(__float2bfloat16_rn(x * x));
+        }
+    }
+    return x;
+}
+
+template<unsigned Format, bool Routed, unsigned Routes = 4, bool Bf16 = false>
 __global__ void packed_matvec(
     const float* dense_input, const uint8_t* dense_weight, float* dense_output,
     const uint32_t* sorted, const uint32_t* sorted_experts, const uint32_t* offsets,
     const float* const* inputs, const uint8_t* const* weights, float* const* outputs,
-    const uint64_t* grid, unsigned rows, unsigned out, unsigned cols) {
+    const uint64_t* grid, unsigned rows, unsigned out, unsigned cols, bool relu_squared = false) {
     constexpr unsigned Warps = 8;
     const unsigned first = Routed ? blockIdx.y : blockIdx.y * Routes;
     const unsigned expert = Routed ? sorted_experts[first] : 0;
@@ -114,20 +126,24 @@ __global__ void packed_matvec(
             #pragma unroll
             for (unsigned j = 0; j < Values; ++j) w[j] = float(integer_weight<Format>(block, local + j, grid)) * scale;
         }
+        if constexpr (Bf16) {
+            #pragma unroll
+            for (unsigned j = 0; j < Values; ++j) w[j] = __bfloat162float(__float2bfloat16_rn(w[j]));
+        }
         #pragma unroll
         for (unsigned r = 0; r < Routes; ++r) if (r < count) {
             if ((reinterpret_cast<uintptr_t>(x[r]) & 15) == 0) {
                 #pragma unroll
                 for (unsigned j = 0; j < Values; j += 4) {
                     const float4 v = reinterpret_cast<const float4*>(x[r] + k + j)[0];
-                    accum[r][0] = fmaf(v.x, w[j], accum[r][0]);
-                    accum[r][1] = fmaf(v.y, w[j + 1], accum[r][1]);
-                    accum[r][2] = fmaf(v.z, w[j + 2], accum[r][2]);
-                    accum[r][3] = fmaf(v.w, w[j + 3], accum[r][3]);
+                    accum[r][0] = fmaf(matvec_input<Bf16>(v.x, relu_squared), w[j], accum[r][0]);
+                    accum[r][1] = fmaf(matvec_input<Bf16>(v.y, relu_squared), w[j + 1], accum[r][1]);
+                    accum[r][2] = fmaf(matvec_input<Bf16>(v.z, relu_squared), w[j + 2], accum[r][2]);
+                    accum[r][3] = fmaf(matvec_input<Bf16>(v.w, relu_squared), w[j + 3], accum[r][3]);
                 }
             } else {
                 #pragma unroll
-                for (unsigned j = 0; j < Values; ++j) accum[r][j % 4] = fmaf(x[r][k + j], w[j], accum[r][j % 4]);
+                for (unsigned j = 0; j < Values; ++j) accum[r][j % 4] = fmaf(matvec_input<Bf16>(x[r][k + j], relu_squared), w[j], accum[r][j % 4]);
             }
         }
     }
@@ -154,7 +170,11 @@ __global__ void prepare_inputs(const float* dense, const float* const* inputs,
     if constexpr (Bf16) {
         for (unsigned k = threadIdx.x; k < cols; k += 256) {
             float value = input[k];
-            if (relu_squared) { value = fmaxf(value, 0.f); value *= value; }
+            if (relu_squared) {
+                value = __bfloat162float(__float2bfloat16_rn(value));
+                value = fmaxf(value, 0.f);
+                value *= value;
+            }
             prepared[size_t(row) * cols + k] = __bfloat16_as_ushort(__float2bfloat16_rn(value));
         }
         return;
@@ -260,7 +280,7 @@ __global__ void packed_gemm(
     const uint16_t* input, const float* powers, const uint64_t* grid,
     unsigned rows, unsigned experts, unsigned out, unsigned cols) {
     constexpr unsigned K = block_elements<Format>, Step = K < 64 ? K : 64, Stride = Step + 8;
-    constexpr unsigned TileOut = Bf16 && !SplitK ? 128 : 64;
+    constexpr unsigned TileOut = Bf16 && !SplitK && Columns > 1 ? 128 : 64;
     constexpr unsigned TileRows = Columns * 8, Parts = Bf16 ? 1 : 3;
     __shared__ unsigned expert, begin, end, ids[TileRows];
     __shared__ __align__(16) uint16_t w[TileOut][block_bytes<Format> / 2 + 1];
@@ -294,6 +314,7 @@ __global__ void packed_gemm(
         __syncthreads();
         float high[Columns][4][4] = {}, low[Columns][4] = {}, tail[Columns][4] = {};
         for (unsigned chunk = 0, stage = 0; chunk < K; chunk += Step, stage ^= 1) {
+            float block_result[Columns][4] = {};
             if (chunk + Step < K) stage_inputs<Step, TileRows, Parts>(&x[stage ^ 1][0][0][0],
                 input, ids, end - begin, cols, base + chunk + Step);
             #pragma unroll
@@ -308,7 +329,7 @@ __global__ void packed_gemm(
                 for (unsigned n = 0; n < Columns; ++n) {
                     const auto* hi = reinterpret_cast<const uint32_t*>(&x[stage][0][lane / 4 + n * 8][k + pair]);
                     if constexpr (Bf16) {
-                        mma<true>(result[n], a0, a1, a2, a3, hi[0], hi[4]);
+                        mma<true>(block_result[n], a0, a1, a2, a3, hi[0], hi[4]);
                     } else {
                         const auto* lo = reinterpret_cast<const uint32_t*>(&x[stage][1][lane / 4 + n * 8][k + pair]);
                         mma<false>(high[n][(k / 16) % 4], a0, a1, a2, a3, hi[0], hi[4]);
@@ -316,6 +337,14 @@ __global__ void packed_gemm(
                         const auto* last = reinterpret_cast<const uint32_t*>(&x[stage][2][lane / 4 + n * 8][k + pair]);
                         mma<false>(tail[n], a0, a1, a2, a3, last[0], last[4]);
                     }
+                }
+            }
+            if constexpr (Bf16) {
+                // Limit each MMA accumulation to 64 products before summing tiles.
+                #pragma unroll
+                for (unsigned n = 0; n < Columns; ++n) {
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; ++i) result[n][i] += block_result[n][i];
                 }
             }
             if (chunk + Step < K) {
@@ -366,6 +395,15 @@ cudaError_t project(
     const float* const* inputs, const uint8_t* const* weights, float* const* outputs,
     const uint64_t* grid, uint16_t* prepared, float* powers, uint32_t* tile_map, float* partials,
     unsigned rows, unsigned experts, unsigned out, unsigned cols, bool relu_squared, cudaStream_t stream) {
+    if constexpr (Bf16 && (Routed || Format == 0)) {
+        if (rows <= (Routed ? 128 : 8)) {
+            constexpr unsigned Routes = Routed ? 1 : 4;
+            packed_matvec<Format, Routed, Routes, true><<<dim3((out+7)/8, Routed ? rows : (rows+3)/4),256,0,stream>>>(
+                dense_input,dense_weight,dense_output,sorted,sorted_experts,offsets,
+                inputs,weights,outputs,grid,rows,out,cols,relu_squared);
+            return cudaGetLastError();
+        }
+    }
     if (prepared) {
         prepare_inputs<Routed, Bf16><<<rows, 256, 0, stream>>>(dense_input, inputs, prepared, powers, cols, relu_squared);
         auto status = cudaGetLastError();
@@ -381,9 +419,17 @@ cudaError_t project(
                 return cudaGetLastError();
             }
         }
+        if constexpr (Bf16 && !Routed) {
+            if (rows >= 128) {
+                // Dense prompt tiles reuse each packed weight across 128 tokens.
+                packed_gemm<Format,false,16,false,true><<<dim3((out+127)/128,(rows+127)/128),256,0,stream>>>(
+                    nullptr,nullptr,nullptr,nullptr,dense_weight,dense_output,prepared,powers,grid,rows,1,out,cols);
+                return cudaGetLastError();
+            }
+        }
         constexpr unsigned Columns = Bf16 && Routed ? 8 : (Bf16 || (Format == 1 && !Routed) ? 4 : 2);
         constexpr unsigned TileRows = Columns * 8;
-        const unsigned tiles = (rows + TileRows - 1) / TileRows + (Routed ? experts - 1 : 0);
+        const unsigned tiles = min(rows, (rows + TileRows - 1) / TileRows + (Routed ? experts - 1 : 0));
         if constexpr (Routed) {
             prepare_tiles<TileRows><<<1, 1024, 0, stream>>>(offsets, tile_map, experts, tiles);
             status = cudaGetLastError();

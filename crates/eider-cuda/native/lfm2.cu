@@ -895,6 +895,65 @@ extern "C" cudaError_t infer_quantized_dense_gemm_f32_on_stream(
     return cudaGetLastError();
 }
 
+// Small BF16 batches reuse each packed FP8 weight across every active row.
+// Each row has the same reduction order in serial and speculative decode.
+template <unsigned Rows>
+__global__ void fp8_bf16_rows(const float* input, const uint8_t* weight,
+    const float* channel_scales, float scale, float* output,
+    unsigned rows, unsigned out, unsigned cols) {
+    __shared__ float partials[Rows][8];
+    const unsigned channel = blockIdx.x, lane = threadIdx.x & 31;
+    const unsigned warp = threadIdx.x >> 5;
+    const auto* packed = reinterpret_cast<const uint32_t*>(weight + size_t(channel) * cols);
+    float sums[Rows] = {};
+    for (unsigned k = threadIdx.x; k < cols / 4; k += 256) {
+        const uint32_t bits = packed[k];
+        const float2 lo = __half22float2(__nv_cvt_fp8x2_to_halfraw2(bits & 0xffff, __NV_E4M3));
+        const float2 hi = __half22float2(__nv_cvt_fp8x2_to_halfraw2(bits >> 16, __NV_E4M3));
+        #pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) {
+            if (row >= rows) continue;
+            const float4 x = reinterpret_cast<const float4*>(input + size_t(row) * cols)[k];
+            sums[row] = fmaf(__bfloat162float(__float2bfloat16_rn(x.x)), lo.x, sums[row]);
+            sums[row] = fmaf(__bfloat162float(__float2bfloat16_rn(x.y)), lo.y, sums[row]);
+            sums[row] = fmaf(__bfloat162float(__float2bfloat16_rn(x.z)), hi.x, sums[row]);
+            sums[row] = fmaf(__bfloat162float(__float2bfloat16_rn(x.w)), hi.y, sums[row]);
+        }
+    }
+    #pragma unroll
+    for (unsigned row = 0; row < Rows; ++row) {
+        for (unsigned delta = 16; delta; delta >>= 1)
+            sums[row] += __shfl_down_sync(0xffffffff, sums[row], delta);
+        if (lane == 0) partials[row][warp] = sums[row];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float multiplier = channel_scales ? channel_scales[channel] : scale;
+        #pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) {
+            float sum = lane < 8 ? partials[row][lane] : 0.f;
+            for (unsigned delta = 16; delta; delta >>= 1)
+                sum += __shfl_down_sync(0xffffffff, sum, delta);
+            if (lane == 0 && row < rows) output[size_t(row) * out + channel] = sum * multiplier;
+        }
+    }
+}
+
+extern "C" cudaError_t infer_fp8_bf16_rows_on_stream(
+    const float* input, const uint8_t* weight, const float* channel_scales,
+    float scale, float* output, unsigned rows, unsigned out, unsigned cols,
+    cudaStream_t stream) {
+    if (!input || !weight || !output || rows == 0 || rows > 8 || out == 0 ||
+        cols == 0 || cols % 4 || !std::isfinite(scale)) return cudaErrorInvalidValue;
+    if (rows == 1) fp8_bf16_rows<1><<<out, 256, 0, stream>>>(
+        input, weight, channel_scales, scale, output, rows, out, cols);
+    else if (rows <= 4) fp8_bf16_rows<4><<<out, 256, 0, stream>>>(
+        input, weight, channel_scales, scale, output, rows, out, cols);
+    else fp8_bf16_rows<8><<<out, 256, 0, stream>>>(
+        input, weight, channel_scales, scale, output, rows, out, cols);
+    return cudaGetLastError();
+}
+
 // Expand one dense projection into reusable scratch. Global/channel scales
 // remain F32 and are applied after GEMM, avoiding a second weight rounding.
 __global__ void expand_dense_bf16(const uint8_t* weights, const uint8_t* scales,

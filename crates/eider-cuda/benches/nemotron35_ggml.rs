@@ -228,7 +228,7 @@ fn main() {
                             sample::<$o, $i, $r, $e, $iq, true, false, false>,
                         );
                         g.bench_sample(
-                            "BF16 tensor cores",
+                            "packed BF16",
                             sample::<$o, $i, $r, $e, $iq, true, false, true>,
                         );
                     });

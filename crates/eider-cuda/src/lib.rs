@@ -156,6 +156,7 @@ pub use kernels::non_gemm::{
     moe_weighted_accumulate_slot_addresses_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream,
+    nemotron3_bf16_norm_into_on_stream, nemotron3_bf16_residual_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
@@ -287,3 +288,5 @@ pub use tensor::{Bf16Tensor2d, Nvfp4Tensor2d, Tensor2dLayout, Tensor2dView};
 pub use ternary_g64::{
     TERNARY_G64_GROUP_SIZE, TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
 };
+
+pub use kernels::nemotron3_ssd::Nemotron3SsdWorkspace;
