@@ -31,6 +31,7 @@ struct Mamba<const ROWS: usize> {
     lengths: DeviceBuffer<u32>,
     snapshots: DeviceBuffer<u8>,
     output: DeviceBuffer<f32>,
+    coefficients: DeviceBuffer<f32>,
     dtype: MambaSsmDtype,
 }
 impl<const ROWS: usize> Mamba<ROWS> {
@@ -75,6 +76,7 @@ impl<const ROWS: usize> Mamba<ROWS> {
             lengths: DeviceBuffer::from_host(&[ROWS as u32]).unwrap(),
             snapshots: DeviceBuffer::zeroed(INNER * STATE * dtype.element_bytes()).unwrap(),
             output: DeviceBuffer::zeroed(ROWS * INNER).unwrap(),
+            coefficients: DeviceBuffer::zeroed(ROWS * HEADS * 2).unwrap(),
             dtype,
         }
     }
@@ -119,6 +121,7 @@ impl<const ROWS: usize> Mamba<ROWS> {
                 &self.offsets,
                 &self.lengths,
                 self.output.output(),
+                self.coefficients.output(),
                 1,
                 ROWS,
                 HEADS,

@@ -5,7 +5,8 @@ use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve_with_shutdown};
 use eider_inference::metrics::metrics as infer_metrics;
 use eider_inference::nemotron3::{
-    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
+    GemmPrecision, MambaSsmDtype, Nemotron3Bf16Storage, Nemotron3Fp8Storage,
+    Nemotron3KvCacheStorage, Nemotron3StorageConfig,
 };
 use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage,
@@ -72,6 +73,31 @@ impl From<StepBf16StorageArg> for Step37Bf16Storage {
         match value {
             StepBf16StorageArg::Bf16 => Self::Bf16,
             StepBf16StorageArg::Nvfp4 => Self::Nvfp4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum NemotronPrecisionArg {
+    #[default]
+    F32,
+    Bf16,
+}
+
+impl From<NemotronPrecisionArg> for GemmPrecision {
+    fn from(value: NemotronPrecisionArg) -> Self {
+        match value {
+            NemotronPrecisionArg::F32 => Self::F32,
+            NemotronPrecisionArg::Bf16 => Self::Bf16,
+        }
+    }
+}
+
+impl From<NemotronPrecisionArg> for MambaSsmDtype {
+    fn from(value: NemotronPrecisionArg) -> Self {
+        match value {
+            NemotronPrecisionArg::F32 => Self::F32,
+            NemotronPrecisionArg::Bf16 => Self::Bf16,
         }
     }
 }
@@ -261,6 +287,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::F32)]
     nemotron_kv_cache: NemotronKvCacheStorageArg,
 
+    /// Matrix arithmetic for Nemotron prompt batches (decode retains F32).
+    #[arg(long, value_enum, default_value_t = NemotronPrecisionArg::F32)]
+    nemotron_prefill_precision: NemotronPrecisionArg,
+
+    /// Override Nemotron recurrent-state storage; defaults to checkpoint metadata.
+    #[arg(long, value_enum)]
+    nemotron_mamba_ssm_dtype: Option<NemotronPrecisionArg>,
+
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
     api_key_env: String,
@@ -400,6 +434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bf16: args.nemotron_bf16_storage.into(),
         fp8: args.nemotron_fp8_storage.into(),
         kv_cache: args.nemotron_kv_cache.into(),
+        prefill_precision: args.nemotron_prefill_precision.into(),
+        mamba_ssm_dtype: args.nemotron_mamba_ssm_dtype.map(Into::into),
     };
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;

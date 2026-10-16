@@ -12473,9 +12473,24 @@ __global__ void infer_nemotron3_group_rms_norm_f32_chunks_kernel(
     }
 }
 
-template <typename State, unsigned RegisterStateSize = 0>
+// Head coefficients are shared by every channel in a recurrent head.
+__global__ void nemotron3_mamba_coefficients(const float* projected, const uint16_t* a_log,
+    const uint16_t* dt_bias, float2* output, unsigned tokens, unsigned heads,
+    unsigned projection_size, float dt_floor) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * heads) return;
+    const unsigned head = i % heads, row = i / heads;
+    const float raw_dt = projected[size_t(row) * projection_size + projection_size - heads + head];
+    const float bias = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(dt_bias + head));
+    const float dt = fmaxf(log1pf(expf(-fabsf(raw_dt + bias))) + fmaxf(raw_dt + bias, 0.0f), dt_floor);
+    const float a = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(a_log + head));
+    output[i] = make_float2(dt, expf(-dt * expf(a)));
+}
+
+template <typename State, unsigned RegisterStateSize = 0, bool Prepared = false>
 __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
     const float* projected,
+    const float* coefficients,
     const float* conv_output,
     const std::uint16_t* a_log_bf16,
     const std::uint16_t* d_bf16,
@@ -12544,15 +12559,21 @@ __global__ void infer_nemotron3_mamba_state_update_f32_chunks_kernel(
             const std::uint32_t head = flat / head_dim;
             x = row_conv[flat];
             gate = row_projected[flat];
-            const float raw_dt = row_projected[intermediate_size + conv_channels + head];
-            const float dt_bias = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
-            dt = fmaxf(log1pf(expf(-fabsf(raw_dt + dt_bias))) +
-                           fmaxf(raw_dt + dt_bias, 0.0f),
-                       dt_floor);
-            const float a_log = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
-            decay = expf(-dt * expf(a_log));
+            if constexpr (Prepared) {
+                const float2 values = reinterpret_cast<const float2*>(coefficients)[size_t(row) * heads + head];
+                dt = values.x;
+                decay = values.y;
+            } else {
+                const float raw_dt = row_projected[intermediate_size + conv_channels + head];
+                const float dt_bias = __bfloat162float(
+                    *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
+                dt = fmaxf(log1pf(expf(-fabsf(raw_dt + dt_bias))) +
+                               fmaxf(raw_dt + dt_bias, 0.0f),
+                           dt_floor);
+                const float a_log = __bfloat162float(
+                    *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
+                decay = expf(-dt * expf(a_log));
+            }
             d = __bfloat162float(
                 *reinterpret_cast<const __nv_bfloat16*>(d_bf16 + head));
         }
@@ -12674,6 +12695,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     const std::uint32_t* sequence_offsets,
     const std::uint32_t* sequence_lengths,
     float* output,
+    float* coefficients,
     std::uint32_t sequence_count,
     std::uint32_t total_tokens,
     std::uint32_t projection_size,
@@ -12688,7 +12710,7 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     if (projected == nullptr || conv_output == nullptr || a_log_bf16 == nullptr ||
         d_bf16 == nullptr || dt_bias_bf16 == nullptr || norm_weight_bf16 == nullptr ||
         ssm_state_table == nullptr || sequence_offsets == nullptr ||
-        sequence_lengths == nullptr || output == nullptr || sequence_count == 0 ||
+        sequence_lengths == nullptr || output == nullptr || coefficients == nullptr || sequence_count == 0 ||
         total_tokens == 0 || projection_size == 0 || heads == 0 || head_dim == 0 ||
         groups == 0 || state_size == 0 || heads % groups != 0 ||
         !(dt_floor > 0.0f) || !(eps > 0.0f)) {
@@ -12700,11 +12722,16 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
     const std::uint32_t state_blocks =
         (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const dim3 blocks(sequence_count, state_blocks, 1);
+    nemotron3_mamba_coefficients<<<(total_tokens * heads + 255) / 256, 256, 0, stream>>>(
+        projected, a_log_bf16, dt_bias_bf16, reinterpret_cast<float2*>(coefficients), total_tokens, heads, projection_size, dt_floor);
+    auto preparation_status = cudaGetLastError();
+    if (preparation_status != cudaSuccess) return preparation_status;
     auto launch = [&](auto state_element) {
         if (state_size == 128) {
-        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element), 128><<<
+        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element), 128, true><<<
             blocks, kThreads, 0, stream>>>(
             projected,
+            coefficients,
             conv_output,
             a_log_bf16,
             d_bf16,
@@ -12722,9 +12749,10 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
             state_size,
             dt_floor);
         } else {
-        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element)><<<
+        infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element), 0, true><<<
             blocks, kThreads, 0, stream>>>(
             projected,
+            coefficients,
             conv_output,
             a_log_bf16,
             d_bf16,
@@ -12805,6 +12833,7 @@ infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
         infer_nemotron3_mamba_state_update_f32_chunks_kernel<decltype(state_element)><<<
             blocks, kThreads, 0, stream>>>(
             projected,
+            nullptr,
             conv_output,
             a_log_bf16,
             d_bf16,

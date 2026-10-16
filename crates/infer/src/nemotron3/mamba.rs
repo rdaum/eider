@@ -384,6 +384,7 @@ impl Nemotron3MambaLayer {
                 sequence_offsets,
                 sequence_lengths,
                 workspace.mixer_output.output(),
+                workspace.coefficients.output(),
                 sequence_count,
                 rows,
                 self.manifest.mamba_heads,
@@ -524,6 +525,7 @@ pub struct Nemotron3MambaRowsWorkspace {
     projected: DeviceBuffer<f32>,
     conv_output: DeviceBuffer<f32>,
     mixer_output: DeviceBuffer<f32>,
+    coefficients: DeviceBuffer<f32>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
 }
@@ -542,6 +544,7 @@ impl Nemotron3MambaRowsWorkspace {
             projected: DeviceBuffer::zeroed(rows * manifest.mamba_projection_size())?,
             conv_output: DeviceBuffer::zeroed(rows * manifest.mamba_conv_channels())?,
             mixer_output: DeviceBuffer::zeroed(rows * manifest.mamba_intermediate_size())?,
+            coefficients: DeviceBuffer::zeroed(rows * manifest.mamba_heads * 2)?,
             projected_output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
             output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
         })
@@ -551,6 +554,7 @@ impl Nemotron3MambaRowsWorkspace {
         if self.normed.len() == rows * manifest.hidden_size
             && self.projected.len() == rows * manifest.mamba_projection_size()
             && self.conv_output.len() == rows * manifest.mamba_conv_channels()
+            && self.coefficients.len() == rows * manifest.mamba_heads * 2
             && self.mixer_output.len() == rows * manifest.mamba_intermediate_size()
             && self.projected_output.len() == rows * manifest.hidden_size
             && self.output.len() == rows * manifest.hidden_size
@@ -573,6 +577,7 @@ impl Nemotron3MambaRowsWorkspace {
             + self.projected.device_bytes()
             + self.conv_output.device_bytes()
             + self.mixer_output.device_bytes()
+            + self.coefficients.device_bytes()
             + self.projected_output.device_bytes()
             + self.output.device_bytes()
     }

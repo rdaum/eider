@@ -27,6 +27,7 @@ pub use attention::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
     Nemotron3AttentionWorkspace,
 };
+pub use eider_cuda::GemmPrecision;
 pub use eider_cuda::MambaSsmDtype;
 pub(crate) use execution::{Nemotron3SequenceId, Nemotron3SequencePool};
 pub use linear::{

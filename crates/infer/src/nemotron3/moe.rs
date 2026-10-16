@@ -195,13 +195,18 @@ impl Nemotron3MoeLayer {
     }
 
     /// Allocates scratch and route tables for a fixed flattened row count.
-    pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MoeRowsWorkspace> {
+    pub fn rows_workspace(
+        &self,
+        rows: usize,
+        precision: eider_cuda::GemmPrecision,
+    ) -> Result<Nemotron3MoeRowsWorkspace> {
         Nemotron3MoeRowsWorkspace::new(
             &self.manifest,
             self.moe,
             rows,
             self.experts.calibrated(),
             self.experts.is_ggml(),
+            precision,
         )
     }
 
@@ -460,6 +465,7 @@ impl Nemotron3ExpertSlab {
             &scratch.routes,
             &scratch.inputs,
             &workspace.up_output_table,
+            false,
             None,
             stream,
         )?;
@@ -472,6 +478,7 @@ impl Nemotron3ExpertSlab {
             &scratch.routes,
             &workspace.down_input_table,
             &workspace.down_output_table,
+            false,
             None,
             stream,
         )?;
@@ -503,6 +510,13 @@ impl Nemotron3ExpertSlab {
                 label: "Nemotron GGML experts",
                 detail: "missing batched route workspace".into(),
             })?;
+        let fused = rows >= 16 && gemm.precision() == eider_cuda::GemmPrecision::Bf16;
+        if fused != workspace.fused_activation {
+            return Err(Error::Format {
+                label: "Nemotron GGML experts",
+                detail: "workspace matrix precision does not match execution".into(),
+            });
+        }
         routes.sort_on_stream(workspace.router.indices(), stream)?;
         let scratch = if rows >= 16 {
             Some(gemm.ggml_workspace(routes.active_routes(), weights.up.in_features())?)
@@ -513,14 +527,17 @@ impl Nemotron3ExpertSlab {
             routes,
             &workspace.up_input_table,
             &workspace.up_output_table,
+            false,
             scratch,
             stream,
         )?;
-        relu_squared_f32_into_on_stream(
-            &workspace.routed_up,
-            workspace.routed_activated.output(),
-            stream,
-        )?;
+        if !fused {
+            relu_squared_f32_into_on_stream(
+                &workspace.routed_up,
+                workspace.routed_activated.output(),
+                stream,
+            )?;
+        }
         let scratch = if rows >= 16 {
             Some(gemm.ggml_workspace(routes.active_routes(), weights.down.in_features())?)
         } else {
@@ -528,8 +545,13 @@ impl Nemotron3ExpertSlab {
         };
         weights.down.run_routed(
             routes,
-            &workspace.down_input_table,
+            if fused {
+                &workspace.up_output_table
+            } else {
+                &workspace.down_input_table
+            },
             &workspace.down_output_table,
+            fused,
             scratch,
             stream,
         )?;
@@ -1072,6 +1094,7 @@ pub struct Nemotron3MoeRowsWorkspace {
     latent: DeviceBuffer<f32>,
     routed_up: DeviceBuffer<f32>,
     routed_activated: DeviceBuffer<f32>,
+    fused_activation: bool,
     routed_down: DeviceBuffer<f32>,
     routed_latent: DeviceBuffer<f32>,
     routed_hidden: DeviceBuffer<f32>,
@@ -1095,6 +1118,7 @@ impl Nemotron3MoeRowsWorkspace {
         rows: usize,
         calibrated: bool,
         ggml: bool,
+        precision: eider_cuda::GemmPrecision,
     ) -> Result<Self> {
         if rows == 0 {
             return Err(Error::Shape {
@@ -1112,11 +1136,24 @@ impl Nemotron3MoeRowsWorkspace {
         let intermediate = moe.intermediate_size;
         let latent_buffer = DeviceBuffer::zeroed(rows * latent)?;
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
-        let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
+        let fused_activation = ggml && rows >= 16 && precision == eider_cuda::GemmPrecision::Bf16;
+        let routed_activated = DeviceBuffer::zeroed(if fused_activation {
+            0
+        } else {
+            routes * intermediate
+        })?;
         let routed_down = DeviceBuffer::zeroed(routes * latent)?;
         let up_input_table = repeated_address_table(&latent_buffer, rows, routes_per_row, latent)?;
         let up_output_table = address_table(&routed_up, routes, intermediate)?;
-        let down_input_table = address_table(&routed_activated, routes, intermediate)?;
+        let down_input_table = address_table(
+            if fused_activation {
+                &routed_up
+            } else {
+                &routed_activated
+            },
+            routes,
+            intermediate,
+        )?;
         let down_output_table = address_table(&routed_down, routes, latent)?;
         let down_result_table = address_table(&routed_down, routes, latent)?;
         let use_nvfp4 = calibrated && rows >= 4;
@@ -1135,6 +1172,7 @@ impl Nemotron3MoeRowsWorkspace {
             latent: latent_buffer,
             routed_up,
             routed_activated,
+            fused_activation,
             routed_down,
             routed_latent: DeviceBuffer::zeroed(rows * latent)?,
             routed_hidden: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
@@ -1168,7 +1206,12 @@ impl Nemotron3MoeRowsWorkspace {
         if self.normed.len() == rows * manifest.hidden_size
             && self.latent.len() == rows * latent
             && self.routed_up.len() == routes * intermediate
-            && self.routed_activated.len() == routes * intermediate
+            && self.routed_activated.len()
+                == if self.fused_activation {
+                    0
+                } else {
+                    routes * intermediate
+                }
             && self.routed_down.len() == routes * latent
             && self.routed_latent.len() == rows * latent
             && self.routed_hidden.len() == rows * manifest.hidden_size

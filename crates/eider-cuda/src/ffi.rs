@@ -4019,6 +4019,7 @@ unsafe extern "C" {
         sequence_offsets: *const u32,
         sequence_lengths: *const u32,
         output: *mut f32,
+        coefficients: *mut f32,
         sequence_count: u32,
         total_tokens: u32,
         projection_size: u32,

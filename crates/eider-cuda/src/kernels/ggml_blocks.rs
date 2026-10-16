@@ -2,12 +2,22 @@
 
 use crate::cuda::check_cuda;
 use crate::{
-    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, Error, MoeSortedRoutes, Result,
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, Error, GemmPrecision, MoeSortedRoutes,
+    Result,
 };
 use eider_format::{GgmlBlockFormat, IQ2_XXS_GRID};
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn infer_ggml_expand_bf16_on_stream(
+        packed: *const u8,
+        grid: *const u64,
+        output: *mut u16,
+        elements: u32,
+        format: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     fn infer_ggml_dense_on_stream(
         input: *const f32,
         weight: *const u8,
@@ -18,6 +28,7 @@ unsafe extern "C" {
         tiles: *mut u32,
         partials: *mut f32,
         format: u32,
+        bf16: u32,
         rows: u32,
         out: u32,
         cols: u32,
@@ -35,6 +46,8 @@ unsafe extern "C" {
         powers: *mut f32,
         tiles: *mut u32,
         format: u32,
+        bf16: u32,
+        relu_squared: u32,
         rows: u32,
         experts: u32,
         out: u32,
@@ -45,6 +58,7 @@ unsafe extern "C" {
 
 /// Bounded activation preparation shared across successive packed projections.
 pub struct GgmlGemmWorkspace {
+    precision: GemmPrecision,
     prepared: DeviceBuffer<u16>,
     powers: DeviceBuffer<f32>,
     tiles: DeviceBuffer<u32>,
@@ -53,10 +67,17 @@ pub struct GgmlGemmWorkspace {
     cols: usize,
 }
 impl GgmlGemmWorkspace {
+    /// Selects input and weight arithmetic; packed checkpoint bytes are unchanged.
+    pub fn set_precision(&mut self, precision: GemmPrecision) {
+        self.precision = precision;
+    }
+
     /// Grows during workspace preparation; established shapes reuse allocation.
     pub fn reserve(&mut self, rows: usize, cols: usize) -> Result<()> {
         if rows > self.rows || cols > self.cols {
+            let precision = self.precision;
             *self = Self::new(rows.max(self.rows), cols.max(self.cols))?;
+            self.precision = precision;
         }
         Ok(())
     }
@@ -66,11 +87,13 @@ impl GgmlGemmWorkspace {
         if rows == 0 || cols == 0 || count.is_none_or(|n| n > u32::MAX as usize) {
             return Err(invalid("invalid GGML GEMM workspace dimensions"));
         }
+        // Each projection prepares all active input, scale and route entries.
         Ok(Self {
-            prepared: DeviceBuffer::zeroed(count.unwrap())?,
-            powers: DeviceBuffer::zeroed(rows)?,
-            tiles: DeviceBuffer::zeroed((rows.div_ceil(16) + 1023) * 3)?,
-            partials: DeviceBuffer::zeroed(0)?,
+            precision: GemmPrecision::F32,
+            prepared: DeviceBuffer::uninitialized(count.unwrap())?,
+            powers: DeviceBuffer::uninitialized(rows)?,
+            tiles: DeviceBuffer::uninitialized((rows.div_ceil(16) + 1023) * 3)?,
+            partials: DeviceBuffer::uninitialized(0)?,
             rows,
             cols,
         })
@@ -91,10 +114,11 @@ impl GgmlGemmWorkspace {
 }
 
 /// One dense matrix, or a contiguous table of equally shaped expert matrices.
-/// Packed block bytes remain resident; no expanded weight copy is retained.
+/// Packed blocks remain resident; dense matrices can retain a prepared BF16 copy.
 pub struct GgmlWeights {
     format: GgmlBlockFormat,
     packed: DeviceBuffer<u8>,
+    bf16: Option<DeviceBuffer<u16>>,
     table: DeviceBuffer<DeviceAddress<u8>>,
     grid: DeviceBuffer<u64>,
     experts: usize,
@@ -102,6 +126,41 @@ pub struct GgmlWeights {
     cols: usize,
 }
 impl GgmlWeights {
+    /// Prepares one dense BF16 copy at load time; decode retains packed weights.
+    pub fn prepare_bf16(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.experts != 1
+            || self
+                .out
+                .checked_mul(self.cols)
+                .is_none_or(|n| n > u32::MAX as usize)
+        {
+            return Err(invalid(
+                "BF16 preparation requires one bounded dense matrix",
+            ));
+        }
+        let weight = DeviceBuffer::uninitialized(self.out * self.cols)?;
+        unsafe {
+            check_cuda(
+                "infer_ggml_expand_bf16_on_stream",
+                infer_ggml_expand_bf16_on_stream(
+                    self.packed.ptr,
+                    self.grid.ptr,
+                    weight.ptr,
+                    weight.len() as u32,
+                    self.format as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.bf16 = Some(weight);
+        Ok(())
+    }
+
+    /// Prepared dense weights, rounded to BF16 after dequantization.
+    pub fn prepared_bf16(&self) -> Option<&DeviceBuffer<u16>> {
+        self.bf16.as_ref()
+    }
+
     /// Validates and uploads row-major GGML blocks and their expert addresses.
     pub fn new(
         format: GgmlBlockFormat,
@@ -146,6 +205,7 @@ impl GgmlWeights {
         Ok(Self {
             format,
             packed,
+            bf16: None,
             table,
             grid,
             experts,
@@ -167,7 +227,10 @@ impl GgmlWeights {
     }
     /// CUDA allocation bytes for weights and address tables.
     pub fn device_bytes(&self) -> usize {
-        self.packed.device_bytes() + self.table.device_bytes() + self.grid.device_bytes()
+        self.packed.device_bytes()
+            + self.table.device_bytes()
+            + self.grid.device_bytes()
+            + self.bf16.as_ref().map_or(0, DeviceBuffer::device_bytes)
     }
 
     /// Copies selected output rows without changing quantization or scales.
@@ -208,6 +271,9 @@ impl GgmlWeights {
             return Err(invalid("invalid GGML dense input or output dimensions"));
         }
         let mut partials = std::ptr::null_mut();
+        let bf16 = workspace
+            .as_ref()
+            .is_some_and(|ws| ws.precision == GemmPrecision::Bf16);
         let (prepared, powers, tiles) = match workspace {
             Some(ws) => {
                 let pointers = ws.pointers(rows, self.cols)?;
@@ -219,7 +285,7 @@ impl GgmlWeights {
                         .filter(|&n| n <= u32::MAX as usize && self.cols / 256 <= 65535)
                         .ok_or_else(|| invalid("GGML split reduction dimensions overflow"))?;
                     if ws.partials.len() < count {
-                        ws.partials = DeviceBuffer::zeroed(count)?;
+                        ws.partials = DeviceBuffer::uninitialized(count)?;
                     }
                     partials = ws.partials.ptr;
                 }
@@ -244,6 +310,7 @@ impl GgmlWeights {
                     tiles,
                     partials,
                     self.format as u32,
+                    u32::from(bf16),
                     rows as u32,
                     self.out as u32,
                     self.cols as u32,
@@ -254,11 +321,13 @@ impl GgmlWeights {
     }
 
     /// Projects expert-major routes through the retained packed expert table.
+    /// BF16 scratch permits ReLU-squared to be fused into input preparation.
     pub fn run_routed(
         &self,
         routes: &MoeSortedRoutes,
         inputs: &DeviceBuffer<DeviceAddress<f32>>,
         outputs: &DeviceBuffer<DeviceAddress<f32>>,
+        relu_squared: bool,
         workspace: Option<&mut GgmlGemmWorkspace>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -270,6 +339,14 @@ impl GgmlWeights {
             || routes.expert_offsets().len() != self.experts + 1
         {
             return Err(invalid("invalid GGML routed matrix dimensions"));
+        }
+        let bf16 = workspace
+            .as_ref()
+            .is_some_and(|ws| ws.precision == GemmPrecision::Bf16);
+        if relu_squared && !bf16 {
+            return Err(invalid(
+                "fused ReLU squared requires BF16 tensor arithmetic",
+            ));
         }
         let (prepared, powers, tiles) = match workspace {
             Some(ws) => ws.pointers(rows, self.cols)?,
@@ -294,6 +371,8 @@ impl GgmlWeights {
                     powers,
                     tiles,
                     self.format as u32,
+                    u32::from(bf16),
+                    u32::from(relu_squared),
                     rows as u32,
                     self.experts as u32,
                     self.out as u32,
@@ -326,6 +405,9 @@ mod tests {
         }
         data
     }
+    fn bf16(value: f32) -> f32 {
+        f32::from_bits((value.to_bits() + 0x7fff + ((value.to_bits() >> 16) & 1)) & 0xffff0000)
+    }
     fn compare(label: &str, actual: &[f32], reference: &[f32]) {
         for (i, (&a, &b)) in actual.iter().zip(reference).enumerate() {
             assert!(
@@ -355,7 +437,7 @@ mod tests {
             let (out, cols, rows) = (65, 512, 33);
             let bytes = packed(format, out, cols);
             let unpacked = format.dequantize(&bytes, out, cols).unwrap();
-            let weights = GgmlWeights::new(format, 1, out, cols, &bytes).unwrap();
+            let mut weights = GgmlWeights::new(format, 1, out, cols, &bytes).unwrap();
             let host: Vec<_> = (0..rows * cols)
                 .map(|i| {
                     let scale = [0., 1. / 256., 16., 1.][i / cols % 4];
@@ -382,6 +464,33 @@ mod tests {
                     &format!("{format:?} dense tensor rows={count}"),
                     &output.copy_to_host(&stream).unwrap()[..count * out],
                     &reference[..count * out],
+                );
+            }
+            ws.set_precision(GemmPrecision::Bf16);
+            let rounded_weight: Vec<_> = unpacked.iter().copied().map(bf16).collect();
+            weights.prepare_bf16(&stream).unwrap();
+            let prepared = weights
+                .prepared_bf16()
+                .unwrap()
+                .copy_to_host(&stream)
+                .unwrap();
+            assert_eq!(
+                prepared
+                    .iter()
+                    .map(|&x| f32::from_bits(u32::from(x) << 16))
+                    .collect::<Vec<_>>(),
+                rounded_weight
+            );
+            let rounded_input: Vec<_> = host.iter().copied().map(bf16).collect();
+            let bf16_reference = self::reference(&rounded_weight, &rounded_input, out, cols);
+            for count in [1, 4, 8, 16, 33, 3] {
+                weights
+                    .run_rows(&input, output.output(), count, Some(&mut ws), &stream)
+                    .unwrap();
+                compare(
+                    &format!("{format:?} BF16 rows={count}"),
+                    &output.copy_to_host(&stream).unwrap()[..count * out],
+                    &bf16_reference[..count * out],
                 );
             }
             let selected = weights.select_rows(&[64, 0, 17], &stream).unwrap();
@@ -442,6 +551,18 @@ mod tests {
                     )
                 })
                 .collect();
+            let rounded_weight: Vec<_> = unpacked.iter().copied().map(bf16).collect();
+            let rounded_input: Vec<_> = host.iter().copied().map(bf16).collect();
+            let bf16_expected: Vec<_> = (0..rows)
+                .flat_map(|r| {
+                    reference(
+                        &rounded_weight[indices[r] as usize * out * cols..][..out * cols],
+                        &rounded_input[r * cols..][..cols],
+                        out,
+                        cols,
+                    )
+                })
+                .collect();
             let indices = DeviceBuffer::from_host(&indices).unwrap();
             let mut routes = MoeSortedRoutes::new(rows, experts).unwrap();
             let mut ws = GgmlGemmWorkspace::new(rows, cols).unwrap();
@@ -449,7 +570,7 @@ mod tests {
                 routes.set_routes(count).unwrap();
                 routes.sort_on_stream(&indices, &stream).unwrap();
                 weights
-                    .run_routed(&routes, &inputs, &outputs, None, &stream)
+                    .run_routed(&routes, &inputs, &outputs, false, None, &stream)
                     .unwrap();
                 compare(
                     &format!("{format:?} routed matvec rows={count}"),
@@ -457,13 +578,43 @@ mod tests {
                     &expected[..count * out],
                 );
                 weights
-                    .run_routed(&routes, &inputs, &outputs, Some(&mut ws), &stream)
+                    .run_routed(&routes, &inputs, &outputs, false, Some(&mut ws), &stream)
                     .unwrap();
                 compare(
                     &format!("{format:?} routed tensor rows={count}"),
                     &output.copy_to_host(&stream).unwrap()[..count * out],
                     &expected[..count * out],
                 );
+                ws.set_precision(GemmPrecision::Bf16);
+                weights
+                    .run_routed(&routes, &inputs, &outputs, false, Some(&mut ws), &stream)
+                    .unwrap();
+                compare(
+                    &format!("{format:?} BF16 routed rows={count}"),
+                    &output.copy_to_host(&stream).unwrap()[..count * out],
+                    &bf16_expected[..count * out],
+                );
+                let activated: Vec<_> = host.iter().map(|&x| bf16(x.max(0.) * x.max(0.))).collect();
+                let ids = indices.copy_to_host(&stream).unwrap();
+                let fused_expected: Vec<_> = (0..count)
+                    .flat_map(|r| {
+                        reference(
+                            &rounded_weight[ids[r] as usize * out * cols..][..out * cols],
+                            &activated[r * cols..][..cols],
+                            out,
+                            cols,
+                        )
+                    })
+                    .collect();
+                weights
+                    .run_routed(&routes, &inputs, &outputs, true, Some(&mut ws), &stream)
+                    .unwrap();
+                compare(
+                    "BF16 fused ReLU squared",
+                    &output.copy_to_host(&stream).unwrap()[..count * out],
+                    &fused_expected,
+                );
+                ws.set_precision(GemmPrecision::F32);
             }
         }
     }

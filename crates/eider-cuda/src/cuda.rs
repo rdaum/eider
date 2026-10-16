@@ -1234,8 +1234,12 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
             check_cuda("cudaMemset", ffi::cudaMemset(raw, 0, bytes))?;
             // cudaMemset may complete asynchronously on the default stream.
             // A non-blocking stream does not inherit the default-stream order,
-            // so establish initialization before returning the allocation.
-            check_cuda("cudaDeviceSynchronize", ffi::cudaDeviceSynchronize())?;
+            // Wait for initialization before returning, without waiting for
+            // unrelated work on non-blocking streams.
+            check_cuda(
+                "cudaStreamSynchronize(default)",
+                ffi::cudaStreamSynchronize(null_mut()),
+            )?;
         }
         Ok(Self {
             ptr: raw.cast(),

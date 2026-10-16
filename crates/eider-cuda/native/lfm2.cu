@@ -61,12 +61,15 @@ extern "C" cudaError_t infer_sum_f32_fp8_parts_on_stream(
     return cudaGetLastError();
 }
 
+template<unsigned Parts>
 __global__ void lfm2_split_bf16(const float* input, __nv_bfloat16* parts,
                                uint32_t count, uint32_t stride) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= stride) return;
     float x = i < count ? input[i] : 0;
     __nv_bfloat16 high = __float2bfloat16_rn(x);
+    parts[i] = high;
+    if constexpr (Parts == 1) return;
     float remainder = x - __bfloat162float(high);
     __nv_bfloat16 middle = __float2bfloat16_rn(remainder);
     parts[i] = high;
@@ -74,23 +77,28 @@ __global__ void lfm2_split_bf16(const float* input, __nv_bfloat16* parts,
     parts[2 * stride + i] = __float2bfloat16_rn(remainder - __bfloat162float(middle));
 }
 
+template<unsigned Parts>
 __global__ void lfm2_sum_parts(const float* parts, float* output, uint32_t count, uint32_t stride,
     const float* channels, float scale, uint32_t width) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) output[i] = (parts[i] + (parts[stride + i] + parts[2 * stride + i]))
-        * (channels ? channels[i % width] : scale);
+    if (i >= count) return;
+    float value = parts[i];
+    if constexpr (Parts == 3) value += parts[stride + i] + parts[2 * stride + i];
+    output[i] = value * (channels ? channels[i % width] : scale);
 }
 
 extern "C" int infer_lfm2_split_bf16_on_stream(
-    const float* input, __nv_bfloat16* parts, uint32_t count, uint32_t stride, cudaStream_t stream) {
-    lfm2_split_bf16<<<(stride + 255) / 256, 256, 0, stream>>>(input, parts, count, stride);
+    const float* input, __nv_bfloat16* parts, uint32_t count, uint32_t stride, uint32_t parts_count, cudaStream_t stream) {
+    if (parts_count == 1) lfm2_split_bf16<1><<<(stride + 255) / 256, 256, 0, stream>>>(input, parts, count, stride);
+    else lfm2_split_bf16<3><<<(stride + 255) / 256, 256, 0, stream>>>(input, parts, count, stride);
     return cudaGetLastError();
 }
 
 extern "C" int infer_lfm2_sum_parts_on_stream(
     const float* parts, float* output, uint32_t count, uint32_t stride,
-    const float* channels, float scale, uint32_t width, cudaStream_t stream) {
-    lfm2_sum_parts<<<(count + 255) / 256, 256, 0, stream>>>(parts, output, count, stride, channels, scale, width);
+    const float* channels, float scale, uint32_t width, uint32_t parts_count, cudaStream_t stream) {
+    if (parts_count == 1) lfm2_sum_parts<1><<<(count + 255) / 256, 256, 0, stream>>>(parts, output, count, stride, channels, scale, width);
+    else lfm2_sum_parts<3><<<(count + 255) / 256, 256, 0, stream>>>(parts, output, count, stride, channels, scale, width);
     return cudaGetLastError();
 }
 

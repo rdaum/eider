@@ -183,6 +183,68 @@ Their common dense work limits the benefit from reducing the routed parameter co
 The Bolt launcher selects this official snapshot by default. Set
 `NEMOTRON35_BOLT_MODEL` or `--model-dir` to use the community conversion.
 
+### BF16 prefill evaluation
+
+The server can select BF16 matrix arithmetic and recurrent state independently:
+
+```sh
+scripts/run-eider-nemotron35-bolt.sh \
+  --nemotron-prefill-precision bf16 \
+  --nemotron-mamba-ssm-dtype bf16
+```
+
+Both settings are experimental and explicit. The server defaults to F32 matrix inputs and the
+checkpoint's recurrent-state dtype. Omit the state override to evaluate BF16
+matrices with F32 recurrent state.
+
+BF16 prefill rounds matrix inputs and dequantized IQ2/Q8 weights to BF16.
+Matrix accumulation, residuals, and attention remain F32. Verification and
+single-token decode retain their existing matrix arithmetic. This implements
+part of NVIDIA's BF16 serving recipe; it does not reproduce that entire backend.
+
+Dense IQ2/Q8 projections retain prepared BF16 copies for prefill. This adds
+4.44 GiB to the official target, bringing resident text weights to about
+33.5 GiB before drafter weights and workspaces. Routed experts remain packed.
+Their BF16 path fuses ReLU-squared with input preparation. Sequential dense
+projections share cuBLAS scratch, and fused expert workspaces omit the unused
+activation intermediate.
+
+The same 7,051-token request used 2,048-token prefill chunks, three LiLiCorr
+drafts, and 256 greedy output tokens. Two separate BF16 runs exceeded twice
+the starting prefill throughput:
+
+| Setting | Prefill tokens/s | Prefill time | Time to first token | Complete request |
+| --- | ---: | ---: | ---: | ---: |
+| Starting F32 baseline | 568 | 12.42 s | 12.88 s | 19.76 s |
+| Final F32 reference | 574 | 12.27 s | 12.68 s | 19.62 s |
+| BF16 matrices and state, run 1 | 1,153 | 6.11 s | 6.44 s | 13.71 s |
+| BF16 matrices and state, run 2 | 1,155 | 6.11 s | 6.43 s | 13.71 s |
+
+Prefill improved by 2.03 times against the starting baseline and 2.01 times
+against the final F32 reference. Complete-request latency fell by about 31%.
+Long-request decode measured 35.0–35.1 tokens/s, compared with 37.1 at baseline.
+The short prompt reached 992–1,002 prefill tokens/s. Prefix reuse retained
+7,040 tokens and completed the cached request in 6.48–6.49 seconds.
+
+BF16 output can differ from F32. Focused checks cover arithmetic, deduplication,
+dependency ordering, crash recovery, and retrieval from a 480-record prompt.
+All five passed in both modes. Repeated BF16 runs produced identical text for
+all three replay requests. Final F32 text matched the starting baseline.
+These checks do not establish broad quality parity.
+
+The strict LiLiCorr comparison remains a known failure with BF16 prefill.
+Serial and speculative generation first chose different tokens at output token
+34, with either F32 or BF16 recurrent state. The default F32 configuration
+matched all 64 tokens. Both BF16 checkpoint tests retain the exact assertion;
+this result is a reason to keep the new mode experimental.
+
+Kernel checks compare each precision mode against its corresponding CPU
+reference without relaxed tolerances. Focused GGML, dense projection, Mamba,
+and stream-initialization checks passed. The broader CUDA suite reported
+242 passes, two ignored tests, and one failure in the untouched Qwen3.6
+long-chunk recurrence test. Formatting and Clippy completed; existing warnings
+remain.
+
 ## Released checkpoint
 
 [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)

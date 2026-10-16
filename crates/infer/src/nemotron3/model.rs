@@ -44,6 +44,7 @@ pub struct Nemotron3Model {
     mtp: Option<Nemotron3Mtp>,
     lilicorr: Option<LiLiCorrDraft>,
     compact_kv_cache: bool,
+    prefill_precision: eider_cuda::GemmPrecision,
     stream: CudaStream,
 }
 
@@ -59,7 +60,10 @@ impl Nemotron3Model {
         storage: Nemotron3StorageConfig,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let manifest = Nemotron3Manifest::from_model_dir(model_dir)?;
+        let mut manifest = Nemotron3Manifest::from_model_dir(model_dir)?;
+        if let Some(dtype) = storage.mamba_ssm_dtype {
+            manifest.mamba_ssm_dtype = dtype;
+        }
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         manifest.validate_checkpoint_index(&checkpoint)?;
         info!(?storage, "selected Nemotron 3 dense-linear storage");
@@ -126,6 +130,7 @@ impl Nemotron3Model {
             mtp,
             lilicorr: None,
             compact_kv_cache: storage.kv_cache == Nemotron3KvCacheStorage::Nvfp4,
+            prefill_precision: storage.prefill_precision,
             stream: CudaStream::new_non_blocking()?,
         })
     }
@@ -2768,6 +2773,11 @@ impl Nemotron3BlockWorkspace {
             .count();
         // Row temporaries are reused by shape. Only recurrent and KV state is
         // layer-specific; hidden carries each residual to the next layer.
+        let precision = if draft_count.is_none() && rows > 8 {
+            model.prefill_precision
+        } else {
+            eider_cuda::GemmPrecision::F32
+        };
         let mut layers = Vec::new();
         let mut shapes = Vec::new();
         let mut layer_slots = Vec::with_capacity(model.layers.len());
@@ -2791,9 +2801,9 @@ impl Nemotron3BlockWorkspace {
                 Nemotron3Layer::Mamba(layer) => {
                     Nemotron3LayerRowsWorkspace::Mamba(Box::new(layer.rows_workspace(rows)?))
                 }
-                Nemotron3Layer::Moe(layer) => {
-                    Nemotron3LayerRowsWorkspace::Moe(Box::new(layer.rows_workspace(rows)?))
-                }
+                Nemotron3Layer::Moe(layer) => Nemotron3LayerRowsWorkspace::Moe(Box::new(
+                    layer.rows_workspace(rows, precision)?,
+                )),
                 Nemotron3Layer::Attention(layer) => {
                     Nemotron3LayerRowsWorkspace::Attention(layer.rows_workspace(rows)?)
                 }
@@ -2838,13 +2848,15 @@ impl Nemotron3BlockWorkspace {
         if !last_logits_only {
             dense_weights.push(&model.lm_head);
         }
+        let mut dense_gemm = Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?;
+        dense_gemm.set_precision(precision);
         let workspace = Self {
             graphs: (0..=model.layers.len()).map(|_| None).collect(),
             graph_warm: false,
             capture_graphs: draft_count.is_some(),
             segment_dense_rows: false,
             dense_row_lengths: Vec::new(),
-            dense_gemm: Nemotron3Linear::dense_workspace(rows, dense_weights.into_iter())?,
+            dense_gemm,
             host_tokens: PinnedHostBuffer::zeroed(rows)?,
             host_offsets: PinnedHostBuffer::zeroed(sequence_count)?,
             host_lengths: PinnedHostBuffer::zeroed(sequence_count)?,
@@ -3235,8 +3247,31 @@ mod lilicorr_tests {
     #[test]
     #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
     fn lilicorr_commits_match_serial_target() {
+        check_lilicorr_commits(Nemotron3StorageConfig::default());
+    }
+
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_bf16_prefill_commits_match_serial_target() {
+        check_lilicorr_commits(Nemotron3StorageConfig {
+            prefill_precision: eider_cuda::GemmPrecision::Bf16,
+            mamba_ssm_dtype: Some(eider_cuda::MambaSsmDtype::Bf16),
+            ..Nemotron3StorageConfig::default()
+        });
+    }
+
+    #[test]
+    #[ignore = "loads the full target and LiLiCorr; requires NEMOTRON_MODEL_DIR and LILICORR_DIR"]
+    fn lilicorr_bf16_matrices_f32_state_commits_match_serial_target() {
+        check_lilicorr_commits(Nemotron3StorageConfig {
+            prefill_precision: eider_cuda::GemmPrecision::Bf16,
+            ..Nemotron3StorageConfig::default()
+        });
+    }
+
+    fn check_lilicorr_commits(storage: Nemotron3StorageConfig) {
         let root = std::env::var("NEMOTRON_MODEL_DIR").unwrap();
-        let mut model = Nemotron3Model::load(&root).unwrap();
+        let mut model = Nemotron3Model::load_with_storage(&root, storage).unwrap();
         model
             .enable_lilicorr(std::env::var("LILICORR_DIR").unwrap())
             .unwrap();

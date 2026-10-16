@@ -14688,6 +14688,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
     mut output: DeviceOutput<'_, f32>,
+    mut coefficients: DeviceOutput<'_, f32>,
     sequence_count: usize,
     total_tokens: usize,
     heads: usize,
@@ -14739,6 +14740,8 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
         || d_bf16.len() != heads
         || dt_bias_bf16.len() != heads
         || norm_weight_bf16.len() != intermediate_size
+        || coefficients.len() != total_tokens.saturating_mul(heads).saturating_mul(2)
+        || total_tokens.saturating_mul(heads) > u32::MAX as usize - 255
         || output.len() != output_len
         || state_table_end > ssm_state_table.len()
         || sequence_offsets.len() < sequence_count
@@ -14782,6 +14785,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
+                coefficients.buffer_mut().ptr,
                 sequence_count as u32,
                 total_tokens as u32,
                 projection_size as u32,
@@ -16321,6 +16325,7 @@ mod tests {
         let ssm_state_table = DeviceBuffer::from_host(&ssm_state_ptrs).expect("SSM state table");
         let mut actual_output =
             DeviceBuffer::zeroed(TOTAL_TOKENS * INTERMEDIATE).expect("chunk Mamba output");
+        let mut coefficients = DeviceBuffer::zeroed(TOTAL_TOKENS * HEADS * 2).unwrap();
         nemotron3_mamba_state_update_f32_chunks_into_on_stream(
             &projected_device,
             &actual_conv,
@@ -16333,6 +16338,7 @@ mod tests {
             &offsets_device,
             &lengths_device,
             actual_output.output(),
+            coefficients.output(),
             2,
             TOTAL_TOKENS,
             HEADS,

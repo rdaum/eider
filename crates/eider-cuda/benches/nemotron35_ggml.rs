@@ -1,6 +1,6 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, GgmlGemmWorkspace, GgmlWeights,
-    MoeSortedRoutes,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, GemmPrecision, GgmlGemmWorkspace,
+    GgmlWeights, MoeSortedRoutes,
 };
 use eider_format::GgmlBlockFormat;
 use micromeasure::{
@@ -8,6 +8,10 @@ use micromeasure::{
     ComparisonPolicy, MeasurementDomain, MetricValue, run_benchmark_main,
 };
 use std::time::Duration;
+
+fn bf16(value: f32) -> f32 {
+    f32::from_bits((value.to_bits() + 0x7fff + ((value.to_bits() >> 16) & 1)) & 0xffff0000)
+}
 
 struct Case<
     const OUT: usize,
@@ -49,7 +53,14 @@ impl<
                 .sort_on_stream(&self.indices, &self.stream)
                 .unwrap();
             self.weights
-                .run_routed(&self.routes, &self.inputs, &self.outputs, ws, &self.stream)
+                .run_routed(
+                    &self.routes,
+                    &self.inputs,
+                    &self.outputs,
+                    false,
+                    ws,
+                    &self.stream,
+                )
                 .unwrap();
         }
     }
@@ -118,7 +129,12 @@ impl<
         };
         // Check full-sized shapes against independent CPU decoding at scattered
         // routes and output channels. Unit tests cover every output on small shapes.
-        for tensor in [false, true] {
+        for (tensor, precision) in [
+            (false, GemmPrecision::F32),
+            (true, GemmPrecision::F32),
+            (true, GemmPrecision::Bf16),
+        ] {
+            case.workspace.set_precision(precision);
             case.run(tensor);
             let actual = case.output.copy_to_host(&case.stream).unwrap();
             for r in [0, R / 3, R - 1] {
@@ -130,13 +146,19 @@ impl<
                     let expected = w
                         .iter()
                         .zip(&host[r * I..][..I])
-                        .map(|(&w, &x)| f64::from(w) * f64::from(x))
+                        .map(|(&w, &x)| {
+                            if precision == GemmPrecision::Bf16 {
+                                f64::from(bf16(w)) * f64::from(bf16(x))
+                            } else {
+                                f64::from(w) * f64::from(x)
+                            }
+                        })
                         .sum::<f64>() as f32;
                     let value = actual[r * O + row];
                     assert!(
                         value.is_finite()
                             && (value - expected).abs() < 2e-4 + expected.abs() * 2e-5,
-                        "tensor={tensor} route={r} channel={row}: GPU {value}, CPU {expected}"
+                        "tensor={tensor} precision={precision:?} route={r} channel={row}: GPU {value}, CPU {expected}"
                     );
                 }
             }
@@ -155,11 +177,17 @@ fn sample<
     const IQ: bool,
     const TENSOR: bool,
     const REPEAT: bool,
+    const BF16: bool,
 >(
     c: &mut Case<O, I, R, E, IQ, REPEAT>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
+    c.workspace.set_precision(if BF16 {
+        GemmPrecision::Bf16
+    } else {
+        GemmPrecision::F32
+    });
     c.start.record_on_stream(&c.stream).unwrap();
     for _ in 0..count {
         c.run(TENSOR);
@@ -193,11 +221,15 @@ fn main() {
                         let g = g.measurement_domain(MeasurementDomain::Gpu);
                         g.bench_sample(
                             "packed F32 matvec",
-                            sample::<$o, $i, $r, $e, $iq, false, false>,
+                            sample::<$o, $i, $r, $e, $iq, false, false, false>,
                         );
                         g.bench_sample(
                             "packed tensor cores",
-                            sample::<$o, $i, $r, $e, $iq, true, false>,
+                            sample::<$o, $i, $r, $e, $iq, true, false, false>,
+                        );
+                        g.bench_sample(
+                            "BF16 tensor cores",
+                            sample::<$o, $i, $r, $e, $iq, true, false, true>,
                         );
                     });
                 };
@@ -207,7 +239,7 @@ fn main() {
                     runner.group::<Case<$o, $i, 36, 496, true, true>>($name, |g| {
                         g.measurement_domain(MeasurementDomain::Gpu).bench_sample(
                             "packed F32 matvec",
-                            sample::<$o, $i, 36, 496, true, false, true>,
+                            sample::<$o, $i, 36, 496, true, false, true, false>,
                         );
                     });
                 };

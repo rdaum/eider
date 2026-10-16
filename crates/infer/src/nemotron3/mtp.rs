@@ -50,6 +50,7 @@ impl Nemotron3Mtp {
             bf16: Nemotron3Bf16Storage::Nvfp4,
             fp8: Nemotron3Fp8Storage::Nvfp4,
             kv_cache: Nemotron3KvCacheStorage::F32,
+            ..Nemotron3StorageConfig::default()
         };
         Ok(Some(Self {
             manifest: manifest.clone(),
@@ -570,7 +571,9 @@ impl Nemotron3MtpWorkspace {
             fused: DeviceBuffer::zeroed(rows * hidden * 2)?,
             projected: DeviceBuffer::zeroed(rows * hidden)?,
             attention: mtp.attention.rows_workspace(rows)?,
-            moe: mtp.moe.rows_workspace(rows)?,
+            moe: mtp
+                .moe
+                .rows_workspace(rows, eider_cuda::GemmPrecision::F32)?,
             final_hidden: DeviceBuffer::zeroed(rows * hidden)?,
             previous_hidden: DeviceBuffer::zeroed(rows * hidden)?,
             logits: DeviceBuffer::zeroed(rows * mtp.manifest.vocab_size)?,

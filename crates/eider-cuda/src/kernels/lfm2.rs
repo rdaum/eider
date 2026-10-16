@@ -7,6 +7,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::rc::Rc;
 
 unsafe extern "C" {
     fn infer_split_f32_fp8_parts_on_stream(
@@ -51,6 +52,7 @@ unsafe extern "C" {
         parts: *mut u16,
         count: u32,
         stride: u32,
+        parts_count: u32,
         stream: *mut c_void,
     ) -> i32;
     fn infer_lfm2_sum_parts_on_stream(
@@ -61,6 +63,7 @@ unsafe extern "C" {
         channels: *const f32,
         scale: f32,
         width: u32,
+        parts_count: u32,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -125,12 +128,24 @@ pub fn quantized_dense_gemm_f32_into_on_stream(
     }
 }
 
+/// Arithmetic used for dense and packed tensor-core projections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GemmPrecision {
+    /// Retain F32 inputs with multiple tensor-core products.
+    #[default]
+    F32,
+    /// Round inputs and dequantized weights to BF16, accumulating in F32.
+    Bf16,
+}
+
 /// Reusable projections from F32 rows, with BF16 decomposition or calibrated FP8 activations.
 pub struct F32DenseGemm {
     ggml: Option<crate::GgmlGemmWorkspace>,
+    precision: GemmPrecision,
     row_segments: Vec<usize>,
     lt: CublasLt,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
+    plan_workspace: Rc<DeviceBuffer<u8>>,
     fp8_plans: HashMap<(usize, usize, usize), Fp8TnMatmulPlan>,
     fp8_input: DeviceBuffer<u8>,
     fp8_parts: Option<Fp8Parts>,
@@ -154,6 +169,19 @@ enum DenseGemmWeights<'a> {
 }
 
 impl F32DenseGemm {
+    /// Selected matrix arithmetic.
+    pub fn precision(&self) -> GemmPrecision {
+        self.precision
+    }
+
+    /// Selects matrix arithmetic before workspace warm-up and graph capture.
+    pub fn set_precision(&mut self, precision: GemmPrecision) {
+        if self.precision != precision {
+            self.plans.clear();
+            self.precision = precision;
+        }
+    }
+
     /// Reuses one activation workspace across packed dense and expert projections.
     pub fn ggml_workspace(
         &mut self,
@@ -165,7 +193,9 @@ impl F32DenseGemm {
         } else {
             self.ggml = Some(crate::GgmlGemmWorkspace::new(rows, cols)?);
         }
-        Ok(self.ggml.as_mut().unwrap())
+        let ws = self.ggml.as_mut().unwrap();
+        ws.set_precision(self.precision);
+        Ok(ws)
     }
 
     /// Allocates scratch for the largest input/output width and prompt chunk.
@@ -185,17 +215,20 @@ impl F32DenseGemm {
                 detail: "invalid workspace dimensions".into(),
             });
         }
+        // Preparation and GEMM overwrite every active element before it is read.
         Ok(Self {
             ggml: None,
+            precision: GemmPrecision::F32,
             row_segments: Vec::new(),
             lt: CublasLt::new()?,
             plans: HashMap::new(),
+            plan_workspace: Rc::new(DeviceBuffer::uninitialized(1 << 20)?),
             fp8_plans: HashMap::new(),
-            fp8_input: DeviceBuffer::zeroed(count.unwrap() / 3)?,
+            fp8_input: DeviceBuffer::uninitialized(count.unwrap() / 3)?,
             fp8_parts: None,
-            input: DeviceBuffer::zeroed(count.unwrap())?,
-            products: DeviceBuffer::zeroed(count.unwrap())?,
-            expanded_weight: DeviceBuffer::zeroed(max_quantized_elements)?,
+            input: DeviceBuffer::uninitialized(count.unwrap())?,
+            products: DeviceBuffer::uninitialized(count.unwrap())?,
+            expanded_weight: DeviceBuffer::uninitialized(max_quantized_elements)?,
             capacity,
             features,
         })
@@ -409,7 +442,7 @@ impl F32DenseGemm {
         Ok(())
     }
 
-    /// Projects active rows, preserving F32 activation residuals in three products.
+    /// Projects active rows with the selected matrix precision.
     /// Plans are cached by matrix shape and power-of-two row count. The first
     /// call for each shape creates its plan outside CUDA graph capture.
     #[allow(clippy::too_many_arguments)]
@@ -639,16 +672,21 @@ impl F32DenseGemm {
     ) -> Result<()> {
         // Power-of-two row buckets bound the plan cache across prompt lengths.
         let padded_rows = rows.next_power_of_two();
+        let parts = if self.precision == GemmPrecision::Bf16 {
+            1
+        } else {
+            3
+        };
         let shape = (out, cols, padded_rows);
         if let std::collections::hash_map::Entry::Vacant(entry) = self.plans.entry(shape) {
-            entry.insert(Bf16TnMatmulPlan::new(
+            entry.insert(Bf16TnMatmulPlan::new_with_workspace(
                 &self.lt,
                 GemmShape {
                     m: out,
-                    n: 3 * padded_rows,
+                    n: parts * padded_rows,
                     k: cols,
                 },
-                1 << 20,
+                Rc::clone(&self.plan_workspace),
             )?);
         }
         let plan = &self.plans[&shape];
@@ -660,6 +698,7 @@ impl F32DenseGemm {
                     self.input.ptr,
                     (rows * cols) as u32,
                     (padded_rows * cols) as u32,
+                    parts as u32,
                     stream.as_raw(),
                 ),
             )?;
@@ -682,6 +721,19 @@ impl F32DenseGemm {
                 &self.expanded_weight
             }
         };
+        if parts == 1 && rows == padded_rows && channel_scales.is_none() {
+            return plan.run_scaled_offsets_on_stream(
+                &self.lt,
+                weight,
+                0,
+                &self.input,
+                0,
+                output,
+                offset * out,
+                global_scale,
+                stream,
+            );
+        }
         plan.run_on_stream(
             &self.lt,
             weight,
@@ -701,6 +753,7 @@ impl F32DenseGemm {
                     channel_scales.map_or(std::ptr::null(), |s| s.ptr),
                     global_scale,
                     out as u32,
+                    parts as u32,
                     stream.as_raw(),
                 ),
             )
@@ -724,11 +777,7 @@ impl F32DenseGemm {
                 .sum::<usize>()
             + self.products.device_bytes()
             + self.expanded_weight.device_bytes()
-            + self
-                .plans
-                .values()
-                .map(Bf16TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
+            + self.plan_workspace.device_bytes()
     }
 }
 
@@ -1394,6 +1443,56 @@ impl Head64DecodeAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn bf16_dense_precision_matches_rounded_cpu() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let (rows, out, cols) = (33, 65, 1024);
+        let rounded = |x: f32| {
+            f32::from_bits((x.to_bits() + 0x7fff + ((x.to_bits() >> 16) & 1)) & 0xffff0000)
+        };
+        let host: Vec<_> = (0..rows * cols)
+            .map(|i| ((i * 31 % 1009) as f32 - 504.) / 137.137)
+            .collect();
+        let weights: Vec<_> = (0..out * cols)
+            .map(|i| (rounded(((i * 71 % 1021) as f32 - 510.) / 1024.).to_bits() >> 16) as u16)
+            .collect();
+        let input = DeviceBuffer::from_host(&host).unwrap();
+        let weight = DeviceBuffer::from_host(&weights).unwrap();
+        let mut output = DeviceBuffer::zeroed(rows * out).unwrap();
+        let mut gemm = F32DenseGemm::new(rows, cols, 0).unwrap();
+        gemm.set_row_segments(&[16, 17]).unwrap();
+        for precision in [GemmPrecision::F32, GemmPrecision::Bf16, GemmPrecision::F32] {
+            gemm.set_precision(precision);
+            gemm.run_on_stream(&input, &weight, output.output(), rows, out, cols, &stream)
+                .unwrap();
+            let actual = output.copy_to_host(&stream).unwrap();
+            for row in 0..rows {
+                for channel in 0..out {
+                    let expected = (0..cols)
+                        .map(|k| {
+                            let x = host[row * cols + k];
+                            let x = if precision == GemmPrecision::Bf16 {
+                                rounded(x)
+                            } else {
+                                x
+                            };
+                            f64::from(x)
+                                * f64::from(f32::from_bits(
+                                    u32::from(weights[channel * cols + k]) << 16,
+                                ))
+                        })
+                        .sum::<f64>() as f32;
+                    let value = actual[row * out + channel];
+                    assert!(
+                        (value - expected).abs() < 2e-4 + expected.abs() * 2e-5,
+                        "{precision:?}: GPU {value}, CPU {expected}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[serial_test::serial]

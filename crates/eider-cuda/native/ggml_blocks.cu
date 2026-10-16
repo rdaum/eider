@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 namespace {
@@ -56,6 +57,15 @@ __device__ __forceinline__ uint32_t integer_pair(const uint8_t* block, unsigned 
     }
     return unsigned(__half_as_ushort(__int2half_rn(a)))
         | (unsigned(__half_as_ushort(__int2half_rn(b))) << 16);
+}
+
+template<unsigned Format, bool Bf16>
+__device__ __forceinline__ uint32_t tensor_pair(const uint8_t* block, unsigned k, const uint64_t* grid) {
+    const uint32_t pair = integer_pair<Format>(block, k, grid);
+    if constexpr (!Bf16) return pair;
+    const float scale = weight_scale<Format>(block);
+    return unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(__half2float(__ushort_as_half(pair)) * scale)))
+        | (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(__half2float(__ushort_as_half(pair >> 16)) * scale))) << 16);
 }
 
 // Dense and routed decode retain compressed weights, F32 inputs and a fixed
@@ -136,11 +146,19 @@ __global__ void packed_matvec(
     }
 }
 
-template<bool Routed>
+template<bool Routed, bool Bf16>
 __global__ void prepare_inputs(const float* dense, const float* const* inputs,
-                               uint16_t* prepared, float* powers, unsigned cols) {
+                               uint16_t* prepared, float* powers, unsigned cols, bool relu_squared) {
     const unsigned row = blockIdx.x;
     const float* input = Routed ? inputs[row] : dense + size_t(row) * cols;
+    if constexpr (Bf16) {
+        for (unsigned k = threadIdx.x; k < cols; k += 256) {
+            float value = input[k];
+            if (relu_squared) { value = fmaxf(value, 0.f); value *= value; }
+            prepared[size_t(row) * cols + k] = __bfloat16_as_ushort(__float2bfloat16_rn(value));
+        }
+        return;
+    }
     __shared__ float maxima[8];
     float maximum = 0;
     for (unsigned k = threadIdx.x; k < cols; k += 256) maximum = fmaxf(maximum, fabsf(input[k]));
@@ -165,9 +183,15 @@ __global__ void prepare_inputs(const float* dense, const float* const* inputs,
     }
 }
 
+template<bool Bf16>
 __device__ __forceinline__ void mma(float* c, unsigned a0, unsigned a1, unsigned a2,
                                    unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+    if constexpr (Bf16) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    } else asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
@@ -175,13 +199,14 @@ __device__ __forceinline__ void mma(float* c, unsigned a0, unsigned a1, unsigned
 
 // Build route tiles once per projection, rather than scanning all experts in
 // every matrix CTA. One warp scans 32 groups of up to 32 experts.
+template<unsigned TileRows>
 __global__ void prepare_tiles(const uint32_t* offsets, uint32_t* tiles,
                               unsigned experts, unsigned capacity) {
     __shared__ unsigned counts[1024], group_totals[32];
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const unsigned first = threadIdx.x < experts ? offsets[threadIdx.x] : 0;
     const unsigned last = threadIdx.x < experts ? offsets[threadIdx.x + 1] : 0;
-    const unsigned count = (last - first + 15) / 16;
+    const unsigned count = (last - first + TileRows - 1) / TileRows;
     unsigned prefix = count;
     for (unsigned delta = 1; delta < 32; delta <<= 1) {
         const unsigned value = __shfl_up_sync(0xffffffff, prefix, delta);
@@ -201,23 +226,23 @@ __global__ void prepare_tiles(const uint32_t* offsets, uint32_t* tiles,
     __syncthreads();
     const unsigned start = counts[threadIdx.x] + (warp ? group_totals[warp - 1] : 0);
     for (unsigned t = 0; t < count; ++t) {
-        const unsigned begin = first + t * 16;
+        const unsigned begin = first + t * TileRows;
         tiles[(start + t) * 3] = threadIdx.x;
         tiles[(start + t) * 3 + 1] = begin;
-        tiles[(start + t) * 3 + 2] = min(begin + 16, last);
+        tiles[(start + t) * 3 + 2] = min(begin + TileRows, last);
     }
     for (unsigned t = group_totals[31] + threadIdx.x; t < capacity; t += 1024)
         tiles[t * 3] = experts;
 }
 
-template<unsigned K, unsigned TileRows>
+template<unsigned K, unsigned TileRows, unsigned Parts>
 __device__ __forceinline__ void stage_inputs(uint16_t* destination,
     const uint16_t* input, const unsigned* ids, unsigned valid_rows,
     unsigned cols, unsigned base) {
-    for (unsigned i = threadIdx.x; i < 3 * TileRows * (K / 8); i += blockDim.x) {
+    for (unsigned i = threadIdx.x; i < Parts * TileRows * (K / 8); i += blockDim.x) {
         const unsigned part = i / (TileRows * (K / 8));
         const unsigned row = (i / (K / 8)) % TileRows, k = (i % (K / 8)) * 8;
-        const auto* source = input + (size_t(ids[row]) * 3 + part) * cols + base + k;
+        const auto* source = input + (size_t(ids[row]) * Parts + part) * cols + base + k;
         const unsigned address = __cvta_generic_to_shared(destination + (part * TileRows + row) * (K + 8) + k);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
             :: "r"(address), "l"(source), "r"(row < valid_rows ? 16 : 0) : "memory");
@@ -225,20 +250,21 @@ __device__ __forceinline__ void stage_inputs(uint16_t* destination,
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
-// Each CTA projects 8, 16, or 32 activation rows through 64 output channels.
+// Each CTA projects 8 to 64 activation rows through 64 or 128 output channels.
 // Short dense batches split the reduction across one CTA per quantization block.
 // Integer weights stay packed; the FP16 block scale is applied in F32 after the dot.
-template<unsigned Format, bool Routed, unsigned Columns = 2, bool SplitK = false>
+template<unsigned Format, bool Routed, unsigned Columns = 2, bool SplitK = false, bool Bf16 = false>
 __global__ void packed_gemm(
     const uint32_t* sorted, const uint32_t* tiles, const uint8_t* const* weights,
     float* const* outputs, const uint8_t* dense_weight, float* dense_output,
     const uint16_t* input, const float* powers, const uint64_t* grid,
     unsigned rows, unsigned experts, unsigned out, unsigned cols) {
     constexpr unsigned K = block_elements<Format>, Step = K < 64 ? K : 64, Stride = Step + 8;
-    constexpr unsigned TileOut = 64, TileRows = Columns * 8;
+    constexpr unsigned TileOut = Bf16 && !SplitK ? 128 : 64;
+    constexpr unsigned TileRows = Columns * 8, Parts = Bf16 ? 1 : 3;
     __shared__ unsigned expert, begin, end, ids[TileRows];
     __shared__ __align__(16) uint16_t w[TileOut][block_bytes<Format> / 2 + 1];
-    __shared__ __align__(16) uint16_t x[2][3][TileRows][Stride];
+    __shared__ __align__(16) uint16_t x[2][Parts][TileRows][Stride];
     if (!threadIdx.x) {
         if constexpr (!Routed) { expert = 0; begin = blockIdx.y * TileRows; end = min(begin + TileRows, rows); }
         else { expert = tiles[blockIdx.y * 3]; begin = tiles[blockIdx.y * 3 + 1]; end = tiles[blockIdx.y * 3 + 2]; }
@@ -263,29 +289,33 @@ __global__ void packed_gemm(
                 + (size_t(global_row) * (cols / K) + base / K) * block_bytes<Format>);
             w[row][word] = global_row < out ? block[word] : 0;
         }
-        stage_inputs<Step, TileRows>(&x[0][0][0][0], input, ids, end - begin, cols, base);
+        stage_inputs<Step, TileRows, Parts>(&x[0][0][0][0], input, ids, end - begin, cols, base);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         float high[Columns][4][4] = {}, low[Columns][4] = {}, tail[Columns][4] = {};
         for (unsigned chunk = 0, stage = 0; chunk < K; chunk += Step, stage ^= 1) {
-            if (chunk + Step < K) stage_inputs<Step, TileRows>(&x[stage ^ 1][0][0][0],
+            if (chunk + Step < K) stage_inputs<Step, TileRows, Parts>(&x[stage ^ 1][0][0][0],
                 input, ids, end - begin, cols, base + chunk + Step);
             #pragma unroll
             for (unsigned k = 0; k < Step; k += 16) {
                 const auto* w0 = reinterpret_cast<const uint8_t*>(&w[row0][0]);
                 const auto* w1 = reinterpret_cast<const uint8_t*>(&w[row1][0]);
-                const unsigned a0 = integer_pair<Format>(w0, chunk + k + pair, grid);
-                const unsigned a1 = integer_pair<Format>(w1, chunk + k + pair, grid);
-                const unsigned a2 = integer_pair<Format>(w0, chunk + k + pair + 8, grid);
-                const unsigned a3 = integer_pair<Format>(w1, chunk + k + pair + 8, grid);
+                const unsigned a0 = tensor_pair<Format, Bf16>(w0, chunk + k + pair, grid);
+                const unsigned a1 = tensor_pair<Format, Bf16>(w1, chunk + k + pair, grid);
+                const unsigned a2 = tensor_pair<Format, Bf16>(w0, chunk + k + pair + 8, grid);
+                const unsigned a3 = tensor_pair<Format, Bf16>(w1, chunk + k + pair + 8, grid);
                 #pragma unroll
                 for (unsigned n = 0; n < Columns; ++n) {
                     const auto* hi = reinterpret_cast<const uint32_t*>(&x[stage][0][lane / 4 + n * 8][k + pair]);
-                    const auto* lo = reinterpret_cast<const uint32_t*>(&x[stage][1][lane / 4 + n * 8][k + pair]);
-                    mma(high[n][(k / 16) % 4], a0, a1, a2, a3, hi[0], hi[4]);
-                    mma(low[n], a0, a1, a2, a3, lo[0], lo[4]);
-                    const auto* last = reinterpret_cast<const uint32_t*>(&x[stage][2][lane / 4 + n * 8][k + pair]);
-                    mma(tail[n], a0, a1, a2, a3, last[0], last[4]);
+                    if constexpr (Bf16) {
+                        mma<true>(result[n], a0, a1, a2, a3, hi[0], hi[4]);
+                    } else {
+                        const auto* lo = reinterpret_cast<const uint32_t*>(&x[stage][1][lane / 4 + n * 8][k + pair]);
+                        mma<false>(high[n][(k / 16) % 4], a0, a1, a2, a3, hi[0], hi[4]);
+                        mma<false>(low[n], a0, a1, a2, a3, lo[0], lo[4]);
+                        const auto* last = reinterpret_cast<const uint32_t*>(&x[stage][2][lane / 4 + n * 8][k + pair]);
+                        mma<false>(tail[n], a0, a1, a2, a3, last[0], last[4]);
+                    }
                 }
             }
             if (chunk + Step < K) {
@@ -297,6 +327,7 @@ __global__ void packed_gemm(
         for (unsigned n = 0; n < Columns; ++n) {
             #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
+                if constexpr (Bf16) continue;
                 const float hi = (high[n][0][i] + high[n][1][i]) + (high[n][2][i] + high[n][3][i]);
                 const float correction = fmaf(tail[n][i], 0x1p-16f, low[n][i]);
                 result[n][i] = fmaf(hi + correction, weight_scale<Format>(reinterpret_cast<const uint8_t*>(&w[i < 2 ? row0 : row1][0])), result[n][i]);
@@ -312,7 +343,7 @@ __global__ void packed_gemm(
             const unsigned row = blockIdx.x * TileOut + (i < 2 ? row0 : row1);
             if (begin + local < end && row < out) {
                 const unsigned id = ids[local];
-                const float value = result[n][i] * powers[id];
+                const float value = Bf16 ? result[n][i] : result[n][i] * powers[id];
                 if constexpr (Routed) outputs[id][row] = value;
                 else dense_output[(size_t(SplitK ? blockIdx.z : 0) * rows + id) * out + row] = value;
             }
@@ -328,20 +359,20 @@ __global__ void sum_split_blocks(const float* partials, float* output, unsigned 
     output[i] = value;
 }
 
-template<unsigned Format, bool Routed>
+template<unsigned Format, bool Routed, bool Bf16>
 cudaError_t project(
     const float* dense_input, const uint8_t* dense_weight, float* dense_output,
     const uint32_t* sorted, const uint32_t* sorted_experts, const uint32_t* offsets,
     const float* const* inputs, const uint8_t* const* weights, float* const* outputs,
     const uint64_t* grid, uint16_t* prepared, float* powers, uint32_t* tile_map, float* partials,
-    unsigned rows, unsigned experts, unsigned out, unsigned cols, cudaStream_t stream) {
+    unsigned rows, unsigned experts, unsigned out, unsigned cols, bool relu_squared, cudaStream_t stream) {
     if (prepared) {
-        prepare_inputs<Routed><<<rows, 256, 0, stream>>>(dense_input, inputs, prepared, powers, cols);
+        prepare_inputs<Routed, Bf16><<<rows, 256, 0, stream>>>(dense_input, inputs, prepared, powers, cols, relu_squared);
         auto status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         if constexpr (Format == 1 && !Routed) {
             if (partials) {
-                packed_gemm<Format, false, 1, true><<<dim3((out + 63) / 64, (rows + 7) / 8, cols / 256), 128, 0, stream>>>(
+                packed_gemm<Format, false, 1, true, Bf16><<<dim3((out + 63) / 64, (rows + 7) / 8, cols / 256), 128, 0, stream>>>(
                     nullptr, nullptr, nullptr, nullptr, dense_weight, partials,
                     prepared, powers, grid, rows, 1, out, cols);
                 status = cudaGetLastError();
@@ -350,16 +381,16 @@ cudaError_t project(
                 return cudaGetLastError();
             }
         }
-        constexpr unsigned Columns = Format == 1 && !Routed ? 4 : 2;
+        constexpr unsigned Columns = Bf16 && Routed ? 8 : (Bf16 || (Format == 1 && !Routed) ? 4 : 2);
         constexpr unsigned TileRows = Columns * 8;
         const unsigned tiles = (rows + TileRows - 1) / TileRows + (Routed ? experts - 1 : 0);
         if constexpr (Routed) {
-            prepare_tiles<<<1, 1024, 0, stream>>>(offsets, tile_map, experts, tiles);
+            prepare_tiles<TileRows><<<1, 1024, 0, stream>>>(offsets, tile_map, experts, tiles);
             status = cudaGetLastError();
             if (status != cudaSuccess) return status;
         }
-        constexpr unsigned TileOut = 64;
-        packed_gemm<Format, Routed, Columns><<<dim3((out + TileOut - 1) / TileOut, tiles), TileOut * 2, 0, stream>>>(
+        constexpr unsigned TileOut = Bf16 ? 128 : 64;
+        packed_gemm<Format, Routed, Columns, false, Bf16><<<dim3((out + TileOut - 1) / TileOut, tiles), TileOut * 2, 0, stream>>>(
             sorted, tile_map, weights, outputs, dense_weight, dense_output,
             prepared, powers, grid, rows, experts, out, cols);
     } else {
@@ -377,26 +408,51 @@ cudaError_t project(
     }
     return cudaGetLastError();
 }
+template<unsigned Format>
+__global__ void expand_bf16(const uint8_t* packed, const uint64_t* grid, uint16_t* output, unsigned elements) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= elements) return;
+    const uint8_t* block = packed + size_t(i / block_elements<Format>) * block_bytes<Format>;
+    const float value = float(integer_weight<Format>(block, i % block_elements<Format>, grid)) * weight_scale<Format>(block);
+    output[i] = __bfloat16_as_ushort(__float2bfloat16_rn(value));
+}
 } // namespace
 
 extern "C" cudaError_t infer_ggml_dense_on_stream(
     const float* input, const uint8_t* weight, float* output, const uint64_t* grid,
-    uint16_t* prepared, float* powers, uint32_t* tiles, float* partials, unsigned format, unsigned rows,
+    uint16_t* prepared, float* powers, uint32_t* tiles, float* partials, unsigned format, unsigned bf16, unsigned rows,
     unsigned out, unsigned cols, cudaStream_t stream) {
-    if (format == 0) return project<0, false>(input, weight, output, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, stream);
-    if (format == 1) return project<1, false>(input, weight, output, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, stream);
+    if (format == 0 && bf16) return project<0, false, true>(input, weight, output, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, false, stream);
+    if (format == 0) return project<0, false, false>(input, weight, output, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, false, stream);
+    if (format == 1 && bf16) return project<1, false, true>(input, weight, output, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, false, stream);
+    if (format == 1) return project<1, false, false>(input, weight, output, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, grid, prepared, powers, tiles, partials, rows, 1, out, cols, false, stream);
     return cudaErrorInvalidValue;
 }
 extern "C" cudaError_t infer_ggml_routed_on_stream(
     const uint32_t* sorted, const uint32_t* sorted_experts, const uint32_t* offsets,
     const float* const* inputs, const uint8_t* const* weights, float* const* outputs,
-    const uint64_t* grid, uint16_t* prepared, float* powers, uint32_t* tiles, unsigned format,
+    const uint64_t* grid, uint16_t* prepared, float* powers, uint32_t* tiles, unsigned format, unsigned bf16, unsigned relu_squared,
     unsigned rows, unsigned experts, unsigned out, unsigned cols, cudaStream_t stream) {
-    if (format == 0) return project<0, true>(nullptr, nullptr, nullptr, sorted,
-        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, stream);
-    if (format == 1) return project<1, true>(nullptr, nullptr, nullptr, sorted,
-        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, stream);
+    if (format == 0 && bf16) return project<0, true, true>(nullptr, nullptr, nullptr, sorted,
+        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, relu_squared, stream);
+    if (format == 0) return project<0, true, false>(nullptr, nullptr, nullptr, sorted,
+        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, relu_squared, stream);
+    if (format == 1 && bf16) return project<1, true, true>(nullptr, nullptr, nullptr, sorted,
+        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, relu_squared, stream);
+    if (format == 1) return project<1, true, false>(nullptr, nullptr, nullptr, sorted,
+        sorted_experts, offsets, inputs, weights, outputs, grid, prepared, powers, tiles, nullptr, rows, experts, out, cols, relu_squared, stream);
     return cudaErrorInvalidValue;
+}
+
+extern "C" cudaError_t infer_ggml_expand_bf16_on_stream(
+    const uint8_t* packed, const uint64_t* grid, uint16_t* output,
+    unsigned elements, unsigned format, cudaStream_t stream) {
+    if (format == 0) expand_bf16<0><<<(elements + 255) / 256, 256, 0, stream>>>(packed, grid, output, elements);
+    else if (format == 1) expand_bf16<1><<<(elements + 255) / 256, 256, 0, stream>>>(packed, grid, output, elements);
+    else return cudaErrorInvalidValue;
+    return cudaGetLastError();
 }

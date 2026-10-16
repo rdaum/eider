@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
+use std::rc::Rc;
 
 /// Persistent cuBLASLt plan for `D[M,N] = A[K,M]^T * B[K,N]` with BF16 inputs.
 pub struct Bf16TnMatmulPlan {
@@ -23,7 +24,7 @@ pub struct Bf16TnMatmulPlan {
     d_layout: MatrixLayout,
     _pref: MatmulPreference,
     algo: ffi::cublasLtMatmulAlgo_t,
-    workspace: Option<DeviceBuffer<u8>>,
+    workspace: Option<Rc<DeviceBuffer<u8>>>,
     workspace_size: usize,
     output_type: Bf16TnOutput,
 }
@@ -43,6 +44,27 @@ impl Bf16TnMatmulPlan {
     /// Creates a plan with BF16 A/B inputs and f32 output.
     pub fn new(lt: &CublasLt, shape: GemmShape, workspace_limit: u64) -> Result<Self> {
         Self::new_with_a_leading_dimension(lt, shape, shape.k, workspace_limit)
+    }
+
+    /// Shares scratch between plans executed sequentially on the same stream.
+    /// Concurrent launches must use separate scratch allocations.
+    pub fn new_with_workspace(
+        lt: &CublasLt,
+        shape: GemmShape,
+        workspace: Rc<DeviceBuffer<u8>>,
+    ) -> Result<Self> {
+        Self::new_strided_batch_with_a_leading_dimension_and_output(
+            lt,
+            shape,
+            shape.k,
+            1,
+            0,
+            0,
+            0,
+            workspace.len() as u64,
+            Bf16TnOutput::F32,
+            Some(workspace),
+        )
     }
 
     /// Creates a plan whose A columns use an explicit leading dimension.
@@ -109,6 +131,7 @@ impl Bf16TnMatmulPlan {
             d_batch_stride,
             workspace_limit,
             Bf16TnOutput::F32,
+            None,
         )
     }
 
@@ -134,6 +157,7 @@ impl Bf16TnMatmulPlan {
             d_batch_stride,
             workspace_limit,
             Bf16TnOutput::Bf16,
+            None,
         )
     }
 
@@ -148,6 +172,7 @@ impl Bf16TnMatmulPlan {
         d_batch_stride: usize,
         workspace_limit: u64,
         output_type: Bf16TnOutput,
+        shared_workspace: Option<Rc<DeviceBuffer<u8>>>,
     ) -> Result<Self> {
         if shape.m == 0 || shape.n == 0 || shape.k == 0 {
             return Err(Error::Shape {
@@ -248,8 +273,13 @@ impl Bf16TnMatmulPlan {
         check_cublas("BF16 TN heuristic state", heuristic.state)?;
         let workspace = if heuristic.workspace_size == 0 {
             None
+        } else if let Some(workspace) = shared_workspace {
+            Some(workspace)
         } else {
-            Some(DeviceBuffer::zeroed(heuristic.workspace_size)?)
+            // cuBLAS owns all reads and writes of this scratch allocation.
+            Some(Rc::new(DeviceBuffer::uninitialized(
+                heuristic.workspace_size,
+            )?))
         };
 
         Ok(Self {
@@ -311,6 +341,35 @@ impl Bf16TnMatmulPlan {
             output_offset,
             stream,
             Bf16TnOutput::F32,
+            1.0,
+        )
+    }
+
+    /// Multiplies into a contiguous F32 submatrix and applies one global scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_scaled_offsets_on_stream(
+        &self,
+        lt: &CublasLt,
+        a_kxm: &DeviceBuffer<u16>,
+        a_offset: usize,
+        b_kxn: &DeviceBuffer<u16>,
+        b_offset: usize,
+        output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        alpha: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_offsets_impl(
+            lt,
+            a_kxm,
+            a_offset,
+            b_kxn,
+            b_offset,
+            output,
+            output_offset,
+            stream,
+            Bf16TnOutput::F32,
+            alpha,
         )
     }
 
@@ -337,6 +396,7 @@ impl Bf16TnMatmulPlan {
             output_offset,
             stream,
             Bf16TnOutput::Bf16,
+            1.0,
         )
     }
 
@@ -352,6 +412,7 @@ impl Bf16TnMatmulPlan {
         output_offset: usize,
         stream: &CudaStream,
         expected_output_type: Bf16TnOutput,
+        alpha: f32,
     ) -> Result<()> {
         if self.output_type != expected_output_type {
             return Err(Error::Shape {
@@ -439,7 +500,6 @@ impl Bf16TnMatmulPlan {
             });
         }
 
-        let alpha = 1.0f32;
         let beta = 0.0f32;
         let workspace_ptr = self
             .workspace
