@@ -287,6 +287,10 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::F32)]
     nemotron_kv_cache: NemotronKvCacheStorageArg,
 
+    /// Dory recurrent loops (1 through 4); defaults to checkpoint configuration.
+    #[arg(long)]
+    dory_loops: Option<usize>,
+
     /// LFM2 matrix input precision; accumulation and sequence state remain F32.
     #[arg(long, value_enum, default_value_t = ComputePrecisionArg::F32)]
     lfm2_compute_precision: ComputePrecisionArg,
@@ -434,6 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_expert: args.step_bf16_shared_expert.into(),
         lm_head: args.step_bf16_lm_head.into(),
     };
+    actor_config.engine.dory_loops = args.dory_loops;
     actor_config.engine.lfm2_compute_precision = args.lfm2_compute_precision.into();
     actor_config.engine.nemotron_storage = Nemotron3StorageConfig {
         bf16: args.nemotron_bf16_storage.into(),

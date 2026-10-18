@@ -71,6 +71,7 @@ fn main() {
     let ternary_g64_object = format!("{out_dir}/ternary_g64.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let ngram_object = format!("{out_dir}/ngram.o");
+    let dory_object = format!("{out_dir}/dory.o");
     let lfm2_object = format!("{out_dir}/lfm2.o");
     let lilicorr_object = format!("{out_dir}/lilicorr.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
@@ -514,6 +515,7 @@ fn main() {
     }
 
     let mut archive_objects = vec![
+        dory_object.as_str(),
         lfm2_object.as_str(),
         oracle_object.as_str(),
         gpu_counters_object.as_str(),
@@ -527,6 +529,23 @@ fn main() {
         cutlass_gemv_object.as_str(),
         cutlass_grouped_gemm_object.as_str(),
     ];
+    let dory_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "--fmad=false",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/dory.cu",
+            "-o",
+            &dory_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for Dory kernels");
+    assert!(dory_status.success(), "nvcc failed to build Dory kernels");
+    println!("cargo:rerun-if-changed=native/dory.cu");
     let lfm2_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
         .args([
             "-std=c++17",

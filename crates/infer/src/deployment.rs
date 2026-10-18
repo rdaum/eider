@@ -3,9 +3,11 @@
 use crate::bitnet::BitNetModel;
 use crate::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use crate::deepseek4::Deepseek4TextModel;
+use crate::dory::DoryModel;
 use crate::execution::bitnet_serving::BitNetChatService;
 use crate::execution::bonsai_serving::BonsaiChatService;
 use crate::execution::deepseek4_serving::Deepseek4ChatService;
+use crate::execution::dory_serving::DoryChatService;
 use crate::execution::gemma4_serving::Gemma4ChatService;
 use crate::execution::laguna_serving::LagunaChatService;
 use crate::execution::lfm2_serving::Lfm2ChatService;
@@ -36,6 +38,8 @@ use tracing::info;
 /// Supported checkpoint execution family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointArchitecture {
+    /// Dory normalized looped transformer.
+    Dory,
     /// Liquid LFM2 MoE.
     Lfm2Moe,
     /// BitNet b1.58.
@@ -89,6 +93,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
         return Ok(CheckpointArchitecture::Nemotron3);
     }
     match config.model_type.as_str() {
+        "dory" => Ok(CheckpointArchitecture::Dory),
         "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
         "bailing_hybrid" => Ok(CheckpointArchitecture::Ling3),
@@ -133,6 +138,7 @@ pub fn with_loaded_engine<R>(
         step_bf16_storage,
         nemotron_storage,
         lfm2_compute_precision,
+        dory_loops,
         ..
     } = config;
     let architecture = checkpoint_architecture(&model_dir)?;
@@ -161,6 +167,17 @@ pub fn with_loaded_engine<R>(
     };
     let defaults = GenerationConfig::from_model_dir(&model_dir)?;
     match architecture {
+        CheckpointArchitecture::Dory => {
+            let model = DoryModel::load(&model_dir, dory_loops)?;
+            let scheduler = SchedulerConfig {
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().max_position_embeddings),
+                ..scheduler
+            };
+            let mut service = DoryChatService::new(&model, &template, scheduler, sequence_cache)?;
+            Ok(run(&mut service, defaults))
+        }
         CheckpointArchitecture::Lfm2Moe => {
             let model = Lfm2Model::load_with_precision(&model_dir, lfm2_compute_precision)?;
             let scheduler = SchedulerConfig {

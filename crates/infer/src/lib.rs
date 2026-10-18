@@ -32,6 +32,9 @@ pub mod execution;
 /// BitNet b1.58 ternary text-model loading and inference.
 pub mod bitnet;
 
+/// Dory looped nGPT loading, generation, and decision readout.
+pub mod dory;
+
 /// Liquid LFM2 MoE model loading and inference.
 pub mod lfm2;
 

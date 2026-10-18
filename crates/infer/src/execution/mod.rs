@@ -3,6 +3,7 @@
 pub(crate) mod bitnet_serving;
 pub(crate) mod bonsai_serving;
 pub(crate) mod deepseek4_serving;
+pub(crate) mod dory_serving;
 pub mod expert_cache;
 pub(crate) mod expert_hotset;
 pub(crate) mod gemma4_serving;

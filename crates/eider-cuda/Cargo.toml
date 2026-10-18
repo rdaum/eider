@@ -200,3 +200,7 @@ harness = false
 [[bench]]
 name = "lilicorr_kernels"
 harness = false
+
+[[bench]]
+name = "dory_attention"
+harness = false

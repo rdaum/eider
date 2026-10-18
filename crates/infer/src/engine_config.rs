@@ -38,6 +38,8 @@ pub struct InferenceEngineConfig {
     pub deepseek_expert_capacity: usize,
     /// Step BF16 storage policy.
     pub step_bf16_storage: Step37Bf16StorageConfig,
+    /// Dory recurrent loop override (checkpoint default when absent).
+    pub dory_loops: Option<usize>,
     /// LFM2 matrix input precision.
     pub lfm2_compute_precision: eider_cuda::GemmPrecision,
     /// Nemotron storage policy.
@@ -63,6 +65,7 @@ impl InferenceEngineConfig {
             step_expert_capacity: 240,
             deepseek_expert_capacity: 8,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
+            dory_loops: None,
             lfm2_compute_precision: eider_cuda::GemmPrecision::F32,
             nemotron_storage: Nemotron3StorageConfig::default(),
         }

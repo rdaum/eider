@@ -61,6 +61,20 @@ fn default_max_active_sequences(model_type: &str) -> usize {
 
 const CATALOGUE: &[ModelSpec] = &[
     ModelSpec {
+        id: "dory1.0-4b-nvfp4",
+        repository: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+        revision: "41f02335e1a1ad3289b8b32485e2265cbe97cfdf",
+        model_type: "dory",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-dory1.0-4b",
+            max_context_tokens: 262_144,
+            prefill_token_capacity: 256,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "lfm2.5-24b-a2b-nvfp4",
         repository: "infinity-ai-institute/LFM2.5-24B-A2B-NVFP4",
         revision: "2d61270a276c320af204143d3d73e524f9ef44d2",
@@ -321,7 +335,7 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
     let artifact_dir = artifact_dir(spec.repository, spec.revision, spec.artifact_kind)?;
     let metadata_root = fetch_metadata_root(&repository, spec, offline).await?;
     validate_checkpoint(&metadata_root, spec.model_type)?;
-    if spec.model_type != "bitnet" {
+    if !matches!(spec.model_type, "bitnet" | "dory") {
         validate_weight_index(&metadata_root)?;
     }
     if !offline {
@@ -465,7 +479,7 @@ async fn fetch_metadata_root(
                 spec.repository, spec.revision
             )
         })?;
-    if spec.model_type != "bitnet" {
+    if !matches!(spec.model_type, "bitnet" | "dory") {
         repository
             .download_file()
             .filename("model.safetensors.index.json")
@@ -652,6 +666,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "bitnet"
+            | "dory"
             | "lfm2_moe"
             | "bailing_hybrid"
             | "muse_glimmer"
@@ -685,10 +700,11 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 "bitnet" => 4_096,
                 "bailing_hybrid" => 4_096,
                 "bonsai" => 65_536,
-                "qwen3_8_flash_next" => 262_144,
+                "qwen3_8_flash_next" | "dory" => 262_144,
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
+                "dory" => 256,
                 "lfm2_moe" => 1_024,
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
@@ -921,6 +937,22 @@ mod tests {
         assert_eq!(model.repository, "microsoft/bitnet-b1.58-2B-4T");
         assert_eq!(model.revision, "04c3b9ad9361b824064a1f25ea60a8be9599b127");
         assert_eq!(model.defaults.max_context_tokens, 4_096);
+    }
+
+    #[test]
+    fn dory_catalogue_and_single_file_checkpoint_resolve() {
+        let spec = catalogue_model("dory1.0-4b-nvfp4").unwrap();
+        assert_eq!(spec.model_type, "dory");
+        assert_eq!(spec.revision, "41f02335e1a1ad3289b8b32485e2265cbe97cfdf");
+        let fixture = CheckpointFixture::new_single("dory");
+        let resolved = resolve_local_model(fixture.path()).unwrap();
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(resolved.defaults.max_context_tokens, 262_144);
+        assert_eq!(resolved.defaults.prefill_token_capacity, 256);
+        assert_eq!(
+            eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
+            eider_inference::CheckpointArchitecture::Dory
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 #[cfg(feature = "cuda-oxide")]
 pub(crate) mod core_oxide;
 pub(crate) mod deepseek4;
+pub(crate) mod dory;
 pub(crate) mod gemma4_attention;
 pub(crate) mod ggml_blocks;
 pub(crate) mod lfm2;
