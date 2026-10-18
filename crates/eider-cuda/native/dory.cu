@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #if EIDER_FLASH_ATTENTION
+extern "C" int infer_dory_flash_branches(void*,void*,void*,void*,float*,int*,int*,int*,int,int,int,int,int,int,int,cudaStream_t);
 extern "C" int infer_dory_flash_decode(void*,void*,void*,void*,float*,int*,int*,int,int,int,int,cudaStream_t);
 extern "C" int infer_dory_flash_attention(void*,void*,void*,void*,float*,int*,int,int,int,int,int,cudaStream_t);
 #endif
@@ -55,11 +56,11 @@ __global__ void norm(const __nv_bfloat16* a,const __nv_bfloat16* b,const float* 
     for(uint32_t j=threadIdx.x,i=0;j<w;j+=256,++i) o[base+j]=bf(v[i]*inv);
 }
 __global__ void rope_norm(const __nv_bfloat16* x,const float* scale,__nv_bfloat16* out,const uint32_t* pos,
-                          uint32_t heads,float theta) {
+                          uint32_t heads,float theta,bool per_row) {
     const uint32_t head=blockIdx.x%heads, row=blockIdx.x/heads, d=threadIdx.x;
     const size_t base=size_t(blockIdx.x)*256;
     const uint32_t h=d%128;
-    const float angle=float(*pos+row)*powf(theta,-float(h)/128.f);
+    const float angle=float(per_row?pos[row]:*pos+row)*powf(theta,-float(h)/128.f);
     float sn,cs; sincosf(angle,&sn,&cs);
     const float other=x[base+(d<128?d+128:d-128)];
     const float rotated=bf(float(x[base+d])*cs+(d<128?-other:other)*sn);
@@ -229,7 +230,7 @@ extern "C" int infer_dory_norm(const __nv_bfloat16* a,const __nv_bfloat16* b,con
         default: return launch_norm<0>(a,b,p,q,o,rows,w,mode,s);
     }
 }
-extern "C" int infer_dory_rope_norm(const __nv_bfloat16* x,const float* scale,__nv_bfloat16* o,const uint32_t* pos,uint32_t rows,uint32_t heads,float theta,cudaStream_t s){rope_norm<<<rows*heads,256,0,s>>>(x,scale,o,pos,heads,theta);return cudaGetLastError();}
+extern "C" int infer_dory_rope_norm(const __nv_bfloat16* x,const float* scale,__nv_bfloat16* o,const uint32_t* pos,uint32_t rows,uint32_t heads,float theta,bool per_row,cudaStream_t s){rope_norm<<<rows*heads,256,0,s>>>(x,scale,o,pos,heads,theta,per_row);return cudaGetLastError();}
 extern "C" int infer_dory_attention(const __nv_bfloat16* q,const __nv_bfloat16* k,const __nv_bfloat16* v,__nv_bfloat16* ck,__nv_bfloat16* cv,float* p,__nv_bfloat16* o,const uint32_t* pos,uint32_t rows,uint32_t qh,uint32_t kh,uint32_t window,uint32_t splits,uint32_t capacity,cudaStream_t s){
     int* length = nullptr;
     int* leftpad = nullptr;
@@ -268,5 +269,53 @@ extern "C" int infer_dory_linear(const __nv_bfloat16* x,const Projection* projec
 extern "C" int infer_dory_embedding(const __nv_bfloat16* table,const uint32_t* ids,__nv_bfloat16* out,
     uint32_t vocab,uint32_t width,uint32_t rows,cudaStream_t s) {
     embedding<<<(rows*width+255)/256,256,0,s>>>(table,ids,out,vocab,width,rows*width);
+    return cudaGetLastError();
+}
+
+namespace {
+// Full prefix pages remain shared. Only its last partial page is copied per branch.
+__global__ void branch_tail(__nv_bfloat16* ck,__nv_bfloat16* cv,const int* pages,
+    uint32_t prefix,uint32_t stride,uint32_t width) {
+    const uint32_t i=blockIdx.x*256+threadIdx.x, tail=prefix%64;
+    if(i>=tail*width)return;
+    const size_t src=size_t(prefix-tail)*width+i;
+    const size_t dst=size_t(pages[blockIdx.y*stride+prefix/64])*64*width+i;
+    ck[dst]=ck[src];cv[dst]=cv[src];
+}
+__global__ void branch_append(const __nv_bfloat16* k,const __nv_bfloat16* v,
+    __nv_bfloat16* ck,__nv_bfloat16* cv,const uint32_t* destinations,uint32_t n,uint32_t width) {
+    const uint32_t i=blockIdx.x*256+threadIdx.x;
+    if(i<n) {const size_t dst=size_t(destinations[i/width])*width+i%width;ck[dst]=k[i];cv[dst]=v[i];}
+}
+__global__ void branch_logits(const __nv_bfloat16* hidden,const __nv_bfloat16* weight,
+    const float* scale,const int* offsets,float* out,uint32_t width,uint32_t labels) {
+    const size_t row=offsets[blockIdx.y+1]-1;
+    float v=0;
+    for(uint32_t i=threadIdx.x;i<width;i+=256)
+        v+=float(hidden[row*width+i])*float(weight[size_t(blockIdx.x)*width+i]);
+    v=sum(v);
+    if(!threadIdx.x)out[blockIdx.y*labels+blockIdx.x]=bf(v)*scale[blockIdx.x];
+}
+}
+extern "C" int infer_dory_branch_attention(const __nv_bfloat16* q,const __nv_bfloat16* k,const __nv_bfloat16* v,
+    __nv_bfloat16* ck,__nv_bfloat16* cv,float* scratch,__nv_bfloat16* out,
+    const uint32_t* destinations,int* offsets,int* lengths,int* pages,uint32_t prefix,
+    uint32_t prefix_rows,uint32_t branches,uint32_t rows,uint32_t max_rows,uint32_t stride,uint32_t qh,uint32_t kh,
+    uint32_t window,cudaStream_t stream) {
+#if EIDER_FLASH_ATTENTION
+    const uint32_t width=kh*256;
+    // Append first: a combined batch supplies this layer's prefix K/V too.
+    branch_append<<<(rows*width+255)/256,256,0,stream>>>(k,v,ck,cv,destinations,rows*width,width);
+    const uint32_t first_suffix=prefix_rows?1:0;
+    if(prefix%64)branch_tail<<<dim3((prefix%64*width+255)/256,branches-first_suffix),256,0,stream>>>(ck,cv,pages+first_suffix*stride,prefix,stride,width);
+    return infer_dory_flash_branches(const_cast<__nv_bfloat16*>(q),ck,cv,out,scratch,
+        offsets,lengths,pages,branches,rows,max_rows,stride,qh,kh,window,stream);
+#else
+    return cudaErrorNotSupported;
+#endif
+}
+extern "C" int infer_dory_branch_logits(const __nv_bfloat16* hidden,const __nv_bfloat16* weight,
+    const float* scale,const int* offsets,float* out,uint32_t width,uint32_t labels,uint32_t branches,cudaStream_t stream) {
+    branch_logits<<<dim3(labels,branches),256,0,stream>>>(hidden,weight,scale,offsets,out,width,labels);
     return cudaGetLastError();
 }

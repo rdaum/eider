@@ -14,8 +14,8 @@
 
 pub mod format;
 pub use kernels::dory::{
-    DoryNorm, DoryProjection, dory_attention, dory_attention_workspace_len, dory_embedding,
-    dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
+    DoryBranchPlan, DoryNorm, DoryProjection, dory_attention, dory_attention_workspace_len,
+    dory_embedding, dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
 };
 pub use kernels::ggml_blocks::{GgmlGemmWorkspace, GgmlWeights};
 pub use kernels::lilicorr;

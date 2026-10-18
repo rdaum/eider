@@ -75,3 +75,38 @@ extern "C" int infer_dory_flash_decode(void* query,void* key,void* value,void* o
     eider_dory_flash::dory_combine_kernel<<<(qheads+3)/4,128,0,stream>>>(p);
     return cudaGetLastError();
 }
+
+namespace eider_dory_flash {
+template<bool Local>
+__global__ void dory_branches_kernel(const __grid_constant__ flash::Flash_fwd_params p) {
+    // The unsplit cache kernel supports a page table and variable query lengths.
+    flash::compute_attn_splitkv<DoryFlashTraits,!Local,Local,false,false,true,false,false,false>(p);
+}
+template<bool Local>
+cudaError_t launch_branches(flash::Flash_fwd_params& p,cudaStream_t stream) {
+    static const cudaError_t status=cudaFuncSetAttribute(dory_branches_kernel<Local>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,DoryFlashTraits::kSmemSize);
+    if(status!=cudaSuccess)return status;
+    dory_branches_kernel<Local><<<dim3((p.seqlen_q+63)/64,p.b,p.h),128,DoryFlashTraits::kSmemSize,stream>>>(p);
+    return cudaGetLastError();
+}
+}
+extern "C" int infer_dory_flash_branches(void* query,void* key,void* value,void* output,float* lse,
+    int* offsets,int* lengths,int* pages,int branches,int rows,int max_rows,int page_stride,
+    int qheads,int kvheads,int window,cudaStream_t stream) {
+    flash::Flash_fwd_params p{};
+    p.q_ptr=query;p.k_ptr=key;p.v_ptr=value;p.o_ptr=output;p.softmax_lse_ptr=lse;
+    p.cu_seqlens_q=offsets;p.seqused_k=lengths;p.block_table=pages;
+    p.block_table_batch_stride=page_stride;p.page_block_size=64;
+    p.b=branches;p.h=qheads;p.h_k=kvheads;p.h_h_k_ratio=qheads/kvheads;
+    p.d=p.d_rounded=256;p.seqlen_q=max_rows;p.total_q=rows;p.seqlen_k=page_stride*64;
+    p.seqlen_q_rounded=(max_rows+127)/128*128;p.seqlen_k_rounded=(p.seqlen_k+127)/128*128;
+    p.q_head_stride=p.k_head_stride=p.v_head_stride=p.o_head_stride=256;
+    p.q_row_stride=p.o_row_stride=qheads*256;p.k_row_stride=p.v_row_stride=kvheads*256;
+    p.k_batch_stride=p.v_batch_stride=int64_t(64)*kvheads*256;
+    p.scale_softmax=.0625f;p.scale_softmax_log2=.09016844005556021f;
+    p.p_dropout=p.rp_dropout=1.f;p.scale_softmax_rp_dropout=.0625f;
+    p.is_bf16=true;p.is_causal=window==0;p.unpadded_lse=true;
+    p.window_size_left=window?window-1:-1;p.window_size_right=0;
+    return window?eider_dory_flash::launch_branches<true>(p,stream):eider_dory_flash::launch_branches<false>(p,stream);
+}

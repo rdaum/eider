@@ -113,10 +113,21 @@ The follow-up SHA-256 is `c1bd33d45d93c8cc519c62ecc021fe7e80b414a5a2323207c34a79
 ## Decisions
 
 `POST /v1/decisions` supports `noul`, `choice`, and `score` questions.
-The runtime processes the shared prefix once, then processes each question suffix separately.
-Questions reuse the same KV allocation and cannot see sibling suffixes.
-The readout projects only the 64 label rows and applies their checkpoint logit scales.
+The runtime combines the shared prefix and first question batch in one backbone traversal when they fit the token budget.
+One question uses a single causal prefill. Multiple questions use packed attention with separate histories.
+Later batches reuse the prefix KV pages produced by the first traversal.
+The default batch contains up to eight questions, within the prefill token budget.
+Questions share complete prefix pages. Each suffix has separate KV pages and absolute RoPE positions.
+The final partial prefix page is copied into each suffix's first page.
+Paged FlashAttention prevents questions from reading sibling suffixes.
+The readout projects the final row of each suffix onto the 64 label rows and applies their checkpoint logit scales.
+Each batch transfers its scores to the CPU once.
 It generates no reasoning or answer text.
+
+Long prefixes and suffixes use chunked execution when they exceed the token budget.
+Cancellation and other requests can progress between batches.
+`--decision-branch-capacity 1` processes one question at a time, including the prefix with the first question when it fits.
+Builds without FlashAttention also process one question at a time.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/v1/decisions \
@@ -136,7 +147,29 @@ curl --fail-with-body http://127.0.0.1:8080/v1/decisions \
 ```
 
 Decision probabilities are uncalibrated. Changing the loop count changes the scoring model.
-Suffixes run sequentially in this implementation. Packed multi-question execution remains future work.
+Packed BF16 execution changes reduction order and can change scores slightly.
+The regression fixtures retained every chosen label, with logit cosine similarity above 0.999.
+Each probability difference from separate serial execution stayed below five percentage points.
+These fixtures do not establish task-quality parity.
+
+On 2026-10-18, `scripts/questions.sh 55` measured these HTTP latencies on GB10 with two loops.
+Each count used one warm-up request and three timed requests.
+The serial column records the user's run before batching. A local serial scheduler measurement reproduced its 55-question latency at 2,967 ms.
+The final column includes the prefix in the first batch.
+
+| Questions | Serial mean (ms) | Separate prefix, packed suffixes (ms) | Combined first batch (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 116.0 | 115.1 | 65.3 |
+| 2 | 169.4 | 130.6 | 80.5 |
+| 8 | 484.2 | 171.6 | 127.4 |
+| 21 | 1,171.1 | 325.2 | 283.4 |
+| 55 | 2,958.6 | 663.6 | 621.8 |
+
+The attention micromeasure compares eight unequal suffix lengths with separate attention calls.
+Combined prefix and suffix attention was 2.1x faster with a partial prefix page and 2.7x faster with a sliding window.
+Local HTTP results, kernel timings, and checkpoint checks are under
+`~/.cache/eider/bench-artifacts/dory-decisions/2026-10-18-combined/`.
+The preceding suffix-only measurements remain under `2026-10-18-packed/` in the same parent directory.
 
 ## Validation
 
@@ -147,10 +180,14 @@ on a 27-token arithmetic prompt. This is numerical coverage, not a task-quality 
 CUDA checks cover BF16 residual boundaries, causal attention, and sliding-window exclusion.
 The checkpoint regression covers one and two loops, chunked prefill, decode graphs,
 prefix restoration and eviction, reused request buffers, selected-label readout, and isolated decision suffixes.
+The decision regression compares combined and separate prefix execution.
+It also covers mixed question types, branch order, sibling replacement, multiple batches, long suffixes, and cancellation.
 
 ```sh
 DORY_MODEL=/path/to/snapshot cargo test --release -p eider-inference --lib \
   dory_chunk_graph_and_prefix_agree -- --ignored
+DORY_MODEL=/path/to/snapshot cargo test --release -p eider-inference --lib \
+  dory_packed_decisions_match_serial_and_cancel_cleanly -- --ignored
 cargo bench -p eider-cuda --bench dory_attention
 cargo bench -p eider-cuda --bench dory_norm
 DORY_MODEL=/path/to/snapshot cargo bench -p eider-cuda --bench dory_projection

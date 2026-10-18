@@ -3,6 +3,8 @@
 use crate::cuda::check_cuda;
 use crate::{CudaStream, DeviceBuffer, DeviceOutput, Error, Result};
 use std::ffi::c_void;
+mod branches;
+pub use branches::DoryBranchPlan;
 unsafe extern "C" {
     fn infer_dory_embedding(
         table: *const u16,
@@ -40,6 +42,7 @@ unsafe extern "C" {
         rows: u32,
         heads: u32,
         theta: f32,
+        per_row: bool,
         s: *mut c_void,
     ) -> i32;
     fn infer_dory_attention(
@@ -261,6 +264,7 @@ pub fn dory_norm(
     }
 }
 /// Applies NeoX RoPE, BF16 rounding, L2 head normalization, and optional Q scale.
+/// Position is either a scalar batch start or one absolute position per row.
 pub fn dory_rope_norm(
     input: &DeviceBuffer<u16>,
     scale: Option<&DeviceBuffer<f32>>,
@@ -276,7 +280,7 @@ pub fn dory_rope_norm(
         || n > u32::MAX as usize
         || input.len() < n
         || output.len() < n
-        || position.len() != 1
+        || (position.len() != 1 && position.len() != rows)
         || !theta.is_finite()
         || theta <= 0.0
         || scale.is_some_and(|s| s.len() != heads * 256)
@@ -294,6 +298,7 @@ pub fn dory_rope_norm(
                 rows as u32,
                 heads as u32,
                 theta,
+                position.len() != 1,
                 stream.as_raw(),
             ),
         )

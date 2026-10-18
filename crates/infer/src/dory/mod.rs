@@ -6,11 +6,12 @@ mod prefix;
 pub use config::DoryConfig;
 use config::invalid;
 use eider_cuda::{
-    Bf16TnMatmulPlan, CublasLt, CudaGraphExec, CudaStream, DeviceBuffer, DoryNorm, DoryProjection,
-    F32DenseGemm, GemmShape, Result, Sm121W4A16HostWeight, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream, dory_attention,
-    dory_attention_workspace_len, dory_embedding, dory_linear, dory_norm, dory_rope_norm,
-    dory_scale_logits, lfm2_decode_inputs_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaGraphExec, CudaStream, DeviceBuffer, DoryBranchPlan, DoryNorm,
+    DoryProjection, F32DenseGemm, GemmShape, Result, Sm121W4A16HostWeight,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, dory_attention, dory_attention_workspace_len,
+    dory_embedding, dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
+    lfm2_decode_inputs_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 pub(crate) use prefix::DoryPrefixCache;
@@ -373,6 +374,10 @@ impl DoryModel {
         if capacity == 0 || capacity > c.max_position_embeddings {
             return Err(invalid("sequence exceeds checkpoint context"));
         }
+        self.allocate_sequence(capacity)
+    }
+    fn allocate_sequence(&self, capacity: usize) -> Result<DorySequence<'_>> {
+        let c = &self.config;
         let mut caches = Vec::new();
         for i in c.schedule() {
             if matches!(self.layers[i].mixer, Mixer::Attention { .. }) {
@@ -408,6 +413,7 @@ impl DoryModel {
         caches: &mut [Cache],
         rows: usize,
         capacity: usize,
+        branches: Option<&DoryBranchPlan>,
     ) -> Result<()> {
         let c = &self.config;
         let st = &self.stream;
@@ -421,7 +427,15 @@ impl DoryModel {
             rows,
             st,
         )?;
-        self.layers_forward(w, caches, rows, capacity, 0..c.n_input_layers, &mut ci)?;
+        self.layers_forward(
+            w,
+            caches,
+            rows,
+            capacity,
+            0..c.n_input_layers,
+            &mut ci,
+            branches,
+        )?;
         w.input
             .copy_prefix_from_device_on_stream(&w.hidden, rows * c.hidden_size, st)?;
         for _ in 0..c.n_recurrent_loops {
@@ -441,6 +455,7 @@ impl DoryModel {
                 capacity,
                 c.n_input_layers..c.n_input_layers + c.n_recurrent_layers,
                 &mut ci,
+                branches,
             )?;
             dory_norm(
                 &w.hidden,
@@ -459,8 +474,10 @@ impl DoryModel {
             capacity,
             c.n_input_layers + c.n_recurrent_layers..c.num_hidden_layers,
             &mut ci,
+            branches,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn layers_forward(
         &self,
         w: &mut DoryPrefillWorkspace,
@@ -469,6 +486,7 @@ impl DoryModel {
         capacity: usize,
         range: std::ops::Range<usize>,
         ci: &mut usize,
+        branches: Option<&DoryBranchPlan>,
     ) -> Result<()> {
         let c = &self.config;
         let st = &self.stream;
@@ -508,7 +526,7 @@ impl DoryModel {
                         &w.q,
                         Some(sqk),
                         w.qr.output(),
-                        &w.position,
+                        branches.map_or(&w.position, DoryBranchPlan::positions),
                         rows,
                         c.num_attention_heads,
                         *theta,
@@ -518,7 +536,7 @@ impl DoryModel {
                         &w.k,
                         None,
                         w.kr.output(),
-                        &w.position,
+                        branches.map_or(&w.position, DoryBranchPlan::positions),
                         rows,
                         c.num_key_value_heads,
                         *theta,
@@ -526,22 +544,38 @@ impl DoryModel {
                     )?;
                     let cache = &mut caches[*ci];
                     *ci += 1;
-                    dory_attention(
-                        &w.qr,
-                        &w.kr,
-                        &w.v,
-                        cache.key.output(),
-                        cache.value.output(),
-                        w.partial.output(),
-                        w.mixed.output(),
-                        &w.position,
-                        rows,
-                        c.num_attention_heads,
-                        c.num_key_value_heads,
-                        capacity,
-                        *window,
-                        st,
-                    )?;
+                    if let Some(plan) = branches {
+                        plan.attention(
+                            &w.qr,
+                            &w.kr,
+                            &w.v,
+                            cache.key.output(),
+                            cache.value.output(),
+                            w.partial.output(),
+                            w.mixed.output(),
+                            c.num_attention_heads,
+                            c.num_key_value_heads,
+                            *window,
+                            st,
+                        )?;
+                    } else {
+                        dory_attention(
+                            &w.qr,
+                            &w.kr,
+                            &w.v,
+                            cache.key.output(),
+                            cache.value.output(),
+                            w.partial.output(),
+                            w.mixed.output(),
+                            &w.position,
+                            rows,
+                            c.num_attention_heads,
+                            c.num_key_value_heads,
+                            capacity,
+                            *window,
+                            st,
+                        )?;
+                    }
                     dory_norm(
                         &w.mixed,
                         w.norm.output(),
@@ -650,7 +684,13 @@ impl DoryModel {
         w.tokens.copy_prefix_from_host(tokens)?;
         w.position.copy_from_host(&[s.position as u32])?;
         s.valid = false;
-        self.forward(w, &mut s.caches, tokens.len(), s.position + tokens.len())?;
+        self.forward(
+            w,
+            &mut s.caches,
+            tokens.len(),
+            s.position + tokens.len(),
+            None,
+        )?;
         copy_bf16_row_to_f32_into_on_stream(
             w.capacity,
             self.config.hidden_size,
@@ -676,7 +716,7 @@ impl DoryModel {
         s.valid = false;
         if s.graph.is_none() {
             s.graph = Some(self.stream.capture(|_| {
-                self.forward(&mut s.workspace, &mut s.caches, 1, s.capacity)?;
+                self.forward(&mut s.workspace, &mut s.caches, 1, s.capacity, None)?;
                 copy_bf16_row_to_f32_into_on_stream(
                     1,
                     self.config.hidden_size,
@@ -854,7 +894,7 @@ mod tests {
             );
             let ids = (0..64).collect::<Vec<_>>();
             let mut head = model.new_decision_readout(&ids)?;
-            let mut decision = model.new_decision_sequence(64)?;
+            let mut decision = model.new_decision_sequence(64, 0, 0)?;
             decision.prefill(&mut w, &tokens[..17])?;
             decision.seal_prefix()?;
             decision.prefill(&mut w, &tokens[17..])?;
@@ -869,7 +909,7 @@ mod tests {
             decision.rewind_to_prefix()?;
             decision.prefill(&mut w, &[27, 28])?;
             let reused = head.selected_logits(&decision)?;
-            let mut isolated = model.new_decision_sequence(64)?;
+            let mut isolated = model.new_decision_sequence(64, 0, 0)?;
             isolated.prefill(&mut w, &tokens[..17])?;
             isolated.prefill(&mut w, &[27, 28])?;
             assert_eq!(reused, head.selected_logits(&isolated)?);
