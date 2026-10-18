@@ -13,7 +13,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod format;
-pub use kernels::dory::{DoryNorm, dory_attention, dory_norm, dory_rope_norm, dory_scale_logits};
+pub use kernels::dory::{
+    DoryNorm, DoryProjection, dory_attention, dory_attention_workspace_len, dory_embedding,
+    dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
+};
 pub use kernels::ggml_blocks::{GgmlGemmWorkspace, GgmlWeights};
 pub use kernels::lilicorr;
 

@@ -43,6 +43,7 @@ pub(crate) struct DoryChatService<'m, 't> {
     config: SchedulerConfig,
     prefill: DoryPrefillWorkspace,
     prefixes: DoryPrefixCache,
+    idle_sequence: Option<DorySequence<'m>>,
     next_id: u64,
     waiting: VecDeque<EngineRequestId>,
     requests: BTreeMap<EngineRequestId, Request<'m, 't>>,
@@ -67,12 +68,34 @@ impl<'m, 't> DoryChatService<'m, 't> {
             .into_iter()
             .map(|(_, id)| id)
             .collect::<Vec<_>>();
+        let mut prefill = model.new_prefill_workspace(config.prefill_token_capacity)?;
+        let idle_sequence = if config.max_active_sequences == 1 {
+            // Reserve the measured chat working set before accepting requests.
+            // Larger contexts grow the allocation; the configured limit is unchanged.
+            let capacity = config.max_context_tokens.min(32_768);
+            let mut sequence = model.new_sequence(capacity)?;
+            let rows = config.prefill_token_capacity.min(32).min(capacity);
+            model.prefill_hidden(&mut prefill, &mut sequence, &vec![0; rows])?;
+            if rows < capacity {
+                model.decode(&mut sequence, 0)?;
+            }
+            sequence.reset()?;
+            tracing::info!(
+                reserved_tokens = capacity,
+                reserved_bytes = sequence.device_bytes(),
+                "prepared Dory decode workspace"
+            );
+            Some(sequence)
+        } else {
+            None
+        };
         Ok(Self {
             model,
             template,
             config,
-            prefill: model.new_prefill_workspace(config.prefill_token_capacity)?,
+            prefill,
             prefixes: DoryPrefixCache::new(cache.max_retained_bytes),
+            idle_sequence,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -164,9 +187,29 @@ impl<'m, 't> DoryChatService<'m, 't> {
             }
             let r = self.requests.get_mut(&id).expect("queued request");
             let allocation = Instant::now();
-            let mut sequence = self
-                .model
-                .new_sequence((r.prompt.len() + r.generation.max_new_tokens).max(1))?;
+            let required = (r.prompt.len() + r.generation.max_new_tokens).max(1);
+            let mut sequence = if let Some(mut sequence) = self
+                .idle_sequence
+                .take()
+                .filter(|s| s.capacity() >= required)
+            {
+                sequence.reset()?;
+                sequence
+            } else {
+                // One idle allocation is retained for sequential chat. Bound its
+                // growth to twice the requested capacity and the context limit.
+                let capacity = if self.config.max_active_sequences == 1 {
+                    (if required < 8192 {
+                        required.next_power_of_two()
+                    } else {
+                        required.next_multiple_of(8192)
+                    })
+                    .min(self.config.max_context_tokens)
+                } else {
+                    required
+                };
+                self.model.new_sequence(capacity)?
+            };
             let allocation_duration = allocation.elapsed();
             let restore = Instant::now();
             let cached = self
@@ -233,7 +276,6 @@ impl<'m, 't> DoryChatService<'m, 't> {
             }
         }
         let mut token_budget = self.config.prefill_token_capacity;
-        let prefix_interval = self.config.prefill_token_capacity;
         let mut sequence_budget = self.config.prefill_sequence_capacity;
         for (&id, r) in &mut self.requests {
             let Some(s) = r.sequence.as_mut() else {
@@ -246,17 +288,16 @@ impl<'m, 't> DoryChatService<'m, 't> {
                 continue;
             }
             lifecycle(EngineLifecycleEvent::PrefillStarted(id));
-            let target = r.prompt.len().saturating_sub(1);
-            let boundary = if self.prefixes.enabled() && r.position < target {
-                // Retain regular endpoints for conversations that diverge before the final prompt.
-                ((r.position / prefix_interval + 1) * prefix_interval).min(target)
+            // Snapshots can restore a partial prefix, so the final prompt token
+            // stays in the batch instead of paying for an extra backbone pass.
+            let end = (r.position + token_budget).min(r.prompt.len());
+            let tokens = &r.prompt[r.position..end];
+            if end == r.prompt.len() {
+                self.model.prefill(&mut self.prefill, s, tokens)?;
             } else {
-                r.prompt.len()
-            };
-            let end = boundary.min(r.position + token_budget);
-            self.model
-                .prefill(&mut self.prefill, s, &r.prompt[r.position..end])?;
-            if self.prefixes.enabled() && (end == target || end.is_multiple_of(prefix_interval)) {
+                self.model.prefill_hidden(&mut self.prefill, s, tokens)?;
+            }
+            if self.prefixes.enabled() && end == r.prompt.len() {
                 self.prefixes.retain(self.model, s, &r.prompt[..end])?;
             }
             token_budget -= end - r.position;
@@ -298,6 +339,9 @@ impl<'m, 't> DoryChatService<'m, 't> {
                     .as_ref()
                     .map_or(0, DorySequence::device_bytes),
             });
+            if self.config.max_active_sequences == 1 {
+                self.idle_sequence = r.sequence.take();
+            }
         }
         Ok(tick)
     }
@@ -329,15 +373,16 @@ impl EngineService for DoryChatService<'_, '_> {
                 released_sequence_device_bytes: group.device_bytes(),
             };
         }
-        let Some(r) = self.requests.remove(&id) else {
+        let Some(mut r) = self.requests.remove(&id) else {
             return EngineCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
+        let bytes = r.sequence.as_ref().map_or(0, DorySequence::device_bytes);
+        if self.config.max_active_sequences == 1 && r.sequence.is_some() {
+            self.idle_sequence = r.sequence.take();
+        }
         EngineCancelOutcome::Cancelled {
-            released_sequence_device_bytes: r
-                .sequence
-                .as_ref()
-                .map_or(0, DorySequence::device_bytes),
+            released_sequence_device_bytes: bytes,
         }
     }
     fn active_sequence_count(&self) -> usize {

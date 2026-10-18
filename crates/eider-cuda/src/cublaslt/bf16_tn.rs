@@ -67,6 +67,26 @@ impl Bf16TnMatmulPlan {
         )
     }
 
+    /// Shares scratch between sequential BF16-input, BF16-output plans.
+    pub fn new_bf16_with_workspace(
+        lt: &CublasLt,
+        shape: GemmShape,
+        workspace: Rc<DeviceBuffer<u8>>,
+    ) -> Result<Self> {
+        Self::new_strided_batch_with_a_leading_dimension_and_output(
+            lt,
+            shape,
+            shape.k,
+            1,
+            0,
+            0,
+            0,
+            workspace.len() as u64,
+            Bf16TnOutput::Bf16,
+            Some(workspace),
+        )
+    }
+
     /// Creates a plan whose A columns use an explicit leading dimension.
     pub fn new_with_a_leading_dimension(
         lt: &CublasLt,
@@ -400,6 +420,19 @@ impl Bf16TnMatmulPlan {
         )
     }
 
+    /// Applies a global F32 scale before rounding the result to BF16.
+    pub fn run_scaled_bf16_on_stream(
+        &self,
+        lt: &CublasLt,
+        a: &DeviceBuffer<u16>,
+        b: &DeviceBuffer<u16>,
+        output: DeviceOutput<'_, u16>,
+        alpha: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_offsets_impl(lt, a, 0, b, 0, output, 0, stream, Bf16TnOutput::Bf16, alpha)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_offsets_impl<T: Copy>(
         &self,
@@ -612,13 +645,9 @@ mod tests {
                 let a = &a;
                 let b = &b;
                 (0..M).map(move |out| {
-                    f32_to_bf16(
-                        (0..K)
-                            .map(|col| {
-                                bf16_to_f32(a[out * K + col]) * bf16_to_f32(b[row * K + col])
-                            })
-                            .sum::<f32>(),
-                    )
+                    (0..K)
+                        .map(|col| bf16_to_f32(a[out * K + col]) * bf16_to_f32(b[row * K + col]))
+                        .sum::<f32>()
                 })
             })
             .collect::<Vec<_>>();
@@ -641,7 +670,31 @@ mod tests {
         let mut output = DeviceBuffer::zeroed(N * M).expect("output");
         plan.run_bf16_offsets_on_stream(&lt, &a, 0, &b, 0, output.output(), 0, &stream)
             .expect("BF16-output matmul");
-        assert_eq!(output.copy_to_host(&stream).expect("copy output"), expected);
+        assert_eq!(
+            output.copy_to_host(&stream).expect("copy output"),
+            expected
+                .iter()
+                .copied()
+                .map(f32_to_bf16)
+                .collect::<Vec<_>>()
+        );
+        let scaled = Bf16TnMatmulPlan::new_bf16_with_workspace(
+            &lt,
+            GemmShape { m: M, n: N, k: K },
+            Rc::new(DeviceBuffer::zeroed(8 << 20).unwrap()),
+        )
+        .unwrap();
+        let alpha = 0.037;
+        scaled
+            .run_scaled_bf16_on_stream(&lt, &a, &b, output.output(), alpha, &stream)
+            .unwrap();
+        assert_eq!(
+            output.copy_to_host(&stream).unwrap(),
+            expected
+                .iter()
+                .map(|&x| f32_to_bf16(x * alpha))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[serial]

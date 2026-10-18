@@ -6,12 +6,12 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     anyhow::ensure!(
         args.len() >= 2,
-        "usage: dory_generate MODEL_DIR [LOOPS=2] [TOKENS=64] [CHUNK=256] [PROMPT] [LOGITS_JSON]"
+        "usage: dory_generate MODEL_DIR [LOOPS=2] [TOKENS=64] [CHUNK=2048] [PROMPT] [LOGITS_JSON]"
     );
     let path = Path::new(&args[1]);
     let loops = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(2);
     let count = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(64);
-    let chunk = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(256);
+    let chunk = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(2048);
     let prompt = args
         .get(5)
         .map(String::as_str)

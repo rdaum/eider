@@ -71,6 +71,7 @@ fn main() {
     let ternary_g64_object = format!("{out_dir}/ternary_g64.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let ngram_object = format!("{out_dir}/ngram.o");
+    let dory_flash_object = format!("{out_dir}/dory_flash_attention.o");
     let dory_object = format!("{out_dir}/dory.o");
     let lfm2_object = format!("{out_dir}/lfm2.o");
     let lilicorr_object = format!("{out_dir}/lilicorr.o");
@@ -529,7 +530,39 @@ fn main() {
         cutlass_gemv_object.as_str(),
         cutlass_grouped_gemm_object.as_str(),
     ];
+    let flash_attention = cutlass_include.is_dir();
+    println!("cargo:rustc-check-cfg=cfg(eider_flash_attention)");
+    if flash_attention {
+        println!("cargo:rustc-cfg=eider_flash_attention");
+        let status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+            .args([
+                "-std=c++17",
+                "-O3",
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
+                "--generate-code=arch=compute_121a,code=sm_121a",
+                "-I",
+            ])
+            .arg(&cutlass_include)
+            .args([
+                "-c",
+                "native/dory_flash_attention.cu",
+                "-o",
+                &dory_flash_object,
+            ])
+            .status()
+            .expect("failed to run nvcc for Dory FlashAttention");
+        assert!(status.success(), "nvcc failed to build Dory FlashAttention");
+        archive_objects.push(dory_flash_object.as_str());
+    }
+    println!("cargo:rerun-if-changed=native/dory_flash_attention.cu");
+    println!("cargo:rerun-if-changed=native/vendor/flash-attention");
     let dory_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .arg(if flash_attention {
+            "-DEIDER_FLASH_ATTENTION=1"
+        } else {
+            "-DEIDER_FLASH_ATTENTION=0"
+        })
         .args([
             "-std=c++17",
             "-O3",

@@ -1247,6 +1247,46 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
         })
     }
 
+    /// Allocates and initializes zeroes on `stream` without a host wait.
+    /// Order subsequent uses on this stream, or synchronize it before other uses.
+    pub fn zeroed_on_stream(len: usize, stream: &CudaStream) -> Result<Self> {
+        let buffer = Self::uninitialized(len)?;
+        if len != 0 {
+            unsafe {
+                check_cuda(
+                    "cudaMemsetAsync",
+                    ffi::cudaMemsetAsync(
+                        buffer.ptr.cast(),
+                        0,
+                        buffer.device_bytes(),
+                        stream.as_raw(),
+                    ),
+                )?;
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// Copies a device range into a new allocation on `stream` without zeroing it first.
+    /// Order subsequent uses on this stream, or synchronize it before other uses.
+    pub fn from_device_range_on_stream(
+        source: &Self,
+        offset: usize,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        if offset.checked_add(len).is_none_or(|end| end > source.len) {
+            return Err(Error::Shape {
+                label: "device range allocation",
+                expected: format!("offset + length <= {}", source.len),
+                actual: format!("offset={offset} length={len}"),
+            });
+        }
+        let mut buffer = Self::uninitialized(len)?;
+        buffer.copy_range_from_device_on_stream(0, source, offset, len, stream)?;
+        Ok(buffer)
+    }
+
     /// Synchronizes `stream` and copies the complete device allocation back to host memory.
     pub fn copy_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, T>> {
         self.copy_prefix_to_host(self.len, stream)
@@ -1790,6 +1830,22 @@ mod tests {
     use super::{CapturedGraph, CudaStream, DeviceBuffer, PinnedHostBuffer};
     use crate::fill_f32_into_on_stream;
     use serial_test::serial;
+
+    #[serial]
+    #[test]
+    fn stream_initialized_allocations_preserve_order_and_bounds() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let mut source = DeviceBuffer::<f32>::zeroed_on_stream(1024, &stream).unwrap();
+        let zeros = DeviceBuffer::from_device_range_on_stream(&source, 511, 3, &stream).unwrap();
+        fill_f32_into_on_stream(source.output(), 7., &stream).unwrap();
+        let filled = DeviceBuffer::from_device_range_on_stream(&source, 1021, 3, &stream).unwrap();
+        assert!(DeviceBuffer::from_device_range_on_stream(&source, 1022, 3, &stream).is_err());
+        assert!(
+            DeviceBuffer::from_device_range_on_stream(&source, usize::MAX, 3, &stream).is_err()
+        );
+        assert_eq!(zeros.copy_to_host(&stream).unwrap().as_slice(), [0.; 3]);
+        assert_eq!(filled.copy_to_host(&stream).unwrap().as_slice(), [7.; 3]);
+    }
 
     #[serial]
     #[test]

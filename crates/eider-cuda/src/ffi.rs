@@ -4115,6 +4115,12 @@ unsafe extern "C" {
     pub(crate) fn cudaHostAlloc(host_ptr: *mut *mut c_void, size: usize, flags: u32)
     -> cudaError_t;
     pub(crate) fn cudaFreeHost(host_ptr: *mut c_void) -> cudaError_t;
+    pub(crate) fn cudaMemsetAsync(
+        dev_ptr: *mut c_void,
+        value: i32,
+        count: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn cudaMemset(dev_ptr: *mut c_void, value: i32, count: usize) -> cudaError_t;
     pub(crate) fn cudaDeviceSynchronize() -> cudaError_t;
     pub(crate) fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: u32) -> cudaError_t;

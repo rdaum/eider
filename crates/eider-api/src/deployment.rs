@@ -70,7 +70,7 @@ const CATALOGUE: &[ModelSpec] = &[
         defaults: ServingDefaults {
             served_model_name: "eider-dory1.0-4b",
             max_context_tokens: 262_144,
-            prefill_token_capacity: 256,
+            prefill_token_capacity: 2_048,
             step_expert_capacity: 240,
         },
     },
@@ -704,7 +704,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
-                "dory" => 256,
+                "dory" => 2_048,
                 "lfm2_moe" => 1_024,
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,

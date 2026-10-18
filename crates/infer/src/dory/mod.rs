@@ -6,25 +6,84 @@ mod prefix;
 pub use config::DoryConfig;
 use config::invalid;
 use eider_cuda::{
-    CudaGraphExec, CudaStream, DeviceBuffer, DoryNorm, F32DenseGemm, GemmPrecision, Result,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, dory_attention, dory_norm, dory_rope_norm,
-    dory_scale_logits, lfm2_decode_inputs_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
-    round_f32_to_bf16_prefix_in_place_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaGraphExec, CudaStream, DeviceBuffer, DoryNorm, DoryProjection,
+    F32DenseGemm, GemmShape, Result, Sm121W4A16HostWeight, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream, dory_attention,
+    dory_attention_workspace_len, dory_embedding, dory_linear, dory_norm, dory_rope_norm,
+    dory_scale_logits, lfm2_decode_inputs_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 pub(crate) use prefix::DoryPrefixCache;
-use std::path::Path;
+use std::{collections::HashMap, path::Path, rc::Rc};
+
+/// Direct BF16 GEMM plans share scratch because all Dory work uses one stream.
+struct PrefillGemm {
+    lt: CublasLt,
+    workspace: Rc<DeviceBuffer<u8>>,
+    plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
+}
+impl PrefillGemm {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            lt: CublasLt::new()?,
+            workspace: Rc::new(DeviceBuffer::zeroed(32 * 1024 * 1024)?),
+            plans: HashMap::new(),
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        weight: &DeviceBuffer<u16>,
+        input: &DeviceBuffer<u16>,
+        output: &mut DeviceBuffer<u16>,
+        rows: usize,
+        out: usize,
+        cols: usize,
+        scale: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let key = (rows, out, cols);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.plans.entry(key) {
+            entry.insert(Bf16TnMatmulPlan::new_bf16_with_workspace(
+                &self.lt,
+                GemmShape {
+                    m: out,
+                    n: rows,
+                    k: cols,
+                },
+                Rc::clone(&self.workspace),
+            )?);
+        }
+        self.plans[&key].run_scaled_bf16_on_stream(
+            &self.lt,
+            weight,
+            input,
+            output.output(),
+            scale,
+            stream,
+        )
+    }
+    fn device_bytes(&self) -> usize {
+        self.workspace.device_bytes()
+    }
+}
 
 struct Linear {
     weight: DeviceBuffer<u8>,
     scale: DeviceBuffer<u8>,
+    prefill_weight: DeviceBuffer<u16>,
     global: f32,
     rows: usize,
     cols: usize,
 }
 impl Linear {
-    fn load(cp: &ModelOptCheckpoint, prefix: &str, rows: usize, cols: usize) -> Result<Self> {
+    fn load(
+        cp: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
         let w = cp.load_nvfp4_linear(prefix)?;
         if w.out_features != rows
             || w.in_features != cols
@@ -33,49 +92,49 @@ impl Linear {
         {
             return Err(invalid(format!("invalid NVFP4 projection {prefix}")));
         }
+        let weight = DeviceBuffer::from_host(&w.packed_weight)?;
+        let scale = DeviceBuffer::from_host(&w.weight_scale)?;
+        let prefill_weight = F32DenseGemm::prepare_nvfp4_weights(&weight, &scale, stream)?;
+        let tiled = Sm121W4A16HostWeight::from_modelopt(&w)?;
         Ok(Self {
-            weight: DeviceBuffer::from_host(&w.packed_weight)?,
-            scale: DeviceBuffer::from_host(&w.weight_scale)?,
+            weight: DeviceBuffer::from_host(&tiled.packed_weight)?,
+            scale: DeviceBuffer::from_host(&tiled.weight_scale)?,
+            prefill_weight,
             global: w.weight_scale_2,
             rows,
             cols,
         })
     }
+    fn projection<'a>(&'a self, output: &'a mut DeviceBuffer<u16>) -> DoryProjection<'a> {
+        DoryProjection {
+            weights: &self.weight,
+            scales: &self.scale,
+            output: output.output(),
+            width: self.rows,
+            global: self.global,
+        }
+    }
     fn run(
         &self,
-        x: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<u16>,
+        y: &mut DeviceBuffer<u16>,
         rows: usize,
-        gemm: &mut F32DenseGemm,
+        gemm: &mut PrefillGemm,
         stream: &CudaStream,
     ) -> Result<()> {
         if rows <= 8 {
-            nvfp4_w4a16_matvec_f32_batch_into_on_stream(
-                x,
-                &self.weight,
-                &self.scale,
-                y.output(),
-                rows,
-                self.rows,
-                self.cols,
-                self.global,
-                stream,
-            )?;
-        } else {
-            gemm.run_quantized_on_stream(
-                x,
-                &self.weight,
-                Some(&self.scale),
-                None,
-                self.global,
-                y.output(),
-                rows,
-                self.rows,
-                self.cols,
-                stream,
-            )?;
+            return dory_linear(x, &mut [self.projection(y)], rows, self.cols, stream);
         }
-        round_f32_to_bf16_prefix_in_place_on_stream(y.inout(), rows * self.rows, stream)
+        gemm.run(
+            &self.prefill_weight,
+            x,
+            y,
+            rows,
+            self.rows,
+            self.cols,
+            self.global,
+            stream,
+        )
     }
 }
 enum Mixer {
@@ -129,26 +188,26 @@ pub struct DorySequence<'m> {
     next_id: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
 }
-/// Reusable layer-major prompt scratch. Quantized weights expand only into shared GEMM scratch.
+/// Reusable layer-major prompt scratch. Prefill weights are prepared once at load time.
 pub struct DoryPrefillWorkspace {
     capacity: usize,
-    gemm: F32DenseGemm,
+    gemm: PrefillGemm,
     tokens: DeviceBuffer<u32>,
     position: DeviceBuffer<u32>,
     length: DeviceBuffer<u32>,
-    hidden: DeviceBuffer<f32>,
-    input: DeviceBuffer<f32>,
-    next: DeviceBuffer<f32>,
-    branch: DeviceBuffer<f32>,
-    q: DeviceBuffer<f32>,
-    qr: DeviceBuffer<f32>,
-    k: DeviceBuffer<f32>,
-    kr: DeviceBuffer<f32>,
-    v: DeviceBuffer<f32>,
-    gate: DeviceBuffer<f32>,
-    up: DeviceBuffer<f32>,
-    mixed: DeviceBuffer<f32>,
-    norm: DeviceBuffer<f32>,
+    hidden: DeviceBuffer<u16>,
+    input: DeviceBuffer<u16>,
+    next: DeviceBuffer<u16>,
+    branch: DeviceBuffer<u16>,
+    q: DeviceBuffer<u16>,
+    qr: DeviceBuffer<u16>,
+    k: DeviceBuffer<u16>,
+    kr: DeviceBuffer<u16>,
+    v: DeviceBuffer<u16>,
+    gate: DeviceBuffer<u16>,
+    up: DeviceBuffer<u16>,
+    mixed: DeviceBuffer<u16>,
+    norm: DeviceBuffer<u16>,
     partial: DeviceBuffer<f32>,
 }
 impl DoryPrefillWorkspace {
@@ -160,12 +219,7 @@ impl DoryPrefillWorkspace {
         if rows == 0 || rows > 65535 {
             return Err(invalid("invalid prompt chunk capacity"));
         }
-        let mut gemm = F32DenseGemm::new(
-            rows,
-            h.max(q).max(f),
-            if rows > 8 { h * f.max(q) } else { 0 },
-        )?;
-        gemm.set_precision(GemmPrecision::Bf16);
+        let gemm = PrefillGemm::new()?;
         Ok(Self {
             capacity: rows,
             gemm,
@@ -185,13 +239,16 @@ impl DoryPrefillWorkspace {
             up: DeviceBuffer::zeroed(rows * f)?,
             mixed: DeviceBuffer::zeroed(rows * f.max(q))?,
             norm: DeviceBuffer::zeroed(rows * f.max(q))?,
-            partial: DeviceBuffer::zeroed(
-                rows * c.num_attention_heads * context.div_ceil(256) * 258,
-            )?,
+            partial: DeviceBuffer::zeroed(Self::attention_workspace_len(c, rows, context))?,
         })
     }
+    fn attention_workspace_len(c: &DoryConfig, rows: usize, context: usize) -> usize {
+        dory_attention_workspace_len(rows, c.num_attention_heads, context, 0).max(
+            dory_attention_workspace_len(rows.min(15), c.num_attention_heads, context, 0),
+        )
+    }
     fn reserve_attention(&mut self, c: &DoryConfig, context: usize) -> Result<()> {
-        let n = self.capacity * c.num_attention_heads * context.div_ceil(256) * 258;
+        let n = Self::attention_workspace_len(c, self.capacity, context);
         if n > self.partial.len() {
             self.partial = DeviceBuffer::zeroed(n)?;
         }
@@ -212,11 +269,11 @@ impl DoryPrefillWorkspace {
             &self.up,
             &self.mixed,
             &self.norm,
-            &self.partial,
         ]
         .iter()
         .map(|x| x.device_bytes())
         .sum::<usize>()
+            + self.partial.device_bytes()
             + self.tokens.device_bytes()
             + 8
             + self.gemm.device_bytes()
@@ -247,7 +304,8 @@ impl DoryModel {
                 h,
                 |x| (x * (c.ngpt_alpha_init / c.initializer_range)).abs(),
             )?;
-            let linear = |name: &str, r, col| Linear::load(&cp, &format!("{mixer}.{name}"), r, col);
+            let linear =
+                |name: &str, r, col| Linear::load(&cp, &format!("{mixer}.{name}"), r, col, &stream);
             let mixer = if attention {
                 let sf = 16.0 / c.initializer_range;
                 let gf = c
@@ -285,6 +343,7 @@ impl DoryModel {
             };
             layers.push(Layer { alpha, mixer });
         }
+        stream.synchronize()?;
         tracing::info!(
             loops = c.n_recurrent_loops,
             physical_layers = c.num_hidden_layers,
@@ -318,8 +377,14 @@ impl DoryModel {
         for i in c.schedule() {
             if matches!(self.layers[i].mixer, Mixer::Attention { .. }) {
                 caches.push(Cache {
-                    key: DeviceBuffer::zeroed(capacity * c.num_key_value_heads * 256)?,
-                    value: DeviceBuffer::zeroed(capacity * c.num_key_value_heads * 256)?,
+                    key: DeviceBuffer::zeroed_on_stream(
+                        capacity * c.num_key_value_heads * 256,
+                        &self.stream,
+                    )?,
+                    value: DeviceBuffer::zeroed_on_stream(
+                        capacity * c.num_key_value_heads * 256,
+                        &self.stream,
+                    )?,
                 });
             }
         }
@@ -347,12 +412,12 @@ impl DoryModel {
         let c = &self.config;
         let st = &self.stream;
         let mut ci = 0;
-        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
-            c.vocab_size,
-            c.hidden_size,
+        dory_embedding(
             &self.embedding,
             &w.tokens,
             w.hidden.output(),
+            c.vocab_size,
+            c.hidden_size,
             rows,
             st,
         )?;
@@ -420,10 +485,25 @@ impl DoryModel {
                     theta,
                     window,
                 } => {
-                    q.run(&w.hidden, &mut w.q, rows, &mut w.gemm, st)?;
-                    k.run(&w.hidden, &mut w.k, rows, &mut w.gemm, st)?;
-                    v.run(&w.hidden, &mut w.v, rows, &mut w.gemm, st)?;
-                    g.run(&w.hidden, &mut w.gate, rows, &mut w.gemm, st)?;
+                    if rows <= 8 {
+                        dory_linear(
+                            &w.hidden,
+                            &mut [
+                                q.projection(&mut w.q),
+                                k.projection(&mut w.k),
+                                v.projection(&mut w.v),
+                                g.projection(&mut w.gate),
+                            ],
+                            rows,
+                            c.hidden_size,
+                            st,
+                        )?;
+                    } else {
+                        q.run(&w.hidden, &mut w.q, rows, &mut w.gemm, st)?;
+                        k.run(&w.hidden, &mut w.k, rows, &mut w.gemm, st)?;
+                        v.run(&w.hidden, &mut w.v, rows, &mut w.gemm, st)?;
+                        g.run(&w.hidden, &mut w.gate, rows, &mut w.gemm, st)?;
+                    }
                     dory_rope_norm(
                         &w.q,
                         Some(sqk),
@@ -482,8 +562,18 @@ impl DoryModel {
                     sg,
                     su,
                 } => {
-                    gate.run(&w.hidden, &mut w.gate, rows, &mut w.gemm, st)?;
-                    up.run(&w.hidden, &mut w.up, rows, &mut w.gemm, st)?;
+                    if rows <= 8 {
+                        dory_linear(
+                            &w.hidden,
+                            &mut [gate.projection(&mut w.gate), up.projection(&mut w.up)],
+                            rows,
+                            c.hidden_size,
+                            st,
+                        )?;
+                    } else {
+                        gate.run(&w.hidden, &mut w.gate, rows, &mut w.gemm, st)?;
+                        up.run(&w.hidden, &mut w.up, rows, &mut w.gemm, st)?;
+                    }
                     dory_norm(
                         &w.gate,
                         w.norm.output(),
@@ -545,7 +635,7 @@ impl DoryModel {
         self.prefill_hidden(w, s, tokens)?;
         self.readout(s)
     }
-    fn prefill_hidden(
+    pub(crate) fn prefill_hidden(
         &self,
         w: &mut DoryPrefillWorkspace,
         s: &mut DorySequence,
@@ -561,11 +651,12 @@ impl DoryModel {
         w.position.copy_from_host(&[s.position as u32])?;
         s.valid = false;
         self.forward(w, &mut s.caches, tokens.len(), s.position + tokens.len())?;
-        s.hidden.copy_range_from_device_on_stream(
-            0,
-            &w.hidden,
-            (tokens.len() - 1) * self.config.hidden_size,
+        copy_bf16_row_to_f32_into_on_stream(
+            w.capacity,
             self.config.hidden_size,
+            tokens.len() - 1,
+            &w.hidden,
+            s.hidden.output(),
             &self.stream,
         )?;
         s.position += tokens.len();
@@ -586,9 +677,12 @@ impl DoryModel {
         if s.graph.is_none() {
             s.graph = Some(self.stream.capture(|_| {
                 self.forward(&mut s.workspace, &mut s.caches, 1, s.capacity)?;
-                s.hidden.copy_prefix_from_device_on_stream(
-                    &s.workspace.hidden,
+                copy_bf16_row_to_f32_into_on_stream(
+                    1,
                     self.config.hidden_size,
+                    0,
+                    &s.workspace.hidden,
+                    s.hidden.output(),
                     &self.stream,
                 )?;
                 self.readout(s)
@@ -622,6 +716,16 @@ impl DoryModel {
     }
 }
 impl DorySequence<'_> {
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+    /// Reuses storage and the decode graph; kernels read only the new valid prefix.
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        self.model.synchronize()?;
+        self.position = 0;
+        self.valid = true;
+        Ok(())
+    }
     pub fn position(&self) -> usize {
         self.position
     }
@@ -723,6 +827,12 @@ mod tests {
                 model.decode(&mut graph, token)?;
             }
             compare(&model.logits_to_host(&graph)?, &expected);
+            graph.reset()?;
+            model.prefill(&mut w, &mut graph, &tokens[..7])?;
+            for &token in &tokens[7..] {
+                model.decode(&mut graph, token)?;
+            }
+            compare(&model.logits_to_host(&graph)?, &expected);
             let mut prefixes = DoryPrefixCache::new(128 << 20);
             let mut source = model.new_sequence(64)?;
             model.prefill(&mut w, &mut source, &tokens[..17])?;
@@ -731,6 +841,17 @@ mod tests {
             assert_eq!(prefixes.restore(&model, &mut restored, &tokens)?, 17);
             model.prefill(&mut w, &mut restored, &tokens[17..])?;
             compare(&model.logits_to_host(&restored)?, &expected);
+            let mut changed = tokens;
+            changed[16] = 1077;
+            let mut partial = model.new_sequence(64)?;
+            assert_eq!(prefixes.restore(&model, &mut partial, &changed)?, 16);
+            model.prefill(&mut w, &mut partial, &changed[16..])?;
+            let mut fresh = model.new_sequence(64)?;
+            model.prefill(&mut w, &mut fresh, &changed)?;
+            compare(
+                &model.logits_to_host(&partial)?,
+                &model.logits_to_host(&fresh)?,
+            );
             let ids = (0..64).collect::<Vec<_>>();
             let mut head = model.new_decision_readout(&ids)?;
             let mut decision = model.new_decision_sequence(64)?;
@@ -757,22 +878,35 @@ mod tests {
                     .iter()
                     .copied()
                     .cycle()
-                    .take(1033)
+                    .take(2061)
                     .collect::<Vec<_>>();
                 let mut w = model.new_prefill_workspace(256)?;
-                let mut source = model.new_sequence(1050)?;
-                for chunk in long[..1029].chunks(256) {
+                let mut source = model.new_sequence(2080)?;
+                for chunk in long[..2053].chunks(256) {
                     model.prefill(&mut w, &mut source, chunk)?;
                 }
                 let mut prefixes = DoryPrefixCache::new(512 << 20);
-                prefixes.retain(&model, &source, &long[..1029])?;
-                let mut restored = model.new_sequence(1050)?;
-                assert_eq!(prefixes.restore(&model, &mut restored, &long)?, 1029);
-                model.prefill(&mut w, &mut source, &long[1029..])?;
-                model.prefill(&mut w, &mut restored, &long[1029..])?;
+                prefixes.retain(&model, &source, &long[..2053])?;
+                let mut restored = model.new_sequence(2080)?;
+                assert_eq!(prefixes.restore(&model, &mut restored, &long)?, 2053);
+                model.prefill(&mut w, &mut source, &long[2053..])?;
+                model.prefill(&mut w, &mut restored, &long[2053..])?;
                 assert_eq!(
                     model.logits_to_host(&source)?,
                     model.logits_to_host(&restored)?
+                );
+                // Eviction reuses the fixed-size sliding buffers, then restores
+                // a partial prefix from the replacement snapshot.
+                prefixes.retain(&model, &source, &long)?;
+                let mut reused = model.new_sequence(2080)?;
+                assert_eq!(
+                    prefixes.restore(&model, &mut reused, &long)?,
+                    long.len() - 1
+                );
+                model.prefill(&mut w, &mut reused, &long[long.len() - 1..])?;
+                compare(
+                    &model.logits_to_host(&reused)?,
+                    &model.logits_to_host(&source)?,
                 );
             }
         }
