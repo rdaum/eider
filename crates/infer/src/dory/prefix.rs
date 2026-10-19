@@ -51,11 +51,39 @@ impl DoryPrefixCache {
         s: &mut DorySequence,
         tokens: &[u32],
     ) -> Result<usize> {
+        self.restore_match(model, s, tokens, false)
+    }
+    /// Decisions need the prefix KV, but no hidden vector for its last token.
+    /// Require the complete state to match so short shared framing does not add
+    /// a separate backbone traversal to otherwise combined decision requests.
+    pub(crate) fn restore_exact(
+        &mut self,
+        model: &DoryModel,
+        s: &mut DorySequence,
+        tokens: &[u32],
+    ) -> Result<usize> {
+        self.restore_match(model, s, tokens, true)
+    }
+    fn restore_match(
+        &mut self,
+        model: &DoryModel,
+        s: &mut DorySequence,
+        tokens: &[u32],
+        exact: bool,
+    ) -> Result<usize> {
         let Some((entry, matched)) = self
             .entries
             .iter_mut()
             .map(|entry| {
-                let matched = entry.matched_prefix(tokens);
+                let matched = if exact {
+                    if entry.tokens.as_ref() == tokens {
+                        tokens.len()
+                    } else {
+                        0
+                    }
+                } else {
+                    entry.matched_prefix(tokens)
+                };
                 (entry, matched)
             })
             .filter(|(_, matched)| *matched > 0)

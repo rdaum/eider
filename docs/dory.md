@@ -112,6 +112,52 @@ The follow-up SHA-256 is `c1bd33d45d93c8cc519c62ecc021fe7e80b414a5a2323207c34a79
 
 ## Decisions
 
+### Execution and request reuse
+
+Decisions use the configured Dory loops and a compact head for the selected answer labels.
+The scheduler packs independent question suffixes into one layer traversal, with separate causal histories.
+A new state and its first question wave can share the same traversal.
+
+Single-sequence serving retains one decision allocation between requests.
+It reserves suffix scratch for the configured token and branch capacities.
+Each allocation retains up to eight attention plans and CUDA graphs, ordered by recent use.
+The first execution of a geometry prepares its kernels and matrix plans.
+The second execution captures its graph. Later executions replay that graph with new token contents.
+Replacing the workspace or answer head invalidates those graphs.
+
+Repeated states reuse their prefix KV directly from the idle allocation.
+The shared prefix cache also restores an exact state after another request replaces it.
+Question suffixes always execute again. Their results are not cached.
+Partial framing matches do not split a new short decision request into two traversals.
+`--retained-prefix-gib 0` disables prefix reuse, while allocation and graph reuse remain active.
+
+Measured HTTP latency on GB10, 2026-10-19, with the trained NVFP4 checkpoint, two loops and eight branches per wave:
+
+| State | Questions | Reuse | Before (ms) | After (ms) |
+|---|---:|---|---:|---:|
+| Short | 1 | New state | 70.4 | 69.1 |
+| Short | 8 | New state | 140.4 | 111.2 |
+| Short | 32 | New state | 433.7 | 411.4 |
+| Long | 1 | Same state | 287.4 | 63.8 |
+| Long | 8 | Same state | 457.1 | 117.7 |
+| Long | 32 | Same state | 798.6 | 458.3 |
+
+Each value is the mean of three requests after one warmup. These measurements include graph capture when it occurs.
+The long state contains 80 repeated service-log entries. New long states still require their full prefill.
+The first new-runtime request took 127.8 ms, including allocation and kernel preparation.
+Graphs reduce launch overhead. Every question wave still reads weights and executes the model.
+
+The GPU regression covers graph replay, changed question tokens, cancellation, prefix restoration and workspace replacement.
+It also compares packed decisions with serial execution. Graph replay preserves logits exactly for an unchanged execution geometry.
+Prefix reuse can change BF16 reduction order and therefore probabilities.
+On 512 training-like test questions, the first pass preserved all chosen answers and the 411-correct total.
+Repeated states changed one error to a correct answer, for 412 correct.
+Both paths retained 55 correct answers on the 89 broader benchmark questions.
+With the existing temperatures, repeated-state Brier scores changed from 0.276829 to 0.276098 and from 0.429001 to 0.428860, respectively.
+The original calibration artifact remains unchanged.
+A copy under `verda-continuation-64k-r8/calibration/engine-reuse/` binds the existing temperatures to this evaluated runtime and records the comparison.
+Measurement requests, responses and scripts are under `~/.cache/eider/bench-artifacts/dory-decisions/2026-10-19-engine/`.
+
 `POST /v1/decisions` supports `noul`, `choice`, and `score` questions.
 The runtime combines the shared prefix and first question batch in one backbone traversal when they fit the token budget.
 One question uses a single causal prefill. Multiple questions use packed attention with separate histories.

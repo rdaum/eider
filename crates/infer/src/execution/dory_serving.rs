@@ -1,7 +1,8 @@
 //! Dory serving with request-owned per-loop KV and bounded prompt retention.
 
 use crate::dory::{
-    DoryDecisionReadout, DoryModel, DoryPrefillWorkspace, DoryPrefixCache, DorySequence,
+    DoryDecisionReadout, DoryDecisionSequence, DoryModel, DoryPrefillWorkspace, DoryPrefixCache,
+    DorySequence,
 };
 use eider_cuda::{Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
@@ -44,6 +45,7 @@ pub(crate) struct DoryChatService<'m, 't> {
     prefill: DoryPrefillWorkspace,
     prefixes: DoryPrefixCache,
     idle_sequence: Option<DorySequence<'m>>,
+    idle_decision: Option<DoryDecisionSequence<'m>>,
     next_id: u64,
     waiting: VecDeque<EngineRequestId>,
     requests: BTreeMap<EngineRequestId, Request<'m, 't>>,
@@ -96,6 +98,7 @@ impl<'m, 't> DoryChatService<'m, 't> {
             prefill,
             prefixes: DoryPrefixCache::new(cache.max_retained_bytes),
             idle_sequence,
+            idle_decision: None,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -366,11 +369,15 @@ impl EngineService for DoryChatService<'_, '_> {
         self.run_tick(lifecycle).map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
-        if let Some(group) = self.decisions.remove(&id) {
+        if let Some(mut group) = self.decisions.remove(&id) {
             self.waiting.retain(|&waiting| waiting != id);
             self.decision_ready.retain(|&ready| ready != id);
+            let bytes = group.device_bytes();
+            if self.config.max_active_sequences == 1 && group.sequence.is_some() {
+                self.idle_decision = group.sequence.take();
+            }
             return EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes: group.device_bytes(),
+                released_sequence_device_bytes: bytes,
             };
         }
         let Some(mut r) = self.requests.remove(&id) else {

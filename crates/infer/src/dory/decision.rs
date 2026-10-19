@@ -1,6 +1,8 @@
 //! Selected-label readout over an immutable per-loop attention prefix.
 use super::*;
+use eider_cuda::DeviceAddress;
 pub(crate) struct DoryDecisionReadout<'m> {
+    identity: u64,
     model: &'m DoryModel,
     token_ids: Vec<u32>,
     weight: DeviceBuffer<u16>,
@@ -9,9 +11,30 @@ pub(crate) struct DoryDecisionReadout<'m> {
     batch_logits: DeviceBuffer<f32>,
 }
 pub(crate) struct DoryDecisionSequence<'m> {
-    pub(super) state: DorySequence<'m>,
+    // Graphs are dropped before the plans and sequence storage they reference.
+    executions: Vec<DecisionExecution>,
+    binding: Option<(u64, DeviceAddress<u16>, u64)>,
+    pub(crate) state: DorySequence<'m>,
     prefix: Option<usize>,
     logical_capacity: usize,
+    retained_prefix: Vec<u32>,
+}
+
+struct DecisionExecution {
+    graph: Option<CudaGraphExec>,
+    plan: Option<DoryBranchPlan>,
+    prefix: usize,
+    lengths: Vec<usize>,
+    include_prefix: bool,
+    warmed: bool,
+}
+
+fn branch_scratch(packed_rows: usize, branches: usize) -> usize {
+    if DoryBranchPlan::supported() {
+        packed_rows + 128 * branches
+    } else {
+        0
+    }
 }
 impl DoryModel {
     pub(crate) fn new_decision_readout(&self, ids: &[u32]) -> Result<DoryDecisionReadout<'_>> {
@@ -44,6 +67,7 @@ impl DoryModel {
         }
         self.synchronize()?;
         Ok(DoryDecisionReadout {
+            identity: workspace_identity(),
             model: self,
             token_ids: ids.to_vec(),
             weight,
@@ -67,15 +91,14 @@ impl DoryModel {
         }
         // At most two partial pages per suffix, plus the packed query rows.
         // Physical scratch may exceed the logical context; RoPE positions do not.
-        let extra = if DoryBranchPlan::supported() && branches > 1 {
-            packed_rows + 128 * branches
-        } else {
-            0
-        };
+        let extra = branch_scratch(packed_rows, branches);
         Ok(DoryDecisionSequence {
+            executions: Vec::new(),
+            binding: None,
             state: self.allocate_sequence(capacity + extra)?,
             prefix: None,
             logical_capacity: capacity,
+            retained_prefix: Vec::new(),
         })
     }
 }
@@ -104,6 +127,29 @@ impl DoryDecisionReadout<'_> {
     }
 }
 impl DoryDecisionSequence<'_> {
+    #[cfg(test)]
+    pub(crate) fn captured_graphs(&self) -> usize {
+        self.executions.iter().filter(|e| e.graph.is_some()).count()
+    }
+    pub(crate) fn supports(&self, capacity: usize, packed_rows: usize, branches: usize) -> bool {
+        self.logical_capacity >= capacity
+            && self.state.capacity >= capacity + branch_scratch(packed_rows, branches)
+    }
+    pub(crate) fn prepare(&mut self, tokens: &[u32], retain: bool) -> Result<bool> {
+        if retain && self.state.valid && self.retained_prefix == tokens {
+            self.state.position = tokens.len();
+            self.prefix = Some(tokens.len());
+            return Ok(true);
+        }
+        self.state.reset()?;
+        self.prefix = None;
+        self.retained_prefix.clear();
+        Ok(false)
+    }
+    pub(crate) fn retain_prefix(&mut self, tokens: &[u32]) {
+        self.retained_prefix.clear();
+        self.retained_prefix.extend_from_slice(tokens);
+    }
     pub(crate) fn device_bytes(&self) -> usize {
         self.state.device_bytes()
     }
@@ -176,35 +222,80 @@ impl DoryDecisionSequence<'_> {
             .copied()
             .chain(suffixes.iter().flat_map(|s| s.iter().copied()))
             .collect::<Vec<_>>();
-        if include_prefix && suffixes.len() == 1 {
-            // One causal prompt needs no page table or separate prefix traversal.
-            model.prefill_hidden(w, s, &tokens)?;
-            let logits = head.selected_logits(self)?;
-            self.state.position = prefix;
-            self.prefix = Some(prefix);
-            return Ok(vec![logits]);
-        }
         model.synchronize()?;
-        let plan = DoryBranchPlan::new(prefix, &lengths, include_prefix)?;
-        if plan.cache_capacity() > s.capacity {
-            return Err(invalid("decision wave exceeds cache scratch"));
-        }
         // The scalar fallback's workspace is also large enough for packed FA2 LSE.
         w.reserve_attention(&model.config, prefix + *lengths.iter().max().unwrap())?;
+        let binding = (w.identity, w.hidden.cuda_address(), head.identity);
+        if self.binding != Some(binding) {
+            self.executions.clear();
+            self.binding = Some(binding);
+        }
+        let index = self.executions.iter().position(|e| {
+            e.prefix == prefix && e.lengths == lengths && e.include_prefix == include_prefix
+        });
+        let mut execution = if let Some(index) = index {
+            self.executions.remove(index)
+        } else {
+            // Bound both graph metadata and GPU page tables. Repeated geometries
+            // move to the end; one-off shapes execute eagerly without capture.
+            if self.executions.len() == 8 {
+                self.executions.remove(0);
+            }
+            let plan = if include_prefix && suffixes.len() == 1 {
+                None
+            } else {
+                Some(DoryBranchPlan::new(prefix, &lengths, include_prefix)?)
+            };
+            if plan
+                .as_ref()
+                .is_some_and(|p| p.cache_capacity() > s.capacity)
+            {
+                return Err(invalid("decision wave exceeds cache scratch"));
+            }
+            DecisionExecution {
+                graph: None,
+                plan,
+                prefix,
+                lengths,
+                include_prefix,
+                warmed: false,
+            }
+        };
         w.tokens.copy_prefix_from_host(&tokens)?;
+        if execution.plan.is_none() {
+            w.position.copy_from_host(&[0])?;
+        }
         s.valid = false;
-        model.forward(w, &mut s.caches, rows, s.capacity, Some(&plan))?;
-        plan.logits(
-            &w.hidden,
-            &head.weight,
-            &head.scales,
-            head.batch_logits.output(),
-            model.config.hidden_size,
-            &model.stream,
-        )?;
-        let logits = head
-            .batch_logits
-            .copy_prefix_to_host(suffixes.len() * head.token_ids.len(), &model.stream)?;
+        let submitted = (|| {
+            if execution.graph.is_none() && execution.warmed {
+                // The eager invocation prepared cuBLAS plans and attention scratch.
+                execution.graph = Some(
+                    model
+                        .stream
+                        .capture(|_| enqueue(model, w, s, head, rows, execution.plan.as_ref()))?,
+                );
+            }
+            if let Some(graph) = &execution.graph {
+                graph.launch(&model.stream)?;
+            } else {
+                enqueue(model, w, s, head, rows, execution.plan.as_ref())?;
+                execution.warmed = true;
+            }
+            Ok(())
+        })();
+        if let Err(err) = submitted {
+            // A partially enqueued eager pass may still reference the page tables.
+            let _ = model.synchronize();
+            return Err(err);
+        }
+        let output = if execution.plan.is_some() {
+            &head.batch_logits
+        } else {
+            &head.logits
+        };
+        let logits =
+            output.copy_prefix_to_host(suffixes.len() * head.token_ids.len(), &model.stream)?;
+        self.executions.push(execution);
         s.valid = true;
         s.position = prefix;
         self.prefix = Some(prefix);
@@ -222,4 +313,58 @@ impl DoryDecisionSequence<'_> {
             .ok_or_else(|| invalid("decision prefix is not sealed"))?;
         Ok(())
     }
+}
+
+fn enqueue(
+    model: &DoryModel,
+    w: &mut DoryPrefillWorkspace,
+    s: &mut DorySequence,
+    head: &mut DoryDecisionReadout,
+    rows: usize,
+    plan: Option<&DoryBranchPlan>,
+) -> Result<()> {
+    let original = w.hidden.cuda_address();
+    let result = (|| {
+        model.forward(
+            w,
+            &mut s.caches,
+            rows,
+            if plan.is_some() { s.capacity } else { rows },
+            plan,
+        )?;
+        if let Some(plan) = plan {
+            plan.logits(
+                &w.hidden,
+                &head.weight,
+                &head.scales,
+                head.batch_logits.output(),
+                model.config.hidden_size,
+                &model.stream,
+            )
+        } else {
+            copy_bf16_row_to_f32_into_on_stream(
+                w.capacity,
+                model.config.hidden_size,
+                rows - 1,
+                &w.hidden,
+                s.hidden.output(),
+                &model.stream,
+            )?;
+            bf16_linear_logits_f32_into_on_stream(
+                &s.hidden,
+                &head.weight,
+                head.logits.output(),
+                head.token_ids.len(),
+                model.config.hidden_size,
+                &model.stream,
+            )?;
+            dory_scale_logits(head.logits.output(), &head.scales, &model.stream)
+        }
+    })();
+    // Graph replay does not repeat Rust's buffer swaps. Keep the next invocation's
+    // input addresses identical for both odd and even backbone schedules.
+    if w.hidden.cuda_address() != original {
+        std::mem::swap(&mut w.hidden, &mut w.next);
+    }
+    result
 }

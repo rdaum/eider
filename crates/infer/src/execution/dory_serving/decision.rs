@@ -1,7 +1,6 @@
 //! Shared-prefix decision batches with isolated question suffixes and compact readout.
 
 use super::*;
-use crate::dory::DoryDecisionSequence;
 use eider_runtime::decision::{
     DecisionBranchLogits, DecisionCompletion, DecisionTimings, DecisionUsage, answers_from_logits,
 };
@@ -11,6 +10,7 @@ pub(super) struct DecisionGroup<'m> {
     request: DecisionRequest,
     pub(super) sequence: Option<DoryDecisionSequence<'m>>,
     prefix_done: bool,
+    prefix_retained: bool,
     next_branch: usize,
     suffix_position: usize,
     logits: Vec<DecisionBranchLogits>,
@@ -52,6 +52,7 @@ impl DoryChatService<'_, '_> {
                 request,
                 sequence: None,
                 prefix_done: false,
+                prefix_retained: false,
                 next_branch: 0,
                 suffix_position: 0,
                 logits: Vec::new(),
@@ -64,28 +65,49 @@ impl DoryChatService<'_, '_> {
 
     pub(super) fn admit_decision_sequence(&mut self, id: EngineRequestId) -> Result<()> {
         let group = self.decisions.get_mut(&id).expect("queued decision");
-        let branches = self
-            .config
-            .decision_branch_capacity
-            .min(group.request.branches.len())
-            .min(64);
-        let mut lengths = group
-            .request
-            .branches
-            .iter()
-            .map(|b| b.suffix_tokens.len())
-            .collect::<Vec<_>>();
-        lengths.sort_unstable_by(|a, b| b.cmp(a));
-        let packed_rows = lengths
-            .iter()
-            .take(branches)
-            .sum::<usize>()
-            .min(self.config.prefill_token_capacity);
-        group.sequence = Some(self.model.new_decision_sequence(
-            group.request.longest_branch_tokens(),
-            packed_rows,
-            branches,
-        )?);
+        let required = group.request.longest_branch_tokens();
+        let mut sequence = if let Some(sequence) = self.idle_decision.take().filter(|s| {
+            s.supports(
+                required,
+                self.config.prefill_token_capacity,
+                self.config.decision_branch_capacity.min(64),
+            )
+        }) {
+            sequence
+        } else {
+            let capacity = if self.config.max_active_sequences == 1 {
+                if required < 8192 {
+                    required.next_power_of_two()
+                } else {
+                    required.next_multiple_of(8192)
+                }
+                .min(self.config.max_context_tokens)
+            } else {
+                required
+            };
+            self.model.new_decision_sequence(
+                capacity,
+                self.config.prefill_token_capacity,
+                self.config.decision_branch_capacity.min(64),
+            )?
+        };
+        let started = Instant::now();
+        group.prefix_done =
+            sequence.prepare(&group.request.prefix_tokens, self.prefixes.enabled())?;
+        if !group.prefix_done
+            && self.prefixes.restore_exact(
+                self.model,
+                &mut sequence.state,
+                &group.request.prefix_tokens,
+            )? > 0
+        {
+            sequence.seal_prefix()?;
+            sequence.retain_prefix(&group.request.prefix_tokens);
+            group.prefix_done = true;
+        }
+        group.prefix_retained = group.prefix_done;
+        group.timings.branch_fork += started.elapsed();
+        group.sequence = Some(sequence);
         self.decision_ready.push_back(id);
         Ok(())
     }
@@ -111,10 +133,15 @@ impl DoryChatService<'_, '_> {
             // including a failed partially enqueued forward pass.
             self.model.synchronize()?;
             match progress {
-                Ok(Some(completion)) => tick.decisions_finished.push(EngineDecisionFinished {
-                    request_id: id,
-                    completion,
-                }),
+                Ok(Some(completion)) => {
+                    if self.config.max_active_sequences == 1 {
+                        self.idle_decision = group.sequence.take();
+                    }
+                    tick.decisions_finished.push(EngineDecisionFinished {
+                        request_id: id,
+                        completion,
+                    });
+                }
                 Ok(None) => {
                     self.decisions.insert(id, group);
                     self.decision_ready.push_back(id);
@@ -159,7 +186,9 @@ impl DoryChatService<'_, '_> {
                 })
                 .map(|branch| branch.suffix_tokens.as_slice())
                 .collect::<Vec<_>>();
-            if branches.len() > 1 || (!prefix.is_empty() && !branches.is_empty()) {
+            if !branches.is_empty()
+                && (eider_cuda::DoryBranchPlan::supported() || !prefix.is_empty())
+            {
                 let rows = prefix.len() + branches.iter().map(|s| s.len()).sum::<usize>();
                 let started = Instant::now();
                 let outputs = sequence.prefill_branches(
@@ -171,6 +200,15 @@ impl DoryChatService<'_, '_> {
                 group.timings.branch_inference += started.elapsed();
                 *token_budget -= rows;
                 group.prefix_done = true;
+                if !group.prefix_retained && self.prefixes.enabled() {
+                    self.prefixes.retain(
+                        self.model,
+                        &sequence.state,
+                        &group.request.prefix_tokens,
+                    )?;
+                    sequence.retain_prefix(&group.request.prefix_tokens);
+                    group.prefix_retained = true;
+                }
                 for logits in outputs {
                     let branch = &group.request.branches[group.next_branch];
                     group.logits.push(DecisionBranchLogits {
@@ -201,6 +239,15 @@ impl DoryChatService<'_, '_> {
                 self.model.synchronize()?;
                 group.timings.branch_fork += started.elapsed();
                 group.prefix_done = true;
+                if self.prefixes.enabled() {
+                    self.prefixes.retain(
+                        self.model,
+                        &sequence.state,
+                        &group.request.prefix_tokens,
+                    )?;
+                    sequence.retain_prefix(&group.request.prefix_tokens);
+                    group.prefix_retained = true;
+                }
             }
             return Ok(None);
         }
@@ -570,5 +617,67 @@ mod tests {
                 assert_eq!(tick.decisions_finished[0].request_id, id);
             }
         }
+
+        // Repeated geometries reuse storage and capture after one eager pass.
+        // New token contents must still reach the graph on every invocation.
+        let request = compiler
+            .prepare(DecisionPromptRequest {
+                state: json!("The parcel arrived yesterday. It contains a red book."),
+                questions: vec![
+                    (
+                        "arrived".into(),
+                        DecisionPromptQuestion::Noul {
+                            instructions: json!("Has the parcel arrived?"),
+                            true_description: "Yes".into(),
+                            false_description: "No".into(),
+                        },
+                    ),
+                    (
+                        "colour".into(),
+                        DecisionPromptQuestion::Choice {
+                            instructions: json!("What colour is the book?"),
+                            options: vec![("red".into(), None), ("blue".into(), None)],
+                        },
+                    ),
+                ],
+            })
+            .unwrap();
+        service.idle_decision = None;
+        let cold = complete(&mut service, request.clone(), true);
+        assert_eq!(service.idle_decision.as_ref().unwrap().captured_graphs(), 0);
+        let captured = complete(&mut service, request.clone(), true);
+        let replayed = complete(&mut service, request.clone(), true);
+        assert_eq!(service.idle_decision.as_ref().unwrap().captured_graphs(), 1);
+        assert_eq!(cold.branch_logits, captured.branch_logits);
+        assert_eq!(cold.branch_logits, replayed.branch_logits);
+        let mut changed = request.clone();
+        changed.branches[0].suffix_tokens.fill(1234);
+        let changed = complete(&mut service, changed, true);
+        assert_eq!(cold.branch_logits[1], changed.branch_logits[1]);
+        assert_ne!(cold.branch_logits[0], changed.branch_logits[0]);
+
+        // Prefix retention works in place and after another state replaces it.
+        service.prefixes = DoryPrefixCache::new(256 * 1024 * 1024);
+        let retained = complete(&mut service, request.clone(), true);
+        assert_eq!(cold.branch_logits, retained.branch_logits);
+        let cached = complete(&mut service, request.clone(), true);
+        compare_logits(&cached, &cold);
+        let captured = complete(&mut service, request.clone(), true);
+        assert_eq!(cached.branch_logits, captured.branch_logits);
+        assert_eq!(service.idle_decision.as_ref().unwrap().captured_graphs(), 2);
+        let mut other = request.clone();
+        other.prefix_tokens.fill(1234);
+        complete(&mut service, other, true);
+        let restored = complete(&mut service, request.clone(), true);
+        assert_eq!(cached.branch_logits, restored.branch_logits);
+
+        // Graph pointers must not survive replacement of the shared workspace.
+        service.prefill = model.new_prefill_workspace(2048).unwrap();
+        let replaced = complete(&mut service, request.clone(), true);
+        assert_eq!(service.idle_decision.as_ref().unwrap().captured_graphs(), 0);
+        assert_eq!(cached.branch_logits, replaced.branch_logits);
+        service.prefixes = DoryPrefixCache::new(0);
+        let uncached = complete(&mut service, request, true);
+        assert_eq!(cold.branch_logits, uncached.branch_logits);
     }
 }

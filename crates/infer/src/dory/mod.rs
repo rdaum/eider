@@ -15,7 +15,17 @@ use eider_cuda::{
 };
 use eider_format::ModelOptCheckpoint;
 pub(crate) use prefix::DoryPrefixCache;
-use std::{collections::HashMap, path::Path, rc::Rc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+fn workspace_identity() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Direct BF16 GEMM plans share scratch because all Dory work uses one stream.
 struct PrefillGemm {
@@ -191,6 +201,7 @@ pub struct DorySequence<'m> {
 }
 /// Reusable layer-major prompt scratch. Prefill weights are prepared once at load time.
 pub struct DoryPrefillWorkspace {
+    identity: u64,
     capacity: usize,
     gemm: PrefillGemm,
     tokens: DeviceBuffer<u32>,
@@ -222,6 +233,7 @@ impl DoryPrefillWorkspace {
         }
         let gemm = PrefillGemm::new()?;
         Ok(Self {
+            identity: workspace_identity(),
             capacity: rows,
             gemm,
             tokens: DeviceBuffer::zeroed(rows)?,
@@ -252,6 +264,7 @@ impl DoryPrefillWorkspace {
         let n = Self::attention_workspace_len(c, self.capacity, context);
         if n > self.partial.len() {
             self.partial = DeviceBuffer::zeroed(n)?;
+            self.identity = workspace_identity();
         }
         Ok(())
     }
