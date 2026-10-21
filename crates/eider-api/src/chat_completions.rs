@@ -72,7 +72,7 @@ pub struct ChatStreamOptions {
 impl ChatCompletionRequest {
     /// Converts a Chat Completions request into the shared runtime contract.
     pub fn into_chat_request(self, defaults: &GenerationConfig) -> Result<ChatRequest, ApiError> {
-        if self.parallel_tool_calls == Some(true) {
+        if self.parallel_tool_calls == Some(true) && !defaults.supports_parallel_tool_calls {
             return Err(ApiError::invalid(
                 "parallel_tool_calls",
                 "parallel tool calls are not supported",
@@ -167,6 +167,9 @@ impl ChatCompletionRequest {
         }
 
         Ok(ChatRequest {
+            parallel_tool_calls: self
+                .parallel_tool_calls
+                .unwrap_or(defaults.supports_parallel_tool_calls),
             messages,
             tools,
             template,
@@ -185,7 +188,8 @@ fn parse_message(value: &Value) -> Result<ChatMessage, ApiError> {
     let role = required_string(value, "role", "messages")?;
     let content = parse_content(value.get("content"))?;
     match role.as_str() {
-        "developer" | "system" => Ok(ChatMessage::system(content.unwrap_or_default())),
+        "system" => Ok(ChatMessage::system(content.unwrap_or_default())),
+        "developer" => Ok(ChatMessage::developer(content.unwrap_or_default())),
         "user" => Ok(ChatMessage::user(content.unwrap_or_default())),
         "tool" => Ok(ChatMessage::tool(
             required_string(value, "tool_call_id", "messages")?,
@@ -699,6 +703,28 @@ mod tests {
         assert_eq!(overridden.generation.sampling.temperature, 0.7);
         assert_eq!(overridden.generation.sampling.top_k, 20);
         assert_eq!(overridden.generation.sampling.top_p, 0.8);
+    }
+
+    #[test]
+    fn parallel_tool_policy_follows_runtime_capability_and_request() {
+        let defaults = GenerationConfig {
+            supports_parallel_tool_calls: true,
+            ..defaults()
+        };
+        for (setting, expected) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"eider-flint", "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":setting
+            }))
+            .unwrap();
+            assert_eq!(
+                request
+                    .into_chat_request(&defaults)
+                    .unwrap()
+                    .parallel_tool_calls,
+                expected
+            );
+        }
     }
 
     #[test]

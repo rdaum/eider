@@ -12,6 +12,15 @@
       },
       "models": [
         {
+          "id": "eider-flint",
+          "name": "Recursive Flint NVFP4",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
           "id": "eider-dory1.0-4b",
           "name": "Dory 1.0 4B NVFP4",
           "reasoning": true,
@@ -308,6 +317,15 @@
         "supportsDeveloperRole": false
       },
       "models": [
+        {
+          "id": "eider-flint",
+          "name": "Recursive Flint NVFP4",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
         {
           "id": "eider-dory1.0-4b",
           "name": "Dory 1.0 4B NVFP4",

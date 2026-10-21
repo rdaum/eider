@@ -19,6 +19,9 @@ pub use kernels::dory::{
 };
 pub use kernels::ggml_blocks::{GgmlGemmWorkspace, GgmlWeights};
 pub use kernels::lilicorr;
+pub use kernels::sink_attention::{
+    SinkAttentionCache, SinkAttentionDecodeBatch, SinkAttentionWorkspace,
+};
 
 mod bitnet;
 mod cublaslt;

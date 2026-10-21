@@ -312,6 +312,7 @@ second column.
 
 | Catalogue ID | API model | Runtime path |
 | --- | --- | --- |
+| [`flint-nvfp4`](docs/flint.md) | `eider-flint` | W4A16 GGUF, learned sinks, shared BF16 prefixes, packed decode, CUDA graphs, and native tool calls |
 | [`dory1.0-4b-nvfp4`](docs/dory.md) | `eider-dory1.0-4b` | Looped nGPT, native NVFP4, BF16 KV, decode graphs, and selected-label decisions |
 | [`lfm2.5-24b-a2b-nvfp4`](docs/lfm2.md) | `eider-lfm2.5-24b-a2b` | NVFP4 experts, gated short convolution, GQA, and LFM tool calls |
 | [`qwen3.8-flash-next`](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4) | `eider-qwen3.8-flash-next` | 125B/6B-active MoE, native QSA and GDN, NVMe-paged BF16 n-gram table, 262K text context |

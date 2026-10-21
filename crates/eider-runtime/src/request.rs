@@ -6,6 +6,8 @@ use crate::scheduler::RequestConfig;
 /// Complete structured input for one chat generation request.
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
+    /// Whether a turn can return more than one tool call.
+    pub parallel_tool_calls: bool,
     /// Conversation history rendered by the checkpoint template.
     pub messages: Vec<ChatMessage>,
     /// Function tools available for the next assistant turn.
@@ -22,6 +24,7 @@ impl ChatRequest {
     /// Creates a request with default template controls and no tools or text stops.
     pub fn new(messages: Vec<ChatMessage>, generation: RequestConfig) -> Self {
         Self {
+            parallel_tool_calls: false,
             messages,
             tools: Vec::new(),
             template: ChatTemplateOptions::default(),

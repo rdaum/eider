@@ -4361,7 +4361,7 @@ fn validate_rope_neox_f32(
     Ok(())
 }
 
-/// Enqueues one-position Neox RoPE using a device-resident position scalar.
+/// Enqueues one-position Neox RoPE for an active row prefix using a device scalar.
 pub fn rope_neox_f32_indexed_into_on_stream(
     rows: usize,
     head_dim: usize,
@@ -4371,7 +4371,33 @@ pub fn rope_neox_f32_indexed_into_on_stream(
     theta: f32,
     stream: &CudaStream,
 ) -> Result<()> {
-    validate_rope_neox_f32(rows, head_dim, input, &output, None, theta)?;
+    let len = rows.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "indexed RoPE dimensions",
+        expected: "rows * head_dim without overflow".to_string(),
+        actual: format!("rows={rows} head_dim={head_dim}"),
+    })?;
+    if rows == 0
+        || rows > u32::MAX as usize
+        || head_dim == 0
+        || head_dim > u32::MAX as usize
+        || !head_dim.is_multiple_of(2)
+        || input.len() < len
+        || output.len() < len
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "indexed RoPE buffers",
+            expected: format!(
+                "positive u32 dimensions, even head_dim, positive theta, buffers >= {len}"
+            ),
+            actual: format!(
+                "rows={rows} head_dim={head_dim} theta={theta} input={} output={}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
     if position.len() != 1 {
         return Err(Error::Shape {
             label: "RoPE indexed position",
@@ -18205,6 +18231,41 @@ mod tests {
                 "RoPE mismatch at {idx}: actual={actual} expected={expected} error={error}"
             );
         }
+    }
+
+    #[serial]
+    #[test]
+    fn indexed_rope_preserves_the_unused_prefill_workspace_tail() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let input = DeviceBuffer::from_host(&[0.25f32; 4 * 128]).unwrap();
+        let mut output = DeviceBuffer::from_host(&[-7.0f32; 4 * 128]).unwrap();
+        let mut reference = DeviceBuffer::zeroed(4 * 128).unwrap();
+        let position = DeviceBuffer::from_host(&[513u32]).unwrap();
+        rope_neox_f32_indexed_into_on_stream(
+            2,
+            128,
+            &input,
+            output.output(),
+            &position,
+            10_000.0,
+            &stream,
+        )
+        .unwrap();
+        rope_neox_sequence_f32_into_on_stream(
+            1,
+            2,
+            128,
+            &input,
+            reference.output(),
+            513,
+            10_000.0,
+            &stream,
+        )
+        .unwrap();
+        let actual = output.copy_to_host(&stream).unwrap();
+        let expected = reference.copy_to_host(&stream).unwrap();
+        assert_eq!(&actual.as_slice()[..256], &expected.as_slice()[..256]);
+        assert!(actual.as_slice()[256..].iter().all(|&value| value == -7.0));
     }
 
     #[serial]

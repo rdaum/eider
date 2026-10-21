@@ -53,6 +53,8 @@ pub enum GgufValue {
     FloatArray(Vec<f64>),
     /// Small boolean array metadata.
     BoolArray(Vec<bool>),
+    /// Small string array metadata, including per-tensor precision names.
+    StringArray(Vec<String>),
 }
 
 impl GgufValue {
@@ -184,7 +186,9 @@ impl GgufIndex {
         for _ in 0..metadata_count {
             let key = read_string(&mut reader, path)?;
             let kind = read_u32(&mut reader, path)?;
-            if let Some(value) = read_metadata_value(&mut reader, path, kind)? {
+            if let Some(value) =
+                read_metadata_value(&mut reader, path, kind, key == "general.tensor_extra.name")?
+            {
                 metadata.insert(key, value);
             }
         }
@@ -323,6 +327,7 @@ fn read_metadata_value(
     reader: &mut BufReader<File>,
     path: &Path,
     kind: u32,
+    retain_strings: bool,
 ) -> Result<Option<GgufValue>> {
     Ok(match kind {
         TYPE_UINT8 => Some(GgufValue::Unsigned(u64::from(read_u8(reader, path)?))),
@@ -346,7 +351,8 @@ fn read_metadata_value(
         TYPE_ARRAY => {
             let element_kind = read_u32(reader, path)?;
             let count = read_u64(reader, path)?;
-            if count > MAX_RETAINED_ARRAY_VALUES || element_kind == TYPE_STRING {
+            if count > MAX_RETAINED_ARRAY_VALUES || (element_kind == TYPE_STRING && !retain_strings)
+            {
                 skip_array(reader, path, element_kind, count)?;
                 None
             } else {
@@ -444,7 +450,11 @@ fn read_small_array(
                 detail: "nested arrays are invalid".to_string(),
             });
         }
-        TYPE_STRING => unreachable!("string arrays are skipped"),
+        TYPE_STRING => GgufValue::StringArray(
+            (0..count)
+                .map(|_| read_string(reader, path))
+                .collect::<Result<_>>()?,
+        ),
         _ => {
             return Err(Error::Format {
                 label: "GGUF metadata array",

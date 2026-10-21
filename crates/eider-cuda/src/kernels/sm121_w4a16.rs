@@ -862,6 +862,7 @@ impl Sm121W4A16Linear {
     }
 
     /// Runs an active prefix of a dense row-major batch.
+    /// The native CUDA path uses the same reduction for one row and larger batches.
     pub fn run_batch_prefix_on_stream(
         &self,
         workspace: &Sm121W4A16LinearBatchWorkspace,
@@ -907,9 +908,9 @@ impl Sm121W4A16Linear {
             });
         }
         #[cfg(not(feature = "cuda-oxide"))]
-        if rows > 1 {
+        {
             let mut output = output;
-            return unsafe {
+            unsafe {
                 check_cuda(
                     "infer_sm121_w4a16_dense_batch_on_stream",
                     ffi::infer_sm121_w4a16_dense_batch_on_stream(
@@ -924,8 +925,9 @@ impl Sm121W4A16Linear {
                         stream.as_raw(),
                     ),
                 )
-            };
+            }
         }
+        #[cfg(feature = "cuda-oxide")]
         self.gate_up.launch(
             &workspace.indices,
             input,
@@ -1095,7 +1097,90 @@ fn read_f32(reader: &mut impl Read) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bf16_linear_logits_f32_batch_into_on_stream;
+    use crate::format::{bf16_to_f32, f32_to_bf16};
     use serial_test::serial;
+
+    #[serial]
+    #[test]
+    fn dense_and_router_projections_are_batch_invariant() -> Result<()> {
+        crate::set_cuda_device(0)?;
+        let (rows, cols, batch) = (64, 2048, 7);
+        let mut seed = 17u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            bf16_to_f32(f32_to_bf16((seed as i32 as f32) / i32::MAX as f32))
+        };
+        let input: Vec<_> = (0..batch * cols).map(|_| random()).collect();
+        let weights: Vec<_> = (0..rows * cols).map(|_| f32_to_bf16(random())).collect();
+        let host = ModelOptNvfp4Linear::quantize_bf16("test", rows, cols, &weights)?;
+        let decoded: Vec<_> = host
+            .dequantize_to_f32_col_major()
+            .into_iter()
+            .map(|v| bf16_to_f32(f32_to_bf16(v * host.weight_scale_2)))
+            .collect();
+        let linear = Sm121W4A16Linear::new(&host)?;
+        let workspace = Sm121W4A16LinearBatchWorkspace::new(batch, cols)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let x = DeviceBuffer::from_host(&input)?;
+        let router = DeviceBuffer::from_host(&weights)?;
+        let mut y = DeviceBuffer::zeroed(batch * rows)?;
+        let mut scores = DeviceBuffer::zeroed(batch * rows)?;
+        linear.run_batch_prefix_on_stream(&workspace, &x, y.output(), batch, &stream)?;
+        bf16_linear_logits_f32_batch_into_on_stream(
+            &x,
+            &router,
+            scores.output(),
+            batch,
+            rows,
+            cols,
+            &stream,
+        )?;
+        let actual = y.copy_to_host(&stream)?;
+        let actual_scores = scores.copy_to_host(&stream)?;
+        for b in 0..batch {
+            let row = DeviceBuffer::from_host(&input[b * cols..(b + 1) * cols])?;
+            let mut single = DeviceBuffer::zeroed(rows)?;
+            linear.run_batch_prefix_on_stream(&workspace, &row, single.output(), 1, &stream)?;
+            assert_eq!(
+                &actual.as_slice()[b * rows..(b + 1) * rows],
+                single.copy_to_host(&stream)?.as_slice()
+            );
+            bf16_linear_logits_f32_batch_into_on_stream(
+                &row,
+                &router,
+                single.output(),
+                1,
+                rows,
+                cols,
+                &stream,
+            )?;
+            assert_eq!(
+                &actual_scores.as_slice()[b * rows..(b + 1) * rows],
+                single.copy_to_host(&stream)?.as_slice()
+            );
+            for r in 0..rows {
+                let expected = (0..cols)
+                    .map(|k| f64::from(input[b * cols + k]) * f64::from(decoded[r * cols + k]))
+                    .sum::<f64>();
+                assert!(
+                    (f64::from(actual.as_slice()[b * rows + r]) - expected).abs()
+                        < 0.004 * expected.abs().max(1.0)
+                );
+                let expected = (0..cols)
+                    .map(|k| {
+                        f64::from(input[b * cols + k])
+                            * f64::from(bf16_to_f32(weights[r * cols + k]))
+                    })
+                    .sum::<f64>();
+                assert!(
+                    (f64::from(actual_scores.as_slice()[b * rows + r]) - expected).abs()
+                        < 1e-5 * expected.abs().max(1.0)
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[serial]
     #[test]

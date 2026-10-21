@@ -8,6 +8,7 @@ use crate::execution::bitnet_serving::BitNetChatService;
 use crate::execution::bonsai_serving::BonsaiChatService;
 use crate::execution::deepseek4_serving::Deepseek4ChatService;
 use crate::execution::dory_serving::DoryChatService;
+use crate::execution::flint_serving::FlintChatService;
 use crate::execution::gemma4_serving::Gemma4ChatService;
 use crate::execution::laguna_serving::LagunaChatService;
 use crate::execution::lfm2_serving::Lfm2ChatService;
@@ -17,6 +18,7 @@ use crate::execution::nemotron3_serving::Nemotron3ChatService;
 use crate::execution::qwen38_flash_next_serving::Qwen38FlashNextChatService;
 use crate::execution::serving::Qwen36ChatService;
 use crate::execution::step37_serving::Step37ChatService;
+use crate::flint::FlintModel;
 use crate::gemma4::Gemma4Model;
 use crate::laguna::LagunaModel;
 use crate::lfm2::Lfm2Model;
@@ -38,6 +40,8 @@ use tracing::info;
 /// Supported checkpoint execution family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointArchitecture {
+    /// Recursive Flint.
+    Flint,
     /// Dory normalized looped transformer.
     Dory,
     /// Liquid LFM2 MoE.
@@ -93,6 +97,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
         return Ok(CheckpointArchitecture::Nemotron3);
     }
     match config.model_type.as_str() {
+        "flint" => Ok(CheckpointArchitecture::Flint),
         "dory" => Ok(CheckpointArchitecture::Dory),
         "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
@@ -167,6 +172,15 @@ pub fn with_loaded_engine<R>(
     };
     let defaults = GenerationConfig::from_model_dir(&model_dir)?;
     match architecture {
+        CheckpointArchitecture::Flint => {
+            let defaults = GenerationConfig {
+                supports_parallel_tool_calls: true,
+                ..defaults
+            };
+            let model = FlintModel::load(&model_dir.join("flint-nvfp4.gguf"))?;
+            let mut service = FlintChatService::new(&model, &template, scheduler, sequence_cache)?;
+            Ok(run(&mut service, defaults))
+        }
         CheckpointArchitecture::Dory => {
             let model = DoryModel::load(&model_dir, dory_loops)?;
             let scheduler = SchedulerConfig {

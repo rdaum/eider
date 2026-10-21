@@ -40,6 +40,8 @@ pub mod lfm2;
 
 /// Ternary Bonsai dense Qwen3 model loading and inference.
 pub mod bonsai;
+/// Recursive Flint NVFP4 model loading and inference.
+pub mod flint;
 
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;

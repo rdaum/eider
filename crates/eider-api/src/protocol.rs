@@ -122,7 +122,7 @@ impl ApiError {
 impl ResponseRequest {
     /// Converts a Responses request into the runtime's complete chat contract.
     pub fn into_chat_request(self, defaults: &GenerationConfig) -> Result<ChatRequest, ApiError> {
-        if self.parallel_tool_calls == Some(true) {
+        if self.parallel_tool_calls == Some(true) && !defaults.supports_parallel_tool_calls {
             return Err(ApiError::invalid(
                 "parallel_tool_calls",
                 "parallel tool calls are not supported",
@@ -213,6 +213,9 @@ impl ResponseRequest {
         }
 
         Ok(ChatRequest {
+            parallel_tool_calls: self
+                .parallel_tool_calls
+                .unwrap_or(defaults.supports_parallel_tool_calls),
             messages,
             tools,
             template,
@@ -390,7 +393,8 @@ fn flush_assistant_message(messages: &mut Vec<ChatMessage>, assistant: &mut Opti
 
 fn parse_message(value: &Value) -> Result<ChatMessage, ApiError> {
     let role = match required_string(value, "role", "input")?.as_str() {
-        "developer" | "system" => ChatRole::System,
+        "system" => ChatRole::System,
+        "developer" => ChatRole::Developer,
         "user" => ChatRole::User,
         "assistant" => ChatRole::Assistant,
         "tool" => ChatRole::Tool,
@@ -408,6 +412,7 @@ fn parse_message(value: &Value) -> Result<ChatMessage, ApiError> {
     }
     Ok(match role {
         ChatRole::System => ChatMessage::system(content),
+        ChatRole::Developer => ChatMessage::developer(content),
         ChatRole::User => ChatMessage::user(content),
         ChatRole::Assistant => ChatMessage::assistant(content),
         ChatRole::Tool => unreachable!(),
@@ -520,6 +525,7 @@ pub struct InferenceFinished {
 
 /// Per-response event builder and non-streaming accumulator.
 pub struct ResponseStream {
+    parallel_tool_calls: bool,
     response_id: String,
     model: String,
     created_at: u64,
@@ -542,8 +548,9 @@ struct TextItem {
 }
 
 impl ResponseStream {
-    pub fn new(model: impl Into<String>) -> Self {
+    pub fn new(model: impl Into<String>, parallel_tool_calls: bool) -> Self {
         Self {
+            parallel_tool_calls,
             response_id: next_id("resp", &NEXT_RESPONSE_ID),
             model: model.into(),
             created_at: SystemTime::now()
@@ -839,7 +846,7 @@ impl ResponseStream {
             "max_output_tokens": null,
             "model": self.model,
             "output": self.output,
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": self.parallel_tool_calls,
             "previous_response_id": null,
             "reasoning": null,
             "store": false,
@@ -927,6 +934,31 @@ mod tests {
         GenerationConfig {
             max_new_tokens: 64,
             ..GenerationConfig::default()
+        }
+    }
+
+    #[test]
+    fn parallel_tool_policy_follows_runtime_capability_and_request() {
+        let defaults = GenerationConfig {
+            supports_parallel_tool_calls: true,
+            ..defaults()
+        };
+        for (setting, expected) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let request: ResponseRequest = serde_json::from_value(json!({
+                "model":"eider-flint", "input":"hello", "parallel_tool_calls":setting
+            }))
+            .unwrap();
+            assert_eq!(
+                request
+                    .into_chat_request(&defaults)
+                    .unwrap()
+                    .parallel_tool_calls,
+                expected
+            );
+            assert_eq!(
+                ResponseStream::new("eider-flint", expected).created()["response"]["parallel_tool_calls"],
+                json!(expected)
+            );
         }
     }
 
@@ -1043,7 +1075,7 @@ mod tests {
             "max_output_tokens": 12
         })).unwrap();
         let chat = request.into_chat_request(&defaults()).unwrap();
-        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages.len(), 5);
         assert_eq!(chat.tools.len(), 1);
         assert_eq!(chat.generation.max_new_tokens, 12);
         assert_eq!(chat.generation.sampling.temperature, 0.7);
@@ -1062,10 +1094,12 @@ mod tests {
                 .content
                 .as_deref()
                 .unwrap()
-                .contains("be concise\n\nrules")
+                .contains("be concise")
         );
-        assert_eq!(chat.messages[2].tool_calls[0].id, "call_1");
-        assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(chat.messages[1].role, ChatRole::Developer);
+        assert_eq!(chat.messages[1].content.as_deref(), Some("rules"));
+        assert_eq!(chat.messages[3].tool_calls[0].id, "call_1");
+        assert_eq!(chat.messages[4].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
@@ -1169,7 +1203,7 @@ mod tests {
 
     #[test]
     fn response_events_follow_text_and_tool_lifecycle() {
-        let mut stream = ResponseStream::new("eider");
+        let mut stream = ResponseStream::new("eider", false);
         assert_eq!(stream.created()["type"], "response.created");
         let text = stream.push(InferenceEvent::Output(ChatOutputEvent::Text("hi".into())));
         assert_eq!(text.len(), 3);
@@ -1211,7 +1245,7 @@ mod tests {
 
     #[test]
     fn response_events_stream_reasoning_before_visible_text() {
-        let mut stream = ResponseStream::new("eider");
+        let mut stream = ResponseStream::new("eider", false);
         let started = stream.push(InferenceEvent::Output(ChatOutputEvent::Reasoning(
             "checking".into(),
         )));

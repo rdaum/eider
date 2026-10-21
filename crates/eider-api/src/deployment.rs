@@ -20,6 +20,7 @@ const MUSE_DFLASH_REVISION: &str = "93769bc7ab5ad1e9cd22d857e3138cf5d977ae81";
 const MUSE_DFLASH_FILE: &str = "dflash-kquant.gguf";
 const QWEN38_DFLASH2_REPOSITORY: &str = "z-lab/Qwen3.8-27B-DFlash2";
 const QWEN38_DFLASH2_REVISION: &str = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4";
+const FLINT_TOKENIZER_REVISION: &str = "2a247be0c0aec895ccb0ac7ca92229ec6df37288";
 
 /// A reviewed model available through the `eider-serve` catalogue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,10 +57,28 @@ fn default_speculative_drafts(model_type: &str) -> usize {
 }
 
 fn default_max_active_sequences(model_type: &str) -> usize {
-    if model_type == "gemma4" { 4 } else { 8 }
+    match model_type {
+        "flint" => 1,
+        "gemma4" => 4,
+        _ => 8,
+    }
 }
 
 const CATALOGUE: &[ModelSpec] = &[
+    ModelSpec {
+        id: "flint-nvfp4",
+        repository: "RecursiveSI/flint-nvfp4-gguf",
+        revision: "6ec43e19b565fc8d560e2d04985d7724f20673bf",
+        model_type: "flint",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-flint",
+            max_context_tokens: 32_768,
+            prefill_token_capacity: 64,
+            step_expert_capacity: 240,
+        },
+    },
     ModelSpec {
         id: "dory1.0-4b-nvfp4",
         repository: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
@@ -328,6 +347,9 @@ pub fn catalogue_model(id: &str) -> Result<&'static ModelSpec, String> {
 pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<ResolvedModel, String> {
     server_metrics().model_resolutions.inc();
     let spec = catalogue_model(id)?;
+    if spec.model_type == "flint" {
+        return resolve_flint(spec, offline).await;
+    }
     let (owner, name) = split_id(spec.repository);
     let client =
         HFClient::new().map_err(|error| format!("configure Hugging Face client: {error}"))?;
@@ -425,6 +447,78 @@ async fn resolve_qwen38_dflash2(offline: bool) -> Result<PathBuf, String> {
         .map_err(|error| {
             format!("resolve {QWEN38_DFLASH2_REPOSITORY}@{QWEN38_DFLASH2_REVISION}: {error}")
         })
+}
+
+async fn resolve_flint(spec: &ModelSpec, offline: bool) -> Result<ResolvedModel, String> {
+    let client = HFClient::new().map_err(|e| format!("configure Hugging Face client: {e}"))?;
+    let (owner, name) = split_id(spec.repository);
+    let repository = client.model(owner, name);
+    let artifact_dir = artifact_dir(spec.repository, spec.revision, spec.artifact_kind)?;
+    if !offline {
+        preflight_download(&repository, spec, &artifact_dir).await?;
+    }
+    let gguf = repository
+        .download_file()
+        .filename("flint-nvfp4.gguf")
+        .revision(spec.revision)
+        .local_files_only(offline)
+        .send()
+        .await
+        .map_err(|e| format!("resolve Flint weights: {e}"))?;
+    let files = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ];
+    let metadata = client
+        .model("RecursiveSI", "flint")
+        .snapshot_download()
+        .revision(FLINT_TOKENIZER_REVISION)
+        .allow_patterns(files.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        .local_files_only(offline)
+        .send()
+        .await
+        .map_err(|e| format!("resolve Flint tokenizer and configuration: {e}"))?;
+    // Compose two immutable snapshots below the Eider cache. Never add files to
+    // either Hugging Face snapshot.
+    let checkpoint_dir = artifact_dir.join(format!("runtime-{FLINT_TOKENIZER_REVISION}"));
+    std::fs::create_dir_all(&checkpoint_dir)
+        .map_err(|e| format!("create Flint runtime directory: {e}"))?;
+    for (name, source) in files
+        .iter()
+        .map(|&name| (name, metadata.join(name)))
+        .chain(std::iter::once(("flint-nvfp4.gguf", gguf)))
+    {
+        let target = checkpoint_dir.join(name);
+        match std::os::unix::fs::symlink(&source, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read_link(&target).map_err(|e| e.to_string())? != source {
+                    return Err(format!(
+                        "Flint runtime link {} points at a different snapshot",
+                        target.display()
+                    ));
+                }
+            }
+            Err(error) => return Err(format!("link {}: {error}", target.display())),
+        }
+    }
+    validate_checkpoint(&checkpoint_dir, "flint")?;
+    validate_runtime_files(&checkpoint_dir, "flint")?;
+    info!(model = spec.id, checkpoint_dir = %checkpoint_dir.display(), "resolved catalogue model");
+    Ok(ResolvedModel {
+        checkpoint_dir,
+        artifact_dir,
+        dflash_gguf: None,
+        dflash2_dir: None,
+        identity: format!("{}@{}+{FLINT_TOKENIZER_REVISION}", spec.id, spec.revision),
+        defaults: spec.defaults,
+        default_max_active_sequences: 1,
+        default_speculative_drafts: 0,
+        preparation: ArtifactKind::None,
+    })
 }
 
 async fn resolve_muse_dflash(offline: bool) -> Result<PathBuf, String> {
@@ -561,6 +655,7 @@ fn required_snapshot_path(path: &str) -> bool {
             | "tokenizer_config.json"
             | "chat_template.jinja"
             | "model.safetensors.index.json"
+            | "flint-nvfp4.gguf"
     ) || path.ends_with(".safetensors")
 }
 
@@ -665,7 +760,8 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     let model_type = checkpoint_model_type(&checkpoint_dir)?;
     if !matches!(
         model_type.as_str(),
-        "bitnet"
+        "flint"
+            | "bitnet"
             | "dory"
             | "lfm2_moe"
             | "bailing_hybrid"
@@ -704,6 +800,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
+                "flint" => 64,
                 "dory" => 2_048,
                 "lfm2_moe" => 1_024,
                 "bailing_hybrid" => 4,
@@ -831,6 +928,11 @@ fn validate_runtime_files(checkpoint_dir: &Path, model_type: &str) -> Result<(),
         }
         return Ok(());
     }
+    if model_type == "flint" {
+        let path = checkpoint_dir.join("flint-nvfp4.gguf");
+        eider_inference::flint::FlintConfig::open(&path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     validate_weight_index(checkpoint_dir)?;
     let index_path = checkpoint_dir.join("model.safetensors.index.json");
     if !index_path.is_file() {
@@ -915,6 +1017,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
+
+    #[test]
+    fn catalogue_pins_flint_weights_and_tokenizer() {
+        let model = catalogue_model("flint-nvfp4").unwrap();
+        assert_eq!(model.model_type, "flint");
+        assert_eq!(model.repository, "RecursiveSI/flint-nvfp4-gguf");
+        assert_eq!(model.revision, "6ec43e19b565fc8d560e2d04985d7724f20673bf");
+        assert_eq!(
+            FLINT_TOKENIZER_REVISION,
+            "2a247be0c0aec895ccb0ac7ca92229ec6df37288"
+        );
+        assert_eq!(model.defaults.served_model_name, "eider-flint");
+        assert_eq!(model.defaults.max_context_tokens, 32_768);
+        assert_eq!(model.defaults.prefill_token_capacity, 64);
+        assert_eq!(default_max_active_sequences(model.model_type), 1);
+    }
 
     #[test]
     fn catalogue_includes_both_supported_gemma4_weight_formats() {
@@ -1079,6 +1197,7 @@ mod tests {
     fn preflight_counts_only_runtime_snapshot_files() {
         assert!(required_snapshot_path("model-00001-of-00002.safetensors"));
         assert!(required_snapshot_path("chat_template.jinja"));
+        assert!(required_snapshot_path("flint-nvfp4.gguf"));
         assert!(!required_snapshot_path("README.md"));
         assert!(!required_snapshot_path("modeling_gemma4.py"));
     }

@@ -633,6 +633,24 @@ fn main() {
         "nvcc failed to build LiLiCorr kernels"
     );
     archive_objects.push(lilicorr_object.as_str());
+    let sink_attention_object = format!("{out_dir}/sink_attention.o");
+    let status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "-arch=sm_121",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/sink_attention.cu",
+            "-o",
+            &sink_attention_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for sink attention");
+    assert!(status.success(), "nvcc failed to build sink attention");
+    archive_objects.push(sink_attention_object.as_str());
+    println!("cargo:rerun-if-changed=native/sink_attention.cu");
     if !cuda_oxide {
         archive_objects.push(qwen36_gdn_object.as_str());
         archive_objects.push(qwen38_object.as_str());

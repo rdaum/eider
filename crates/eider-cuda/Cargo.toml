@@ -212,3 +212,7 @@ harness = false
 [[bench]]
 name = "dory_norm"
 harness = false
+
+[[bench]]
+name = "flint_attention"
+harness = false

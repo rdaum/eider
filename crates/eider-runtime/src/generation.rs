@@ -11,6 +11,8 @@ use tokenizers::Tokenizer;
 /// Request-level generation policy independent of an HTTP API schema.
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
+    /// Whether the active runtime can return multiple tool calls in one turn.
+    pub supports_parallel_tool_calls: bool,
     /// Token selection policy.
     pub sampling: SamplingConfig,
     /// Maximum number of completion tokens.
@@ -26,6 +28,7 @@ pub struct GenerationConfig {
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
+            supports_parallel_tool_calls: false,
             sampling: SamplingConfig::default(),
             max_new_tokens: 64,
             eos_token_ids: BTreeSet::new(),

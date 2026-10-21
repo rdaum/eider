@@ -94,7 +94,7 @@ pub struct ChatOutputCodec<'tokenizer> {
     decode_stream: TokenizerDecodeStream<'tokenizer>,
     parser: ChatOutputParser,
     gemma_special_tokens: Option<GemmaSpecialTokens>,
-    lfm_special_tokens: Vec<(u32, &'static str)>,
+    protocol_special_tokens: Vec<(u32, &'static str)>,
     muse_special_tokens: Option<MuseSpecialTokens>,
     muse_header: Option<String>,
     finished: bool,
@@ -164,12 +164,20 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             .map(|_| "assistant".to_string());
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
-            lfm_special_tokens: if tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).is_some() {
+            protocol_special_tokens: if tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).is_some()
+                || tokenizer.token_to_id("<arg_key>").is_some()
+            {
                 [
                     LFM_TOOL_CALL_OPEN,
                     LFM_TOOL_CALL_CLOSE,
                     "<think>",
                     THINK_CLOSE,
+                    TOOL_CALL_OPEN,
+                    TOOL_CALL_CLOSE,
+                    "<arg_key>",
+                    "</arg_key>",
+                    "<arg_value>",
+                    "</arg_value>",
                 ]
                 .into_iter()
                 .filter_map(|marker| tokenizer.token_to_id(marker).map(|id| (id, marker)))
@@ -194,7 +202,7 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             });
         }
         if let Some((_, marker)) = self
-            .lfm_special_tokens
+            .protocol_special_tokens
             .iter()
             .find(|(id, _)| *id == token_id)
         {
@@ -569,14 +577,18 @@ impl ChatOutputParser {
         .into_iter()
         .filter_map(|(open, protocol)| self.pending.find(open).map(|index| (index, open, protocol)))
         .min_by_key(|(index, _, _)| *index);
-        let channel_marker = [(GEMMA_CHANNEL_OPEN, true), (GEMMA_THINK_CLOSE, false)]
-            .into_iter()
-            .filter_map(|(marker, opens_channel)| {
-                self.pending
-                    .find(marker)
-                    .map(|index| (index, marker, opens_channel))
-            })
-            .min_by_key(|(index, _, _)| *index);
+        let channel_marker = [
+            (GEMMA_CHANNEL_OPEN, true),
+            (GEMMA_THINK_CLOSE, false),
+            ("<think>", true),
+        ]
+        .into_iter()
+        .filter_map(|(marker, opens_channel)| {
+            self.pending
+                .find(marker)
+                .map(|index| (index, marker, opens_channel))
+        })
+        .min_by_key(|(index, _, _)| *index);
         if let Some((index, marker, opens_channel)) = channel_marker.filter(|(index, _, _)| {
             protocol_open
                 .as_ref()
@@ -590,7 +602,7 @@ impl ChatOutputParser {
             self.pending.drain(..index + marker.len());
             if opens_channel {
                 self.mode = OutputMode::Reasoning;
-                self.gemma_channel_header_pending = true;
+                self.gemma_channel_header_pending = marker == GEMMA_CHANNEL_OPEN;
             } else {
                 self.trim_after_thinking = true;
             }
@@ -629,6 +641,7 @@ impl ChatOutputParser {
                 ATEM_TOOL_CALLS_OPEN,
                 GEMMA_CHANNEL_OPEN,
                 GEMMA_THINK_CLOSE,
+                "<think>",
             ]
             .into_iter()
             .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
@@ -1356,7 +1369,7 @@ fn parse_poolside_function_call(
             label: "chat tool call",
             detail: format!("unterminated Poolside value for {parameter:?}"),
         })?;
-        let raw_value = strip_protocol_newlines(&value[..value_end]);
+        let raw_value = &value[..value_end];
         if arguments
             .insert(
                 parameter.to_string(),
@@ -1759,6 +1772,99 @@ mod tests {
                 },
             })]
         );
+    }
+
+    #[test]
+    fn flint_parallel_calls_preserve_literal_whitespace_at_every_boundary() {
+        let text = concat!(
+            "<think>Use both tools.</think>",
+            "<tool_call>write_file<arg_key>path</arg_key><arg_value>a</arg_value>",
+            "<arg_key>contents</arg_key><arg_value>\n  x\n</arg_value></tool_call>",
+            "<tool_call>bash<arg_key>command</arg_key><arg_value>true</arg_value>",
+            "<arg_key>options</arg_key><arg_value>{\"env\":{\"x\":[1,false]}}</arg_value></tool_call>"
+        );
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&dsml_tools(), false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|e| match e {
+                        ChatOutputEvent::Reasoning(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "Use both tools."
+            );
+            let calls = events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatOutputEvent::ToolCall(c) => Some(c),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2, "split {split}");
+            assert_eq!(calls[0].function.arguments["contents"], json!("\n  x\n"));
+            assert_eq!(calls[1].function.arguments["command"], json!("true"));
+            assert_eq!(
+                calls[1].function.arguments["options"],
+                json!({"env":{"x":[1,false]}})
+            );
+        }
+    }
+
+    #[test]
+    fn flint_codec_preserves_special_argument_and_reasoning_markers() {
+        let mut tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let markers = [
+            "<think>",
+            THINK_CLOSE,
+            TOOL_CALL_OPEN,
+            TOOL_CALL_CLOSE,
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+        ];
+        for marker in markers {
+            tokenizer.add_special_tokens(&[tokenizers::AddedToken::from(marker, true)]);
+        }
+        let mut codec = ChatOutputCodec::new(&tokenizer, &tools(), false).unwrap();
+        codec
+            .push_token(tokenizer.token_to_id("<think>").unwrap())
+            .unwrap();
+        assert!(codec.is_reasoning());
+        codec
+            .push_token(tokenizer.token_to_id(THINK_CLOSE).unwrap())
+            .unwrap();
+        assert!(!codec.is_reasoning());
+        codec
+            .push_token(tokenizer.token_to_id(TOOL_CALL_OPEN).unwrap())
+            .unwrap();
+        codec.parser.push_text("write_file").unwrap();
+        codec
+            .push_token(tokenizer.token_to_id("<arg_key>").unwrap())
+            .unwrap();
+        codec.parser.push_text("contents").unwrap();
+        codec
+            .push_token(tokenizer.token_to_id("</arg_key>").unwrap())
+            .unwrap();
+        codec
+            .push_token(tokenizer.token_to_id("<arg_value>").unwrap())
+            .unwrap();
+        codec.parser.push_text("\n x\n").unwrap();
+        codec
+            .push_token(tokenizer.token_to_id("</arg_value>").unwrap())
+            .unwrap();
+        let events = codec
+            .push_token(tokenizer.token_to_id(TOOL_CALL_CLOSE).unwrap())
+            .unwrap();
+        let ChatOutputEvent::ToolCall(call) = &events[0] else {
+            panic!("expected tool call")
+        };
+        assert_eq!(call.function.arguments["contents"], json!("\n x\n"));
     }
 
     fn parse_chunks(chunks: &[&str]) -> Vec<ChatOutputEvent> {

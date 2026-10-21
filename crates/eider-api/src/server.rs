@@ -190,7 +190,7 @@ async fn models(
             "apply_patch_tool_type": null,
             "web_search_tool_type": "text",
             "truncation_policy": {"mode": "tokens", "limit": context_window},
-            "supports_parallel_tool_calls": false,
+            "supports_parallel_tool_calls": state.actor.generation_defaults().supports_parallel_tool_calls,
             "supports_image_detail_original": false,
             "context_window": context_window,
             "max_context_window": context_window,
@@ -242,6 +242,7 @@ async fn responses(
                 .inc(ServerEndpoint::Responses);
             ApiFailure::bad_request(e)
         })?;
+    let parallel_tool_calls = chat.parallel_tool_calls;
     let response = state.actor.submit(chat).map_err(|e| {
         server_metrics()
             .request_errors
@@ -255,7 +256,7 @@ async fn responses(
         } else {
             StreamingMode::NonStream
         });
-    let stream = ResponseStream::new(model);
+    let stream = ResponseStream::new(model, parallel_tool_calls);
 
     if stream_requested {
         return Ok(streaming_response(

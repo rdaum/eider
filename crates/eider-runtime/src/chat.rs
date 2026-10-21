@@ -20,6 +20,8 @@ const TEMPLATE_NAME: &str = "chat_template";
 pub enum ChatRole {
     /// Instructions that apply to the whole conversation.
     System,
+    /// Application instructions, distinct from system messages where supported.
+    Developer,
     /// Input supplied by the user.
     User,
     /// Text or tool calls previously produced by the model.
@@ -90,6 +92,11 @@ impl ChatMessage {
     /// Creates a user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self::text(ChatRole::User, content)
+    }
+
+    /// Creates an application instruction message.
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self::text(ChatRole::Developer, content)
     }
 
     /// Creates an assistant text message.
@@ -211,6 +218,7 @@ pub struct CheckpointChatTemplate {
     template_path: PathBuf,
     bos_token: String,
     eos_token: String,
+    native_developer_role: bool,
 }
 
 impl CheckpointChatTemplate {
@@ -252,12 +260,14 @@ impl CheckpointChatTemplate {
             .ok()
             .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
             .unwrap_or(Value::Null);
+        let native_developer_role = tokenizer.token_to_id("<|developer|>").is_some();
         Ok(Self {
             environment,
             tokenizer,
             template_path,
             bos_token: special_token_content(&tokenizer_config["bos_token"]),
             eos_token: special_token_content(&tokenizer_config["eos_token"]),
+            native_developer_role,
         })
     }
 
@@ -278,6 +288,30 @@ impl CheckpointChatTemplate {
         tools: &[ChatTool],
         options: ChatTemplateOptions,
     ) -> Result<String> {
+        // Preserve the existing system-message mapping for checkpoints without
+        // a native developer marker. Flint retains its distinct role and order.
+        let mapped;
+        let messages = if !self.native_developer_role
+            && messages.iter().any(|m| m.role == ChatRole::Developer)
+        {
+            let mut instructions = Vec::new();
+            let mut conversation = Vec::new();
+            for message in messages {
+                if matches!(message.role, ChatRole::System | ChatRole::Developer) {
+                    if let Some(content) = &message.content {
+                        instructions.push(content.as_str());
+                    }
+                } else {
+                    conversation.push(message.clone());
+                }
+            }
+            mapped = std::iter::once(ChatMessage::system(instructions.join("\n\n")))
+                .chain(conversation)
+                .collect::<Vec<_>>();
+            &mapped
+        } else {
+            messages
+        };
         validate_chat(messages, tools)?;
         render_with_environment(
             &self.environment,
@@ -636,6 +670,39 @@ fn template_error(error: TemplateError) -> Error {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn developer_roles_are_native_or_merged_into_system_in_order() {
+        let mut template = CheckpointChatTemplate {
+            environment: build_environment(
+                "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}".into(),
+            )
+            .unwrap(),
+            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            template_path: PathBuf::new(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+            native_developer_role: true,
+        };
+        let messages = [
+            ChatMessage::system("system"),
+            ChatMessage::developer("developer"),
+            ChatMessage::user("question"),
+        ];
+        assert_eq!(
+            template
+                .render(&messages, &[], ChatTemplateOptions::default())
+                .unwrap(),
+            "[system:system][developer:developer][user:question]"
+        );
+        template.native_developer_role = false;
+        assert_eq!(
+            template
+                .render(&messages, &[], ChatTemplateOptions::default())
+                .unwrap(),
+            "[system:system\n\ndeveloper][user:question]"
+        );
+    }
 
     fn tool_definition() -> ChatTool {
         ChatTool::function(ChatFunctionDefinition {

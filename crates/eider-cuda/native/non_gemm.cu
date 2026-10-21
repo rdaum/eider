@@ -8448,7 +8448,8 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_batch_on_stream(
         return cudaErrorInvalidValue;
     }
     constexpr int kThreads = 256;
-    if (batch_size == 1 || (cols & 3u) != 0u) {
+    // Keep the reduction order independent of the active batch size.
+    if ((cols & 3u) != 0u) {
         const std::size_t shmem =
             kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
         const cudaError_t shared_memory_status = cudaFuncSetAttribute(
