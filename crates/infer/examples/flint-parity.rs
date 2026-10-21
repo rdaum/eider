@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         });
     let mut cache = model.new_sequence_cache(3, tokens.len() + 3, 0)?;
     let mut reference = model.admit(&mut cache, tokens.len() + 3, &[])?.unwrap();
-    let mut work = model.new_workspace(64.min(tokens.len() + 3), tokens.len() + 3)?;
+    let mut work = model.new_workspace(256.min(tokens.len() + 3), tokens.len() + 3)?;
     let started = Instant::now();
     for &token in &tokens {
         model.forward(&mut work, &mut reference, &mut cache, &[token])?;
@@ -83,7 +83,8 @@ fn main() -> anyhow::Result<()> {
         model.forward(&mut work, &mut reference, &mut cache, &[token])?;
     }
     let continued = model.logits(&reference)?;
-    for chunk in [7, 64] {
+    // Cross the sorted-route threshold and page boundary with partial chunks.
+    for chunk in [7, 63, 64, 128, 129, 256] {
         let mut sequence = model.admit(&mut cache, tokens.len() + 3, &[])?.unwrap();
         let started = Instant::now();
         for tokens in tokens.chunks(chunk) {

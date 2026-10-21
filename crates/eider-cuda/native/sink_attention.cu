@@ -57,6 +57,95 @@ __global__ void partial_attention(
     if(lane==0) { dst[128]=mx; dst[129]=total; }
 }
 
+// Reuse each KV tile across 16 prompt queries. Every query retains the decode
+// kernel's 256-key partitions, lane dot products, and sequential online softmax.
+template <bool Paged>
+__global__ void prefill_attention(
+    const float* q, const __nv_bfloat16* ck, const __nv_bfloat16* cv,
+    const float* k, const float* v, float* partial, uint32_t end,
+    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity,
+    uint32_t splits, const __nv_bfloat16* const* pages, uint32_t layer_offset,
+    uint32_t page_tokens, const uint32_t* position) {
+    constexpr unsigned Warps=8, Queries=2, QueryRows=Warps*Queries, Keys=32;
+    __shared__ float keys[Keys][128], values[Keys][128];
+    const unsigned lane=threadIdx.x%32, warp=threadIdx.x/32;
+    const unsigned head=blockIdx.x, first_query=blockIdx.y*QueryRows, part=blockIdx.z;
+    const unsigned kvhead=head/(qheads/kvheads);
+    if (position) end=position[0];
+    float query_value[Queries][4], acc[Queries][4]={};
+    float mx[Queries], total[Queries]={};
+    uint64_t begin[Queries], limit[Queries];
+    #pragma unroll
+    for(unsigned n=0;n<Queries;++n) {
+        const unsigned query=first_query+warp+n*Warps;
+        const uint64_t last=uint64_t(end)+query+1;
+        const uint64_t first=last>capacity ? last-capacity : 0;
+        begin[n]=first+part*256;
+        limit[n]=min(last,first+(part+1)*256);
+        mx[n]=-INFINITY;
+        #pragma unroll
+        for(unsigned c=0;c<4;++c)
+            query_value[n][c]=query<rows ? q[(size_t(query)*qheads+head)*128+lane+c*32] : 0.f;
+    }
+    const uint64_t first_last=uint64_t(end)+first_query+1;
+    const uint64_t first=first_last>capacity ? first_last-capacity : 0;
+    const uint64_t last=uint64_t(end)+min(first_query+QueryRows,rows);
+    const uint64_t last_first=last>capacity ? last-capacity : 0;
+    const uint64_t stop=min(last,last_first+(part+1)*256);
+    for(uint64_t tile=first+part*256;tile<stop;tile+=Keys) {
+        for(unsigned j=threadIdx.x;j<Keys*128;j+=blockDim.x) {
+            const uint64_t token=tile+j/128;
+            const unsigned col=j%128;
+            float key=0.f, value=0.f;
+            if(token<stop) {
+                const bool cached=token<end;
+                const size_t row=cached ? (Paged ? (token&127) : token%capacity) : token-end;
+                const size_t base=(row*kvheads+kvhead)*128+col;
+                if(cached) {
+                    const __nv_bfloat16* pk=Paged ? pages[token>>7]+layer_offset : ck;
+                    const __nv_bfloat16* pv=Paged ? pk+size_t(page_tokens)*kvheads*128 : cv;
+                    key=__bfloat162float(pk[base]); value=__bfloat162float(pv[base]);
+                } else { key=k[base]; value=v[base]; }
+            }
+            keys[j/128][col]=key; values[j/128][col]=value;
+        }
+        __syncthreads();
+        for(unsigned t=0;t<Keys && tile+t<stop;++t) {
+            float key[4], value[4];
+            #pragma unroll
+            for(unsigned c=0;c<4;++c) {
+                key[c]=keys[t][lane+c*32]; value[c]=values[t][lane+c*32];
+            }
+            #pragma unroll
+            for(unsigned n=0;n<Queries;++n) {
+                const unsigned query=first_query+warp+n*Warps;
+                if(query<rows && tile+t>=begin[n] && tile+t<limit[n]) {
+                    float dot=0.f;
+                    #pragma unroll
+                    for(unsigned c=0;c<4;++c) dot=fmaf(query_value[n][c],key[c],dot);
+                    dot=warp_sum(dot)*0.08838834764831845f;
+                    const float next=fmaxf(mx[n],dot), keep=expf(mx[n]-next), p=expf(dot-next);
+                    total[n]=total[n]*keep+p;
+                    #pragma unroll
+                    for(unsigned c=0;c<4;++c) acc[n][c]=acc[n][c]*keep+p*value[c];
+                    mx[n]=next;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(unsigned n=0;n<Queries;++n) {
+        const unsigned query=first_query+warp+n*Warps;
+        if(query<rows) {
+            float* dst=partial+((size_t(query)*qheads+head)*splits+part)*130;
+            #pragma unroll
+            for(unsigned c=0;c<4;++c) dst[lane+c*32]=acc[n][c];
+            if(lane==0) { dst[128]=mx[n]; dst[129]=total[n]; }
+        }
+    }
+}
+
 __global__ void merge_attention(const float* partial, const float* sinks, float* out,
                                  uint32_t splits, uint32_t qheads) {
     const uint32_t lane=threadIdx.x,row=blockIdx.x;
@@ -123,11 +212,17 @@ extern "C" cudaError_t infer_paged_sink_attention(
     uint32_t page_tokens, cudaStream_t stream) {
     if(page_tokens != 128) return cudaErrorInvalidValue;
     if(pages) {
-        partial_attention<true><<<dim3(qheads,rows,splits),32,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,pages,layer_offset,page_tokens,position);
+        if(rows>=64)
+            prefill_attention<true><<<dim3(qheads,(rows+15)/16,splits),256,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,pages,layer_offset,page_tokens,position);
+        else
+            partial_attention<true><<<dim3(qheads,rows,splits),32,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,pages,layer_offset,page_tokens,position);
         merge_attention<<<qheads*rows,32,0,stream>>>(partial,sinks,out,splits,qheads);
         append_kv<true><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,page_tokens,position);
     } else {
-        partial_attention<false><<<dim3(qheads,rows,splits),32,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,nullptr,0,0,position);
+        if(rows>=64)
+            prefill_attention<false><<<dim3(qheads,(rows+15)/16,splits),256,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,nullptr,0,0,position);
+        else
+            partial_attention<false><<<dim3(qheads,rows,splits),32,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,nullptr,0,0,position);
         merge_attention<<<qheads*rows,32,0,stream>>>(partial,sinks,out,splits,qheads);
         append_kv<false><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(k,v,ck,cv,end,rows,kvheads*128,capacity,nullptr,0,0,position);
     }

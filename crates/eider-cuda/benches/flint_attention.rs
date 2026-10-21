@@ -9,7 +9,12 @@ use micromeasure::{
 };
 use std::time::Duration;
 
-struct Attention<const ROWS: usize, const WINDOW: usize, const PAGED: bool = false> {
+struct Attention<
+    const ROWS: usize,
+    const WINDOW: usize,
+    const PAGED: bool = false,
+    const LOCAL: bool = false,
+> {
     _pages: Vec<DeviceBuffer<u16>>,
     table: DeviceBuffer<DeviceAddress<u16>>,
     position: DeviceBuffer<u32>,
@@ -24,18 +29,18 @@ struct Attention<const ROWS: usize, const WINDOW: usize, const PAGED: bool = fal
     sinks: DeviceBuffer<f32>,
     out: DeviceBuffer<f32>,
 }
-impl<const R: usize, const W: usize, const P: bool> Attention<R, W, P> {
+impl<const R: usize, const W: usize, const P: bool, const L: bool> Attention<R, W, P, L> {
     fn run(&mut self) {
-        if P {
+        if P || L {
             self.work
                 .run_paged(
-                    None,
+                    if L { Some(&mut self.cache) } else { None },
                     &self.table,
                     0,
                     128,
                     &self.position,
-                    W - R,
-                    W,
+                    if L { W } else { W - R },
+                    if L { W + R } else { W },
                     4,
                     &self.q,
                     &self.k,
@@ -62,11 +67,13 @@ impl<const R: usize, const W: usize, const P: bool> Attention<R, W, P> {
             .unwrap();
     }
 }
-impl<const R: usize, const W: usize, const P: bool> BenchContext for Attention<R, W, P> {
+impl<const R: usize, const W: usize, const P: bool, const L: bool> BenchContext
+    for Attention<R, W, P, L>
+{
     fn prepare(_: usize) -> Self {
         let mut page = vec![0u16; 2 * 128 * 4 * 128];
         page[128 * 4 * 128..].fill(0x3f80);
-        let pages = (0..W.div_ceil(128))
+        let pages = (0..(if L { W + R } else { W }).div_ceil(128))
             .map(|_| DeviceBuffer::from_host(&page).unwrap())
             .collect::<Vec<_>>();
         let mut s = Self {
@@ -78,9 +85,9 @@ impl<const R: usize, const W: usize, const P: bool> BenchContext for Attention<R
             )
             .unwrap(),
             _pages: pages,
-            position: DeviceBuffer::from_host(&[(W - R) as u32]).unwrap(),
+            position: DeviceBuffer::from_host(&[(if L { W } else { W - R }) as u32]).unwrap(),
             cache: SinkAttentionCache::new(W, 4).unwrap(),
-            work: SinkAttentionWorkspace::new(R, 32, W).unwrap(),
+            work: SinkAttentionWorkspace::new(R, 32, if L { W + R } else { W }).unwrap(),
             stream: CudaStream::new_non_blocking().unwrap(),
             start: CudaEvent::new().unwrap(),
             stop: CudaEvent::new().unwrap(),
@@ -91,8 +98,24 @@ impl<const R: usize, const W: usize, const P: bool> BenchContext for Attention<R
             out: DeviceBuffer::zeroed(R * 32 * 128).unwrap(),
         };
         for _ in 0..W.div_ceil(R) + 1 {
-            s.run();
+            if L {
+                s.work
+                    .run(
+                        &mut s.cache,
+                        &s.q,
+                        &s.k,
+                        &s.v,
+                        &s.sinks,
+                        &mut s.out,
+                        R,
+                        &s.stream,
+                    )
+                    .unwrap();
+            } else {
+                s.run();
+            }
         }
+        s.run();
         // All real-key logits are zero and exp(sink)=window. A global
         // prefill row sees only its causal prefix; a full ring sees W keys.
         let output = s.out.copy_to_host(&s.stream).unwrap();
@@ -112,8 +135,8 @@ impl<const R: usize, const W: usize, const P: bool> BenchContext for Attention<R
         None
     }
 }
-fn sample<const R: usize, const W: usize, const P: bool>(
-    s: &mut Attention<R, W, P>,
+fn sample<const R: usize, const W: usize, const P: bool, const L: bool>(
+    s: &mut Attention<R, W, P, L>,
     count: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -295,27 +318,39 @@ fn main() {
             });
             runner.group::<Attention<1, 4096, true>>("paged global decode", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<1, 4096, true>);
+                    .bench_sample("causal sink", sample::<1, 4096, true, false>);
             });
             runner.group::<Attention<64, 4096, true>>("paged global prefill", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<64, 4096, true>);
+                    .bench_sample("causal sink", sample::<64, 4096, true, false>);
+            });
+            runner.group::<Attention<256, 4096, true>>("paged global prefill 256 at 4K", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("causal sink", sample::<256, 4096, true, false>);
+            });
+            runner.group::<Attention<256, 8192, true>>("paged global prefill 256 at 8K", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("causal sink", sample::<256, 8192, true, false>);
+            });
+            runner.group::<Attention<256, 513, false, true>>("local serving prefill 256", |g| {
+                g.measurement_domain(MeasurementDomain::Gpu)
+                    .bench_sample("causal sink", sample::<256, 513, false, true>);
             });
             runner.group::<Attention<1, 513>>("local decode", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<1, 513, false>);
+                    .bench_sample("causal sink", sample::<1, 513, false, false>);
             });
             runner.group::<Attention<64, 513>>("local prefill", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<64, 513, false>);
+                    .bench_sample("causal sink", sample::<64, 513, false, false>);
             });
             runner.group::<Attention<1, 4096>>("global decode", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<1, 4096, false>);
+                    .bench_sample("causal sink", sample::<1, 4096, false, false>);
             });
             runner.group::<Attention<64, 4096>>("global prefill", |g| {
                 g.measurement_domain(MeasurementDomain::Gpu)
-                    .bench_sample("causal sink", sample::<64, 4096, false>);
+                    .bench_sample("causal sink", sample::<64, 4096, false, false>);
             });
         },
     );

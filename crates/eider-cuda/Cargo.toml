@@ -216,3 +216,7 @@ harness = false
 [[bench]]
 name = "flint_attention"
 harness = false
+
+[[bench]]
+name = "flint_routed_linear"
+harness = false

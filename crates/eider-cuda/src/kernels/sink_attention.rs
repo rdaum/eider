@@ -424,6 +424,7 @@ impl SinkAttentionWorkspace {
     pub fn device_bytes(&self) -> usize {
         self.partial.device_bytes()
     }
+    /// Reference path for checking and timing the serving prefill kernels.
     /// Appends a causal chunk after evaluating it against the previous KV ring.
     /// Inputs must contain BF16-valued Q/K/V in F32 storage.
     #[allow(clippy::too_many_arguments)]
@@ -643,7 +644,7 @@ mod tests {
         let kvheads = 2;
         let sinks = [-2.0, 0.0, 2.0, 8.0];
         let ds = DeviceBuffer::from_host(&sinks)?;
-        let total = 1057;
+        let total = 1313;
         let q: Vec<_> = (0..total * heads * 128)
             .map(|i| bf(((i * 17 % 113) as f32 - 56.0) / 80.0))
             .collect();
@@ -653,9 +654,9 @@ mod tests {
         let v: Vec<_> = (0..total * kvheads * 128)
             .map(|i| bf(((i * 7 % 83) as f32 - 41.0) / 50.0))
             .collect();
-        for capacity in [65, 513, 1057] {
+        for capacity in [65, 513, total] {
             let mut cache = SinkAttentionCache::new(capacity, kvheads)?;
-            let mut w = SinkAttentionWorkspace::new(129, heads, capacity)?;
+            let mut w = SinkAttentionWorkspace::new(256, heads, capacity)?;
             let pages = (0..total.div_ceil(128))
                 .map(|_| DeviceBuffer::<u16>::zeroed(2 * 128 * kvheads * 128 + 256))
                 .collect::<Result<Vec<_>>>()?;
@@ -668,11 +669,14 @@ mod tests {
             let mut local = (capacity < total)
                 .then(|| SinkAttentionCache::new(capacity, kvheads))
                 .transpose()?;
-            let mut paged = SinkAttentionWorkspace::new(129, heads, total)?;
+            let mut paged = SinkAttentionWorkspace::new(256, heads, total)?;
             let mut position = DeviceBuffer::zeroed(1)?;
             let mut start = 0;
+            let chunks = [1, 63, 64, 65, 129, 256];
+            let mut chunk_index = 0;
             while start < total {
-                let rows = (total - start).min(if start == 0 { 1 } else { 129 });
+                let rows = (total - start).min(chunks[chunk_index % chunks.len()]);
+                chunk_index += 1;
                 let dq =
                     DeviceBuffer::from_host(&q[start * heads * 128..(start + rows) * heads * 128])?;
                 let dk = DeviceBuffer::from_host(

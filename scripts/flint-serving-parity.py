@@ -65,9 +65,13 @@ def stream(base, api, prompt, **policy):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="http://127.0.0.1:18080")
+    parser.add_argument("--records", type=int, default=128,
+                        help="Number of inventory records in the cold prompt")
     args = parser.parse_args()
+    if args.records < 1:
+        parser.error("--records must be positive")
     prompt = ("Read these inventory records.\n" + "\n".join(
-        f"Record {i}: warehouse north, item bolts, count {i+10}." for i in range(128))
+        f"Record {i}: warehouse north, item bolts, count {i+10}." for i in range(args.records))
         + "\nExplain briefly why an inventory ledger helps a warehouse manager.")
     cold = stream(args.base, "chat/completions", prompt)
     warm = stream(args.base, "chat/completions", prompt)
@@ -110,9 +114,19 @@ def main():
     after_cancel = stream(args.base, "responses", prompt)
     assert after_cancel["output"] == cold["output"]
     assert after_cancel["cached_tokens"] > 0
+    # An appended tool-sized suffix exercises prefill after restoring a prefix.
+    extended = prompt + "\nAdditional records:\n" + "\n".join(
+        f"Record {i}: warehouse south, item nuts, count {i+20}." for i in range(64))
+    suffix = stream(args.base, "chat/completions", extended)
+    suffix_warm = stream(args.base, "responses", extended)
+    assert suffix["cached_tokens"] >= warm["cached_tokens"]
+    assert suffix["prompt_tokens"] > cold["prompt_tokens"]
+    assert suffix["output"] == suffix_warm["output"]
+    assert suffix_warm["cached_tokens"] >= suffix["cached_tokens"]
     results = {"cold": cold, "warm": warm, "responses": responses,
                "isolated_sampled": isolated_sampled, "concurrent_sampled": sampled,
-               "during_cancel": during_cancel, "after_cancel": after_cancel}
+               "during_cancel": during_cancel, "after_cancel": after_cancel,
+               "suffix": suffix, "suffix_warm": suffix_warm}
     print(json.dumps(results, indent=2))
 
 

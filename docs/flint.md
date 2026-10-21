@@ -25,7 +25,7 @@ scripts/run-pi-eider-flint.sh
 ```
 
 Both `/v1/responses` and `/v1/chat/completions` use the same Flint service.
-The defaults are 32,768 context tokens, 64 prefill tokens per chunk, and one active request.
+The defaults are 32,768 context tokens, 256 prefill tokens per chunk, and one active request.
 The checkpoint permits 262,144 context tokens. Larger limits increase the global KV reservation and attention scratch space. Global pages are populated as tokens arrive.
 
 The catalogue pins two sources:
@@ -51,11 +51,18 @@ The GGUF supplies explicit local-attention and RoPE patterns.
 Local layers retain 513 tokens, including the current token, and use RoPE with theta 10,000.
 Global layers do not use RoPE.
 Each head has a learned sink logit that contributes to the softmax denominator without a value vector.
+Serving prefill chunks of at least 64 rows share KV tiles across 16 queries.
+The tiled kernel preserves the reference dot products, 256-key partitions, and sequential softmax order.
+It uses 32 KiB of shared memory per block. It adds no persistent device storage.
+Decode and smaller chunks use the existing attention path.
 
 All 485 NVFP4 tensors declare `prec_a4=false`.
 Eider keeps activations at BF16 precision and rejects checkpoints that request A4 execution.
 The loader also validates tensor names, shapes, types, and per-expert scale counts.
 Dense projections use SM121 W4A16 tensor cores. Routed projections use the existing addressed W4A16 kernels.
+Prefill chunks with at least 64 tokens sort routes by expert and reuse each decoded weight across up to four routes.
+Gate, up, and down share one route ordering. Short chunks and decode keep the independent-route path.
+Both paths preserve the same FP32 reduction order and per-expert scale placement.
 
 The checkpoint template retains distinct system and developer roles.
 The output parser handles optional reasoning and multiple tool calls.
@@ -93,6 +100,7 @@ Unrestricted sampling uses the CPU reference. RNG and penalty counts belong to e
 | Shared prefix index, byte reservations, eviction | Implemented through `seqcache` |
 | Zero-copy global prefix pages | Implemented; local history uses bounded snapshots |
 | Chunked causal prefill and decode-first scheduling | Implemented |
+| Tiled prefill attention | Implemented for local rings and global pages; exact reference outputs checked |
 | CUDA decode graphs | Implemented; exact eager/graph replay checked |
 | GPU greedy and bounded sampling | Implemented; CPU decision parity checked |
 | Packed decode across active requests | Implemented; exact logits checked against isolated execution |
@@ -128,7 +136,7 @@ For the API comparison, start a fresh server with two active slots and two decod
 ```sh
 scripts/run-eider-flint.sh --offline --listen 127.0.0.1:18080 \
     --max-context-tokens 8192 --max-active-sequences 2 --decode-capacity 2
-python3 scripts/flint-serving-parity.py
+python3 scripts/flint-serving-parity.py --records 320
 ```
 
 The API check compares cold and warm requests, both streaming adapters, and isolated versus concurrent seeded sampling.
@@ -140,6 +148,7 @@ Run the sink-attention reference test and micromeasure separately:
 ```sh
 cargo test -p eider-cuda sink_attention -- --test-threads=1
 cargo bench -p eider-cuda --bench flint_attention
+cargo bench -p eider-cuda --bench flint_routed_linear
 ```
 
 Do not run these GPU checks while a model server uses the device.
@@ -257,6 +266,108 @@ With 16 warps for gate/up and four for down, decode time matched SIMT at approxi
 At 64 prompt rows, gate/up increased from 0.676 ms to 0.757 ms. Down decreased from 0.847 ms to 0.752 ms.
 These measurements repeatedly accessed seven experts and do not represent full-model memory traffic.
 The prototype was rejected and removed. The runtime retains the existing expert path.
+
+## Prefill weight reuse, 2026-10-21
+
+A CUDA trace of 4,169 prompt tokens attributed 58.8% of kernel time to routed experts.
+Global attention accounted for 18.2%, local attention for 8.8%, and dense projections for 10.0%.
+The trace used the committed runtime and 64-token chunks. Profiling overhead is not part of the HTTP measurements.
+
+The retained change uses the existing sorted-route W4A16 kernel. It introduces no new CUDA kernel or weight representation.
+Route ordering stays on the GPU, and the workspace owns its reusable storage.
+The projection benchmark includes sorting for each projection. The model sorts only once for gate, up, and down together.
+All benchmark outputs matched the independent-route kernel exactly. Selected outputs also passed an FP64 reference.
+
+| Prompt rows | Selected experts | Projection | Independent routes | Sorted weight reuse |
+| --- | ---: | --- | ---: | ---: |
+| 64 | 256 | Gate or up | 1.093 ms | 0.846 ms |
+| 64 | 256 | Down | 1.205 ms | 1.001 ms |
+| 64 | 32 | Gate or up | 0.702 ms | 0.366 ms |
+| 64 | 32 | Down | 0.883 ms | 0.546 ms |
+| 256 | 256 | Gate or up | 4.435 ms | 1.923 ms |
+| 256 | 256 | Down | 4.824 ms | 2.927 ms |
+
+These CUDA event medians use 256 resident synthetic experts with spread-out or concentrated routing.
+They measure one projection repeatedly, not the complete model's weight traffic.
+
+A 521-token full-model replay compared chunks of 7, 63, 64, 128, 129, and 256 tokens with single-token execution.
+Every vocabulary logit matched exactly, including the three-token continuation after prefill.
+The cases cross the route-reuse threshold, global pages, and the local attention window.
+
+Sequential HTTP runs compared commit `7e0e69a` with route reuse at 64 and 256 tokens per chunk.
+Each run started a fresh server with two active slots, two decode slots, and 8,192 context tokens.
+The cold prompt contained 4,498 tokens. Warm requests restored 4,480 tokens.
+The extended prompt contained 5,397 tokens, with 917 tokens to process after the same prefix restore.
+
+| HTTP measurement | Original, 64 tokens | Reuse, 64 tokens | Reuse, 256 tokens |
+| --- | ---: | ---: | ---: |
+| Cold first output | 16.449 s | 13.102 s | 10.492 s |
+| Cold complete request | 18.196 s | 14.850 s | 12.261 s |
+| Extended prompt first output | 4.164 s | 3.544 s | 2.897 s |
+| Extended prompt complete request | 5.912 s | 5.300 s | 4.675 s |
+| Warm first output | 0.163 s | 0.162 s | 0.164 s |
+| Warm decode | 36.08 tokens/s | 36.17 tokens/s | 35.74 tokens/s |
+
+Measured completed requests generated 64 tokens. All text and reasoning matched across runs, including seeded sampling, concurrent decode, and cancellation recovery.
+The extended prompt also matched between Chat Completions and Responses after prefix restoration.
+These are single-run measurements. They establish lower latency for this workload, not throughput parity with another model family.
+
+Flint now defaults to 256 prefill tokens per chunk. Larger chunks increase scratch storage and the work between scheduler ticks.
+At the default 32,768-token context, attention scratch increases from 130 MiB for 64 rows to 520 MiB for 256 rows.
+Other batch buffers also grow. The cache budget still excludes workspace storage.
+Use `--prefill-token-capacity 64` to select the smaller workspace and scheduling chunks.
+
+A separate experiment placed four head warps in each attention block.
+Local prefill improved slightly, but paged global prefill increased from 4.760 ms to 5.139 ms.
+The experiment was removed. Attention retains its existing kernels and launch geometry.
+
+## Tiled prefill attention, 2026-10-21
+
+After expert-weight reuse, a trace of 7,185 prompt tokens attributed 41.2% of kernel time to attention and 41.8% to routed experts.
+Global attention accounted for 32.1% and local attention for 9.1%.
+
+The selected kernel uses eight warps, two queries per warp, and a shared tile of 32 KV rows.
+It preserves each query's partition boundaries, including the different starting positions within a local window.
+KV append remains after attention, and the merge includes the learned sink exactly once.
+The original ring kernel remains the numerical and benchmark reference.
+
+A standalone probe compared the original and tiled kernels on identical nonzero inputs.
+Every output matched exactly across cold prefill, partial tiles, local-ring wraps, and global pages at 4K and 8K context.
+At 256 query rows, paged global attention decreased from 17.11 ms to 8.47 ms at 4K context.
+At 8K context, it decreased from 34.71 ms to 17.19 ms. These CUDA event medians include KV append.
+
+The repository micromeasure independently measured these candidate medians:
+
+| Attention | Query rows | Context or window | Time |
+| --- | ---: | ---: | ---: |
+| Paged global prefill | 64 | 4,096 | 2.157 ms |
+| Paged global prefill | 256 | 4,096 | 8.309 ms |
+| Paged global prefill | 256 | 8,192 | 16.966 ms |
+| Local serving prefill | 256 | 513 | 1.195 ms |
+
+The attention regression compares every output with the original kernel across chunks of 1, 63, 64, 65, 129, and 256 tokens.
+It also checks an FP64 reference and a nonzero page-layer offset. CUDA memcheck reported zero errors.
+The full-model chunk replay retained exact vocabulary logits and continuation across all tested chunk sizes.
+
+HTTP runs compared the existing 256-row expert-reuse runtime with the tiled-attention runtime.
+The 7,186-token run used 16,384 context capacity, two active slots, and two decode slots.
+Its extended prompt contained 8,085 tokens, with 7,168 restored tokens and 917 uncached tokens.
+A separate cold request used the earlier 4,498-token prompt and 8,192 context capacity.
+
+| HTTP measurement | Before tiling | After tiling |
+| --- | ---: | ---: |
+| 4,498-token cold first output | 10.492 s | 8.827 s |
+| 4,498-token complete request | 12.261 s | 10.604 s |
+| 7,186-token cold first output | 18.824 s | 15.293 s |
+| 7,186-token complete request | 20.592 s | 17.070 s |
+| Extended prompt first output | 3.493 s | 2.582 s |
+| Extended prompt complete request | 5.257 s | 4.368 s |
+| Warm first output | 0.193 s | 0.191 s |
+| Warm decode | 35.52 tokens/s | 35.29 tokens/s |
+
+Measured completed requests generated 64 tokens. All text and reasoning matched the previous implementation.
+The comparison included cold and restored prefixes, both API adapters, concurrent seeded sampling, and cancellation recovery.
+These are single-run measurements. The gain applies to these workloads and does not establish model-family throughput parity.
 
 ## Current limits
 

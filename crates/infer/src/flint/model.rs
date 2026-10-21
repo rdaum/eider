@@ -6,18 +6,19 @@ use super::sequence::{
 };
 use eider_cuda::{
     CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, GPU_SAMPLING_MAX_TOP_K, GpuSamplingRow,
-    GpuTokenSampler, MropeSections, Result, SinkAttentionCache, SinkAttentionDecodeBatch,
-    SinkAttentionWorkspace, Sm121W4A16Linear, Sm121W4A16LinearBatchWorkspace,
-    add_f32_prefix_into_on_stream, argmax_f32_into_on_stream,
+    GpuTokenSampler, MoeSortedRoutes, MropeSections, Result, SinkAttentionCache,
+    SinkAttentionDecodeBatch, SinkAttentionWorkspace, Sm121W4A16Linear,
+    Sm121W4A16LinearBatchWorkspace, add_f32_prefix_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, fill_f32_into_on_stream,
     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
-    nvfp4_w4a16_matvec_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_imrope_text_batch_f32_into_on_stream, rope_neox_f32_indexed_into_on_stream,
-    rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
-    set_cuda_device, silu_mul_f32_prefix_into_on_stream,
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_reuse_matvec_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
+    rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    round_f32_to_bf16_prefix_in_place_on_stream, set_cuda_device,
+    silu_mul_f32_prefix_into_on_stream,
 };
 use eider_format::{GgufIndex, ModelOptNvfp4Linear};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -75,8 +76,22 @@ impl ExpertProjection {
         input: &DeviceBuffer<DeviceAddress<f32>>,
         output: &DeviceBuffer<DeviceAddress<f32>>,
         routes: usize,
+        sorted: Option<&MoeSortedRoutes>,
         stream: &CudaStream,
     ) -> Result<()> {
+        if let Some(sorted) = sorted {
+            return nvfp4_w4a16_reuse_matvec_into_on_stream(
+                sorted,
+                input,
+                &self.weights,
+                &self.scales,
+                &self.global,
+                output,
+                self.rows,
+                self.cols,
+                stream,
+            );
+        }
         nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
             indices,
             input,
@@ -195,6 +210,7 @@ pub struct FlintWorkspace<'model> {
     indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
     expert_inputs: DeviceBuffer<DeviceAddress<f32>>,
+    sorted_routes: MoeSortedRoutes,
     expert_gate: Slots,
     expert_up: Slots,
     expert_act: Slots,
@@ -371,6 +387,7 @@ impl FlintModel {
             indices: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
             expert_inputs,
+            sorted_routes: MoeSortedRoutes::new(routes, c.experts)?,
             expert_gate: Slots::new(routes, c.expert_intermediate)?,
             expert_up: Slots::new(routes, c.expert_intermediate)?,
             expert_act: Slots::new(routes, c.expert_intermediate)?,
@@ -934,11 +951,21 @@ impl FlintModel {
                     stream,
                 )?;
                 let routes = rows * c.top_k;
+                // Sort once for all three projections. Short batches keep the
+                // independent route path; reuse is measured from 64 prompt rows.
+                let sorted = if sequence.is_some() && rows >= 64 && routes <= 65_535 {
+                    w.sorted_routes.set_routes(routes)?;
+                    w.sorted_routes.sort_on_stream(&w.indices, stream)?;
+                    Some(&w.sorted_routes)
+                } else {
+                    None
+                };
                 moe.gate.run(
                     &w.indices,
                     &w.expert_inputs,
                     &w.expert_gate.addresses,
                     routes,
+                    sorted,
                     stream,
                 )?;
                 moe.up.run(
@@ -946,6 +973,7 @@ impl FlintModel {
                     &w.expert_inputs,
                     &w.expert_up.addresses,
                     routes,
+                    sorted,
                     stream,
                 )?;
                 round(
@@ -975,6 +1003,7 @@ impl FlintModel {
                     &w.expert_act.addresses,
                     &w.expert_down.addresses,
                     routes,
+                    sorted,
                     stream,
                 )?;
                 round(&mut w.expert_down.values, routes * h, stream)?;
