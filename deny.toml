@@ -3,6 +3,10 @@ yanked = "deny"
 unmaintained = "all"
 unsound = "all"
 unused-ignored-advisory = "deny"
+ignore = [
+    # Remove when tokenizers and simdeez no longer depend on paste.
+    { id = "RUSTSEC-2024-0436", reason = "Unmaintained compile-time macro dependency of tokenizers and simdeez; no compatible dependency update removes it" },
+]
 
 [bans]
 multiple-versions = "warn"
