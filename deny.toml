@@ -1,0 +1,13 @@
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+unused-ignored-advisory = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/rdaum/seqcache"]
