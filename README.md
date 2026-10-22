@@ -14,6 +14,22 @@ Eider has three priorities:
 - It provides a practical platform for experiments and for learning how
   inference systems work.
 
+## Decisive Dory: fast typed decisions
+
+[Decisive Dory](https://huggingface.co/rdaum/decisive-dory) is our fine-tune of
+NVIDIA Dory 1.0 4B for decisions over application-defined answers. Supply
+context, a question, and the allowed answers. The model returns answer
+probabilities without generating an explanation.
+
+Use it for workflow routing, tool-call validation, rubric scoring, and action
+selection. Questions can request a binary answer, a named choice, or an ordered
+score. Eider serves these through its native decision API.
+
+The [Hugging Face model page](https://huggingface.co/rdaum/decisive-dory)
+provides BF16 and NVFP4 weights, a Q8_0 GGUF, and the LoRA adapter. It includes
+training sources, evaluation results, and llama.cpp instructions for builds
+with Dory support.
+
 ## Qwen3.8 Flash Next
 
 Eider served [Qwen3.8 Flash
@@ -313,7 +329,7 @@ second column.
 | Catalogue ID | API model | Runtime path |
 | --- | --- | --- |
 | [`flint-nvfp4`](docs/flint.md) | `eider-flint` | W4A16 GGUF, learned sinks, shared BF16 prefixes, packed decode, CUDA graphs, and native tool calls |
-| [`dory1.0-4b-nvfp4`](docs/dory.md) | `eider-dory1.0-4b` | Looped nGPT, native NVFP4, BF16 KV, decode graphs, and selected-label decisions |
+| [`dory1.0-4b-nvfp4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4) | `eider-dory1.0-4b` | Looped nGPT, native NVFP4, BF16 KV, decode graphs, and selected-label decisions |
 | [`lfm2.5-24b-a2b-nvfp4`](docs/lfm2.md) | `eider-lfm2.5-24b-a2b` | NVFP4 experts, gated short convolution, GQA, and LFM tool calls |
 | [`qwen3.8-flash-next`](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4) | `eider-qwen3.8-flash-next` | 125B/6B-active MoE, native QSA and GDN, NVMe-paged BF16 n-gram table, 262K text context |
 | [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |
