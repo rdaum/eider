@@ -1,5 +1,8 @@
 //! LFM3 hybrid convolution/attention runtime with native ModelOpt NVFP4 FFNs.
 mod config;
+mod decision;
+use decision::Lfm3TreeWorkspace;
+pub(crate) use decision::{Lfm3DecisionReadout, Lfm3DecisionSequence};
 mod prefix;
 use crate::execution::kv_cache::{LayerKvCache, LayerKvCacheCheckpoint};
 pub use config::Lfm3Config;
@@ -14,7 +17,16 @@ use eider_cuda::{
 };
 use eider_format::ModelOptCheckpoint;
 pub(crate) use prefix::Lfm3PrefixCache;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+fn workspace_identity() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 struct Linear {
     weight: DeviceBuffer<u16>,
@@ -76,6 +88,7 @@ impl FfnLinear {
         rows: usize,
         activation: &mut Nvfp4Matrix,
         plans: &mut HashMap<(usize, usize, usize), Fp4TnMatmulPlan>,
+        plan_epoch: &mut u64,
         gemm: &mut F32DenseGemm,
         lt: &CublasLt,
         stream: &CudaStream,
@@ -104,6 +117,7 @@ impl FfnLinear {
             if plans.len() >= 16 {
                 stream.synchronize()?;
                 plans.clear();
+                *plan_epoch += 1;
             }
             plans.insert(
                 key,
@@ -176,12 +190,15 @@ pub struct Lfm3Sequence<'m> {
     position: usize,
     capacity: usize,
     valid: bool,
+    hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     next_id: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
 }
 
 pub struct Lfm3Workspace<'m> {
+    identity: u64,
+    plan_epoch: u64,
     model: &'m Lfm3Model,
     capacity: usize,
     gemm: F32DenseGemm,
@@ -208,7 +225,6 @@ pub struct Lfm3Workspace<'m> {
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
     act: DeviceBuffer<f32>,
-    last: DeviceBuffer<f32>,
 }
 
 impl Lfm3Model {
@@ -285,6 +301,9 @@ impl Lfm3Model {
         self.stream.synchronize()
     }
     pub fn new_sequence(&self, capacity: usize) -> Result<Lfm3Sequence<'_>> {
+        self.new_sequence_with_readout(capacity, true)
+    }
+    fn new_sequence_with_readout(&self, capacity: usize, full: bool) -> Result<Lfm3Sequence<'_>> {
         let c = &self.config;
         if capacity == 0 || capacity > c.max_position_embeddings {
             return Err(invalid("invalid sequence capacity"));
@@ -307,7 +326,8 @@ impl Lfm3Model {
             position: 0,
             capacity,
             valid: true,
-            logits: DeviceBuffer::zeroed(c.vocab_size)?,
+            hidden: DeviceBuffer::zeroed(c.hidden_size)?,
+            logits: DeviceBuffer::zeroed(if full { c.vocab_size } else { 0 })?,
             next_id: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
         })
@@ -324,6 +344,8 @@ impl Lfm3Model {
         let mut gemm = F32DenseGemm::new(capacity, (3 * h).max(f), 0)?;
         gemm.set_precision(GemmPrecision::Bf16);
         Ok(Lfm3Workspace {
+            identity: workspace_identity(),
+            plan_epoch: 0,
             model: self,
             capacity,
             gemm,
@@ -350,7 +372,6 @@ impl Lfm3Model {
             gate: buf(f)?,
             up: buf(f)?,
             act: buf(f)?,
-            last: DeviceBuffer::zeroed(h)?,
         })
     }
     /// Runs a prompt chunk or one decode token. Scratch is shared on one stream.
@@ -359,6 +380,15 @@ impl Lfm3Model {
         w: &mut Lfm3Workspace,
         s: &mut Lfm3Sequence,
         tokens: &[u32],
+    ) -> Result<()> {
+        self.forward_with_readout(w, s, tokens, true)
+    }
+    fn forward_with_readout(
+        &self,
+        w: &mut Lfm3Workspace,
+        s: &mut Lfm3Sequence,
+        tokens: &[u32],
+        full: bool,
     ) -> Result<()> {
         if !std::ptr::eq(self, s.model)
             || !std::ptr::eq(self, w.model)
@@ -371,7 +401,10 @@ impl Lfm3Model {
             return Err(invalid("invalid model, tokens, state or chunk capacity"));
         }
         s.valid = false;
-        let result = self.forward_inner(w, s, tokens);
+        let result = (|| {
+            w.upload(tokens, &self.stream)?;
+            self.forward_inner(w, s, tokens.len(), full, None)
+        })();
         // Completion also protects temporary host uploads and cancellation/drop.
         let completion = self.synchronize();
         result?;
@@ -384,15 +417,16 @@ impl Lfm3Model {
         &self,
         w: &mut Lfm3Workspace,
         s: &mut Lfm3Sequence,
-        tokens: &[u32],
+        rows: usize,
+        full: bool,
+        mut tree: Option<&mut Lfm3TreeWorkspace>,
     ) -> Result<()> {
         let c = &self.config;
         let st = &self.stream;
-        let rows = tokens.len();
         let h = c.hidden_size;
-        w.host_tokens.as_mut_slice()[..rows].copy_from_slice(tokens);
-        w.tokens
-            .copy_range_from_pinned_on_stream(0, &w.host_tokens, st)?;
+        // Preserve each branch's BF16 reduction shape before FP4 quantization.
+        w.gemm
+            .set_row_segments(tree.as_ref().map_or(&[], |tree| tree.row_lengths()))?;
         copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
             c.vocab_size,
             h,
@@ -422,16 +456,20 @@ impl Lfm3Model {
                     LayerState::Conv(history),
                 ) => {
                     input.run(&w.normalized, &mut w.bcx, rows, &mut w.gemm, st)?;
-                    lfm3::short_conv(
-                        &w.bcx,
-                        weight,
-                        history.inout(),
-                        w.mixed.output(),
-                        h,
-                        c.conv_width,
-                        rows,
-                        st,
-                    )?;
+                    if let Some(tree) = tree.as_deref_mut() {
+                        tree.convolution(&w.bcx, weight, history, &mut w.mixed, c, st)?;
+                    } else {
+                        lfm3::short_conv(
+                            &w.bcx,
+                            weight,
+                            history.inout(),
+                            w.mixed.output(),
+                            h,
+                            c.conv_width,
+                            rows,
+                            st,
+                        )?;
+                    }
                     output.run(&w.mixed, &mut w.projected, rows, &mut w.gemm, st)?;
                 }
                 (
@@ -470,37 +508,41 @@ impl Lfm3Model {
                         c.norm_eps,
                         st,
                     )?;
-                    // Full head pairing plus zero frequencies implements LFM3's partial RoPE.
-                    lfm3::rope(
-                        rows,
-                        c.num_attention_heads,
-                        c.head_dim,
-                        &w.q_norm,
-                        inv_freq,
-                        w.q_rope.output(),
-                        s.position,
-                        st,
-                    )?;
-                    lfm3::rope(
-                        rows,
-                        c.num_key_value_heads,
-                        c.head_dim,
-                        &w.k_norm,
-                        inv_freq,
-                        w.k_rope.output(),
-                        s.position,
-                        st,
-                    )?;
-                    cache.append_prefix_on_stream(&w.k_rope, &w.v, rows, st)?;
-                    cache.window_attention_into_on_stream(
-                        &w.q_rope,
-                        w.mixed.output(),
-                        rows,
-                        s.position,
-                        c.num_attention_heads,
-                        *window,
-                        st,
-                    )?;
+                    if let Some(tree) = tree.as_deref_mut() {
+                        tree.attention(w, cache, inv_freq, *window, s.position, c, st)?;
+                    } else {
+                        // Full head pairing plus zero frequencies implements LFM3's partial RoPE.
+                        lfm3::rope(
+                            rows,
+                            c.num_attention_heads,
+                            c.head_dim,
+                            &w.q_norm,
+                            inv_freq,
+                            w.q_rope.output(),
+                            s.position,
+                            st,
+                        )?;
+                        lfm3::rope(
+                            rows,
+                            c.num_key_value_heads,
+                            c.head_dim,
+                            &w.k_norm,
+                            inv_freq,
+                            w.k_rope.output(),
+                            s.position,
+                            st,
+                        )?;
+                        cache.append_prefix_on_stream(&w.k_rope, &w.v, rows, st)?;
+                        cache.window_attention_into_on_stream(
+                            &w.q_rope,
+                            w.mixed.output(),
+                            rows,
+                            s.position,
+                            c.num_attention_heads,
+                            *window,
+                            st,
+                        )?;
+                    }
                     lfm3::head_gate(
                         &w.attention_gate,
                         &w.mixed,
@@ -555,6 +597,7 @@ impl Lfm3Model {
                 rows,
                 &mut w.activation_hidden,
                 &mut w.plans,
+                &mut w.plan_epoch,
                 &mut w.gemm,
                 &self.lt,
                 st,
@@ -565,6 +608,7 @@ impl Lfm3Model {
                 rows,
                 &mut w.activation_hidden,
                 &mut w.plans,
+                &mut w.plan_epoch,
                 &mut w.gemm,
                 &self.lt,
                 st,
@@ -582,6 +626,7 @@ impl Lfm3Model {
                 rows,
                 &mut w.activation_ffn,
                 &mut w.plans,
+                &mut w.plan_epoch,
                 &mut w.gemm,
                 &self.lt,
                 st,
@@ -623,10 +668,16 @@ impl Lfm3Model {
             c.norm_eps,
             st,
         )?;
-        w.last
+        if tree.is_some() {
+            return Ok(());
+        }
+        s.hidden
             .copy_range_from_device_on_stream(0, &w.normalized, (rows - 1) * h, h, st)?;
+        if !full {
+            return Ok(());
+        }
         bf16_linear_logits_f32_into_on_stream(
-            &w.last,
+            &s.hidden,
             &self.embedding,
             s.logits.output(),
             c.vocab_size,
@@ -669,6 +720,7 @@ impl Lfm3Sequence<'_> {
                 LayerState::Attention(s) => s.device_bytes(),
             })
             .sum::<usize>()
+            + self.hidden.device_bytes()
             + self.logits.device_bytes()
             + self.next_id.device_bytes()
             + self.next_value.device_bytes()
@@ -701,6 +753,14 @@ fn read_float(cp: &ModelOptCheckpoint, name: &str, shape: &[usize]) -> Result<De
         &cp.open_shard_for_tensor(name)?
             .read_float_tensor_as_f32(name)?,
     )
+}
+
+impl Lfm3Workspace<'_> {
+    fn upload(&mut self, tokens: &[u32], stream: &CudaStream) -> Result<()> {
+        self.host_tokens.as_mut_slice()[..tokens.len()].copy_from_slice(tokens);
+        self.tokens
+            .copy_range_from_pinned_on_stream(0, &self.host_tokens, stream)
+    }
 }
 
 #[cfg(test)]

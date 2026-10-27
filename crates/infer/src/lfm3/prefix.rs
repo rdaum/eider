@@ -46,12 +46,33 @@ impl Lfm3PrefixCache {
         state: &mut Lfm3Sequence,
         tokens: &[u32],
     ) -> Result<usize> {
+        self.restore_match(model, state, tokens, false)
+    }
+    pub(crate) fn restore_exact(
+        &mut self,
+        model: &Lfm3Model,
+        state: &mut Lfm3Sequence,
+        tokens: &[u32],
+    ) -> Result<usize> {
+        self.restore_match(model, state, tokens, true)
+    }
+    fn restore_match(
+        &mut self,
+        model: &Lfm3Model,
+        state: &mut Lfm3Sequence,
+        tokens: &[u32],
+        exact: bool,
+    ) -> Result<usize> {
         let Some(index) = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                entry.tokens.len() < tokens.len() && tokens.starts_with(&entry.tokens)
+                if exact {
+                    entry.tokens.as_ref() == tokens
+                } else {
+                    entry.tokens.len() < tokens.len() && tokens.starts_with(&entry.tokens)
+                }
             })
             .max_by_key(|(_, entry)| entry.tokens.len())
             .map(|(i, _)| i)

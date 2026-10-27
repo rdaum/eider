@@ -51,6 +51,74 @@ Decode uses the same execution path as a one-token prompt chunk.
 
 The loader also accepts the original BF16 checkpoint through `--model-dir`.
 
+## Decisions
+
+`POST /v1/decisions` supports `noul`, `choice`, and `score` questions.
+Each request reads the shared state once, then evaluates isolated question suffixes.
+The readout projects only the 64 validated label tokens.
+Decision sequences do not allocate or compute full-vocabulary logits.
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "eider-lfm3-1.7b",
+    "state": "The parcel arrived yesterday. It contains a red book.",
+    "questions": {
+      "arrived": {"type": "noul", "instructions": "Has the parcel arrived?"},
+      "colour": {
+        "type": "choice",
+        "instructions": "What colour is the book?",
+        "criteria": {"red": null, "blue": null, "green": null}
+      }
+    }
+  }'
+```
+
+The runtime follows Dory's decision execution pattern: combined prefix/suffix
+passes, packed suffix waves, reusable sequence storage, and bounded CUDA graphs
+for repeated shapes. Each branch shares the immutable KV prefix and starts from
+the same convolution snapshot. NVFP4 FFNs process packed rows together.
+BF16 projections retain each segment's reduction shape before activation quantization.
+
+The LFM3 launcher defaults to one active sequence and 2,048 prefill tokens.
+These settings retain the decision allocation between requests and fit larger waves.
+Use `--decision-branch-capacity` to change the wave size; the server default is eight.
+All launcher settings accept command-line overrides.
+Prefix retention uses the configured cache budget. Set `--retained-prefix-gib 0`
+to measure requests without retained-prefix reuse.
+
+The checkpoint is the general chat model. Decision scores use the existing
+label-normalization and calibration interface; they are not calibrated by default.
+
+The GPU regressions compare compact and full readouts, packed and serial branches,
+sibling independence, cancellation, retained prefixes, and graph invalidation.
+Run them separately on an idle GPU:
+
+```sh
+LFM3_REFERENCE_DIR=/tmp/lfm3-reference cargo test -p eider-inference --lib \
+  lfm3_compact_decisions -- --ignored
+LFM3_MODEL=/path/to/checkpoint cargo test --release -p eider-inference --lib \
+  lfm3_packed_decisions -- --ignored --nocapture
+```
+
+On GB10, the published checkpoint passed the scheduler comparison on 2026-10-27.
+Warm request times with retained-prefix reuse disabled were:
+
+| Questions | Serial suffixes | Packed suffixes with combined prefix |
+| --- | ---: | ---: |
+| 1 | 28.9 ms | 22.3 ms |
+| 8 | 121.3 ms | 97.6 ms |
+| 55 | 751.9 ms | 468.2 ms |
+
+These are single warm measurements from the regression fixture used by
+`scripts/questions.sh`, with eight branches per wave and 2,048 prefill tokens.
+They measure the complete scheduler request, including prefix processing and readout.
+
+The live HTTP checks covered all three question types, 64-option answers,
+64-question groups, validation errors, and chat after decisions.
+Repeated three-question requests with a retained prefix took 31–33 ms over HTTP.
+
 ## Validation
 
 The independent PyTorch reference follows the equations in
