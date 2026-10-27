@@ -12,6 +12,7 @@ pub mod generation;
 pub(crate) mod kv_cache;
 pub(crate) mod laguna_serving;
 pub(crate) mod lfm2_serving;
+pub(crate) mod lfm3_serving;
 pub(crate) mod ling3_serving;
 pub(crate) mod muse_glimmer_serving;
 pub(crate) mod nemotron3_serving;

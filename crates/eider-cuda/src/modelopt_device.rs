@@ -211,3 +211,42 @@ pub fn upload_grouped_nvfp4(
         DeviceBuffer::from_host(&grouped.group_scales)?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CudaStream;
+
+    #[test]
+    #[ignore = "requires CUDA NVFP4 support"]
+    fn activation_quantization_matches_host_at_bf16_boundaries() {
+        let stream = CudaStream::new_non_blocking().unwrap();
+        let (rows, cols) = (256, 128);
+        let values = (0..rows * cols)
+            .map(|i| {
+                format::bf16_to_f32(format::f32_to_bf16(
+                    ((i * 347 % 8191) as f32 - 4095.) / 2048.,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let device = DeviceBuffer::from_host(&values).unwrap();
+        for scale in [0.025, 0.026, 0.031, 1.0] {
+            let host = ModelOptNvfp4Activation::quantize_col_major_f32(rows, cols, &values, scale)
+                .unwrap();
+            let gpu =
+                ModelOptNvfp4Activation::quantize_device_col_major_f32(rows, cols, &device, scale)
+                    .unwrap();
+            crate::synchronize_device().unwrap();
+            assert_eq!(
+                host.matrix.copy_values_to_host(&stream).unwrap().to_vec(),
+                gpu.matrix.copy_values_to_host(&stream).unwrap().to_vec(),
+                "packed FP4 scale={scale}"
+            );
+            assert_eq!(
+                host.matrix.copy_scales_to_host(&stream).unwrap().to_vec(),
+                gpu.matrix.copy_scales_to_host(&stream).unwrap().to_vec(),
+                "block scales scale={scale}"
+            );
+        }
+    }
+}

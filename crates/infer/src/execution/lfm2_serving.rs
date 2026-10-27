@@ -359,7 +359,7 @@ impl EngineService for Lfm2ChatService<'_, '_> {
     }
 }
 
-fn emit(
+pub(super) fn emit(
     id: EngineRequestId,
     stop: &mut StopBuffer,
     events: Vec<ChatOutputEvent>,

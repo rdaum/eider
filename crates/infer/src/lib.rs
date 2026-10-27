@@ -37,6 +37,7 @@ pub mod dory;
 
 /// Liquid LFM2 MoE model loading and inference.
 pub mod lfm2;
+pub mod lfm3;
 
 /// Ternary Bonsai dense Qwen3 model loading and inference.
 pub mod bonsai;

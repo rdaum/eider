@@ -94,6 +94,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "lfm3-1.7b-nvfp4",
+        repository: "LiquidAI/LFM3-1.7B-NVFP4",
+        revision: "b30025bbbbcbf62f6c110b40d51d36af6579f6a2",
+        model_type: "lfm3",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-lfm3-1.7b",
+            max_context_tokens: 32_768,
+            prefill_token_capacity: 256,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "lfm2.5-24b-a2b-nvfp4",
         repository: "infinity-ai-institute/LFM2.5-24B-A2B-NVFP4",
         revision: "2d61270a276c320af204143d3d73e524f9ef44d2",
@@ -357,7 +371,7 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
     let artifact_dir = artifact_dir(spec.repository, spec.revision, spec.artifact_kind)?;
     let metadata_root = fetch_metadata_root(&repository, spec, offline).await?;
     validate_checkpoint(&metadata_root, spec.model_type)?;
-    if !matches!(spec.model_type, "bitnet" | "dory") {
+    if !matches!(spec.model_type, "bitnet" | "dory" | "lfm3") {
         validate_weight_index(&metadata_root)?;
     }
     if !offline {
@@ -573,7 +587,7 @@ async fn fetch_metadata_root(
                 spec.repository, spec.revision
             )
         })?;
-    if !matches!(spec.model_type, "bitnet" | "dory") {
+    if !matches!(spec.model_type, "bitnet" | "dory" | "lfm3") {
         repository
             .download_file()
             .filename("model.safetensors.index.json")
@@ -764,6 +778,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             | "bitnet"
             | "dory"
             | "lfm2_moe"
+            | "lfm3"
             | "bailing_hybrid"
             | "muse_glimmer"
             | "bonsai"
@@ -803,6 +818,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 "flint" => 256,
                 "dory" => 2_048,
                 "lfm2_moe" => 1_024,
+                "lfm3" => 256,
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
                 "qwen3_8_flash_next" => 512,
@@ -1070,6 +1086,23 @@ mod tests {
         assert_eq!(
             eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
             eider_inference::CheckpointArchitecture::Dory
+        );
+    }
+
+    #[test]
+    fn catalogue_pins_official_lfm3_and_resolves_single_file_checkpoint() {
+        let spec = catalogue_model("lfm3-1.7b-nvfp4").unwrap();
+        assert_eq!(spec.repository, "LiquidAI/LFM3-1.7B-NVFP4");
+        assert_eq!(spec.revision, "b30025bbbbcbf62f6c110b40d51d36af6579f6a2");
+        assert_eq!(spec.model_type, "lfm3");
+        assert_eq!(spec.defaults.served_model_name, "eider-lfm3-1.7b");
+        let fixture = CheckpointFixture::new_single("lfm3");
+        let resolved = resolve_local_model(fixture.path()).unwrap();
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(resolved.defaults.prefill_token_capacity, 256);
+        assert_eq!(
+            eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
+            eider_inference::CheckpointArchitecture::Lfm3
         );
     }
 

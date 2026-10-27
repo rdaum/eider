@@ -340,6 +340,39 @@ impl LayerKvCache {
         )
     }
 
+    /// Runs causal attention with an optional token window over valid cache rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn window_attention_into_on_stream(
+        &self,
+        query: &DeviceBuffer<f32>,
+        output: DeviceOutput<'_, f32>,
+        rows: usize,
+        start: usize,
+        q_heads: usize,
+        window: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if start.checked_add(rows).is_none_or(|end| end > self.len) {
+            return Err(Error::Format {
+                label: "window attention",
+                detail: "query exceeds valid cache".into(),
+            });
+        }
+        eider_cuda::prefill_window_gqa_attention_f32_into_on_stream(
+            query,
+            &self.key,
+            &self.value,
+            output,
+            rows,
+            start,
+            q_heads,
+            self.kv_heads,
+            self.head_dim,
+            window,
+            stream,
+        )
+    }
+
     /// Enqueues K/V append using a device-resident destination row.
     ///
     /// This does not advance `len`; call [`LayerKvCache::advance_len`] after

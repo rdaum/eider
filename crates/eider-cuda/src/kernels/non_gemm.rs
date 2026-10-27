@@ -7116,6 +7116,64 @@ pub fn prefill_gqa_attention_f32_into_on_stream(
     }
 }
 
+/// Runs causal GQA with a bounded window; zero selects full attention.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_window_gqa_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<f32>,
+    value_cache: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    tokens: usize,
+    start_position: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if window > u32::MAX as usize {
+        return Err(Error::Format {
+            label: "window attention",
+            detail: "window exceeds u32".into(),
+        });
+    }
+    let query_len = prefill_gqa_attention_len(
+        query,
+        key_cache,
+        value_cache,
+        tokens,
+        start_position,
+        q_heads,
+        kv_heads,
+        head_dim,
+    )?;
+    if output.len() < query_len {
+        return Err(Error::Shape {
+            label: "prefill GQA output",
+            expected: format!("{query_len} values"),
+            actual: format!("{} values", output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_prefill_window_gqa_attention_f32_on_stream",
+            ffi::infer_prefill_window_gqa_attention_f32_on_stream(
+                query.ptr,
+                key_cache.ptr,
+                value_cache.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                start_position as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                window as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Appends flattened ragged K/V rows into per-sequence cache pointer tables.
 #[allow(clippy::too_many_arguments)]
 pub fn append_ragged_kv_f32_into_on_stream(

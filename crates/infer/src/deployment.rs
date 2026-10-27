@@ -12,6 +12,7 @@ use crate::execution::flint_serving::FlintChatService;
 use crate::execution::gemma4_serving::Gemma4ChatService;
 use crate::execution::laguna_serving::LagunaChatService;
 use crate::execution::lfm2_serving::Lfm2ChatService;
+use crate::execution::lfm3_serving::Lfm3ChatService;
 use crate::execution::ling3_serving::Ling3ChatService;
 use crate::execution::muse_glimmer_serving::MuseGlimmerChatService;
 use crate::execution::nemotron3_serving::Nemotron3ChatService;
@@ -22,6 +23,7 @@ use crate::flint::FlintModel;
 use crate::gemma4::Gemma4Model;
 use crate::laguna::LagunaModel;
 use crate::lfm2::Lfm2Model;
+use crate::lfm3::Lfm3Model;
 use crate::ling3::Ling3Model;
 use crate::muse_glimmer::MuseGlimmerModel;
 use crate::nemotron3::{NEMOTRON_OMNI_ARCHITECTURE, Nemotron3Manifest, Nemotron3Model};
@@ -46,6 +48,8 @@ pub enum CheckpointArchitecture {
     Dory,
     /// Liquid LFM2 MoE.
     Lfm2Moe,
+    /// Liquid LFM3 dense hybrid.
+    Lfm3,
     /// BitNet b1.58.
     BitNet,
     /// Ling 3.
@@ -100,6 +104,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
         "flint" => Ok(CheckpointArchitecture::Flint),
         "dory" => Ok(CheckpointArchitecture::Dory),
         "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
+        "lfm3" => Ok(CheckpointArchitecture::Lfm3),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
         "bailing_hybrid" => Ok(CheckpointArchitecture::Ling3),
         "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
@@ -201,6 +206,21 @@ pub fn with_loaded_engine<R>(
                 ..scheduler
             };
             let mut service = Lfm2ChatService::new(&model, &template, scheduler, sequence_cache)?;
+            Ok(run(&mut service, defaults))
+        }
+        CheckpointArchitecture::Lfm3 => {
+            let defaults = GenerationConfig {
+                supports_parallel_tool_calls: true,
+                ..defaults
+            };
+            let model = Lfm3Model::load(&model_dir)?;
+            let scheduler = SchedulerConfig {
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().max_position_embeddings),
+                ..scheduler
+            };
+            let mut service = Lfm3ChatService::new(&model, &template, scheduler, sequence_cache)?;
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::BitNet => {

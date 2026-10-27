@@ -120,9 +120,10 @@ __global__ void infer_quantize_nvfp4_col_major_f32_kernel(const float* input,
     const std::uint32_t row_start = row_block * 16;
     const std::uint32_t row_end = min(row_start + 16, rows);
     const std::uint32_t lane = threadIdx.x;
+    // Preserve ties-to-even at FP4 boundaries even under --use_fast_math.
     float max_abs = 0.0f;
     if (row_start + lane < row_end) {
-        const float value = input[row_start + lane + col * rows] / input_scale;
+        const float value = __fdiv_rn(input[row_start + lane + col * rows], input_scale);
         max_abs = isfinite(value) ? fabsf(value) : 0.0f;
     }
     max_abs = infer_warp_reduce_max(max_abs);
@@ -130,7 +131,7 @@ __global__ void infer_quantize_nvfp4_col_major_f32_kernel(const float* input,
     std::uint32_t scale_word = 0;
     if (lane == 0) {
         scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            __nv_cvt_float_to_fp8(__fdiv_rn(max_abs, 6.0f), __NV_SATFINITE, __NV_E4M3));
         scales[infer_ue4m3_tiled_scale_offset(col, row_block, rows)] =
             static_cast<std::uint8_t>(scale_word);
     }
@@ -140,13 +141,13 @@ __global__ void infer_quantize_nvfp4_col_major_f32_kernel(const float* input,
 
     if (lane < 8 && row_start + lane * 2 < row_end) {
         const std::uint32_t row = row_start + lane * 2;
-        const float lo_value = scale == 0.0f ? 0.0f : (input[row + col * rows] / input_scale) / scale;
+        const float lo_value = scale == 0.0f ? 0.0f : __fdiv_rn(__fdiv_rn(input[row + col * rows], input_scale), scale);
         const std::uint8_t lo =
             static_cast<std::uint8_t>(__nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
         std::uint8_t hi = 0;
         if (row + 1 < row_end) {
             const float hi_value =
-                scale == 0.0f ? 0.0f : (input[row + 1 + col * rows] / input_scale) / scale;
+                scale == 0.0f ? 0.0f : __fdiv_rn(__fdiv_rn(input[row + 1 + col * rows], input_scale), scale);
             hi = static_cast<std::uint8_t>(
                 __nv_cvt_float_to_fp4(hi_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
         }
@@ -6347,7 +6348,8 @@ __global__ void infer_prefill_gqa_attention_f32_kernel(const float* query,
                                                              std::uint32_t start_position,
                                                              std::uint32_t q_heads,
                                                              std::uint32_t kv_heads,
-                                                             std::uint32_t head_dim) {
+                                                             std::uint32_t head_dim,
+                                                             std::uint32_t window) {
     extern __shared__ float shmem[];
     float* q_sh = shmem;
     float* partial = shmem + head_dim;
@@ -6376,7 +6378,8 @@ __global__ void infer_prefill_gqa_attention_f32_kernel(const float* query,
     const std::uint32_t lane = tid & 31u;
     const std::uint32_t warp = tid >> 5u;
     const std::uint32_t warps = blockDim.x >> 5u;
-    for (std::uint32_t row = 0; row < cache_len; ++row) {
+    const std::uint32_t first = window && cache_len > window ? cache_len - window : 0;
+    for (std::uint32_t row = first; row < cache_len; ++row) {
         const std::size_t base = static_cast<std::size_t>(row) * kv_width + kv_head * head_dim;
         const float* k = key_cache + base;
         const float* v = value_cache + base;
@@ -7014,6 +7017,35 @@ extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
 extern "C" cudaError_t infer_lfm2_prefill_attention_on_stream(
     const float*, const float*, const float*, float*, unsigned, unsigned, unsigned, unsigned, cudaStream_t);
 
+extern "C" cudaError_t infer_prefill_window_gqa_attention_f32_on_stream(const float* query,
+                                                             const float* key_cache,
+                                                             const float* value_cache,
+                                                             float* output,
+                                                             std::uint32_t tokens,
+                                                             std::uint32_t start_position,
+                                                             std::uint32_t q_heads,
+                                                             std::uint32_t kv_heads,
+                                                             std::uint32_t head_dim,
+                                                             std::uint32_t window,
+                                                             cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    if (query == nullptr || key_cache == nullptr || value_cache == nullptr || output == nullptr ||
+        tokens == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 || head_dim > kThreads ||
+        (q_heads % kv_heads) != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    const dim3 blocks(tokens, q_heads);
+    if (head_dim == 64 && window == 0) {
+        return infer_lfm2_prefill_attention_on_stream(
+            query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, stream);
+    }
+    infer_prefill_gqa_attention_f32_kernel<<<
+        blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
+        query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, head_dim, window);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* query,
                                                              const float* key_cache,
                                                              const float* value_cache,
@@ -7024,22 +7056,8 @@ extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* qu
                                                              std::uint32_t kv_heads,
                                                              std::uint32_t head_dim,
                                                              cudaStream_t stream) {
-    constexpr int kThreads = 256;
-    if (query == nullptr || key_cache == nullptr || value_cache == nullptr || output == nullptr ||
-        tokens == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 || head_dim > kThreads ||
-        (q_heads % kv_heads) != 0) {
-        return cudaErrorInvalidValue;
-    }
-
-    const dim3 blocks(tokens, q_heads);
-    if (head_dim == 64) {
-        return infer_lfm2_prefill_attention_on_stream(
-            query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, stream);
-    }
-    infer_prefill_gqa_attention_f32_kernel<<<
-        blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
-        query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, head_dim);
-    return cudaGetLastError();
+    return infer_prefill_window_gqa_attention_f32_on_stream(
+        query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, head_dim, 0, stream);
 }
 
 extern "C" cudaError_t infer_prefill_gqa_attention_f32(const float* query,

@@ -18,6 +18,7 @@ pub use kernels::dory::{
     dory_embedding, dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
 };
 pub use kernels::ggml_blocks::{GgmlGemmWorkspace, GgmlWeights};
+pub use kernels::lfm3;
 pub use kernels::lilicorr;
 pub use kernels::sink_attention::{
     SinkAttentionCache, SinkAttentionDecodeBatch, SinkAttentionWorkspace,
@@ -183,7 +184,8 @@ pub use kernels::non_gemm::{
     pack_token_heads_bf16_at_offset_into_on_stream, pack_token_heads_bf16_into_on_stream,
     pack_tree_kv_bf16_into_on_stream, pack_value_heads_bf16_into_on_stream,
     prefill_gqa_attention_f32_into, prefill_gqa_attention_f32_into_on_stream,
-    prepend_u32_rows_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    prefill_window_gqa_attention_f32_into_on_stream, prepend_u32_rows_into_on_stream,
+    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,

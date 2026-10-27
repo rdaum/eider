@@ -7,6 +7,7 @@ pub(crate) mod dory;
 pub(crate) mod gemma4_attention;
 pub(crate) mod ggml_blocks;
 pub(crate) mod lfm2;
+pub mod lfm3;
 pub mod lilicorr;
 pub(crate) mod non_gemm;
 pub(crate) mod qwen36_gdn;

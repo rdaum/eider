@@ -2578,6 +2578,19 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_prefill_window_gqa_attention_f32_on_stream(
+        query: *const f32,
+        key_cache: *const f32,
+        value_cache: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        start_position: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        window: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_append_ragged_kv_f32_on_stream(
         key: *const f32,
         value: *const f32,
