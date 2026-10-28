@@ -78,8 +78,9 @@ curl -fsS http://127.0.0.1:8080/v1/decisions \
 The runtime follows Dory's decision execution pattern: combined prefix/suffix
 passes, packed suffix waves, reusable sequence storage, and bounded CUDA graphs
 for repeated shapes. Each branch shares the immutable KV prefix and starts from
-the same convolution snapshot. NVFP4 FFNs process packed rows together.
-BF16 projections retain each segment's reduction shape before activation quantization.
+the same convolution snapshot. BF16 projections and NVFP4 FFNs retain each
+segment's reduction shape. This keeps cache hits and sibling branches from
+changing decision logits through different NVFP4 rounding.
 
 The LFM3 launcher defaults to one active sequence and 2,048 prefill tokens.
 These settings retain the decision allocation between requests and fit larger waves.
@@ -100,6 +101,8 @@ LFM3_REFERENCE_DIR=/tmp/lfm3-reference cargo test -p eider-inference --lib \
   lfm3_compact_decisions -- --ignored
 LFM3_MODEL=/path/to/checkpoint cargo test --release -p eider-inference --lib \
   lfm3_packed_decisions -- --ignored --nocapture
+LFM3_DECISION_MODEL_DIR=/path/to/final-nvfp4 cargo test --release -p eider-inference --lib \
+  lfm3_nvfp4_decisions_match_after_prefix_cache_hit -- --ignored
 ```
 
 On GB10, the published checkpoint passed the scheduler comparison on 2026-10-27.
@@ -114,6 +117,7 @@ Warm request times with retained-prefix reuse disabled were:
 These are single warm measurements from the regression fixture used by
 `scripts/questions.sh`, with eight branches per wave and 2,048 prefill tokens.
 They measure the complete scheduler request, including prefix processing and readout.
+They predate the 2026-10-28 fix that preserves NVFP4 segment shapes.
 
 The live HTTP checks covered all three question types, 64-option answers,
 64-question groups, validation errors, and chat after decisions.

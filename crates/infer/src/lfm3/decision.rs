@@ -32,16 +32,16 @@ struct DecisionExecution {
     include_prefix: bool,
 }
 
-/// Dense projections and FFNs operate on all packed rows. Mixers process each
+/// Projections preserve each segment's reduction shape. Mixers process each
 /// segment against the same prefix, using bounded reusable staging buffers.
 pub(super) struct Lfm3TreeWorkspace {
     capacity: usize,
     segments: Vec<Range<usize>>,
     row_lengths: Vec<u32>,
     prefix_rows: usize,
-    bcx: DeviceBuffer<f32>,
+    staging_input: DeviceBuffer<f32>,
     history: DeviceBuffer<f32>,
-    mixed: DeviceBuffer<f32>,
+    staging_output: DeviceBuffer<f32>,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -57,9 +57,9 @@ impl Lfm3TreeWorkspace {
             segments: Vec::new(),
             row_lengths: Vec::new(),
             prefix_rows: 0,
-            bcx: DeviceBuffer::zeroed(capacity * 3 * h)?,
+            staging_input: DeviceBuffer::zeroed(capacity * (3 * h).max(c.intermediate_size))?,
             history: DeviceBuffer::zeroed(h * (c.conv_width - 1))?,
-            mixed: DeviceBuffer::zeroed(capacity * h)?,
+            staging_output: DeviceBuffer::zeroed(capacity * h.max(c.intermediate_size))?,
             q: DeviceBuffer::zeroed(capacity * h)?,
             k: DeviceBuffer::zeroed(capacity * kv)?,
             v: DeviceBuffer::zeroed(capacity * kv)?,
@@ -70,11 +70,24 @@ impl Lfm3TreeWorkspace {
     pub(super) fn row_lengths(&self) -> &[u32] {
         &self.row_lengths
     }
+    pub(super) fn projection_staging(
+        &mut self,
+    ) -> (
+        &[Range<usize>],
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ) {
+        (
+            &self.segments,
+            &mut self.staging_input,
+            &mut self.staging_output,
+        )
+    }
     fn device_bytes(&self) -> usize {
         [
-            &self.bcx,
+            &self.staging_input,
             &self.history,
-            &self.mixed,
+            &self.staging_output,
             &self.q,
             &self.k,
             &self.v,
@@ -96,7 +109,7 @@ impl Lfm3TreeWorkspace {
     ) -> Result<()> {
         let h = c.hidden_size;
         for (i, range) in self.segments.iter().enumerate() {
-            self.bcx.copy_range_from_device_on_stream(
+            self.staging_input.copy_range_from_device_on_stream(
                 0,
                 input,
                 range.start * 3 * h,
@@ -111,10 +124,10 @@ impl Lfm3TreeWorkspace {
                 &mut self.history
             };
             lfm3::short_conv(
-                &self.bcx,
+                &self.staging_input,
                 weight,
                 history.inout(),
-                self.mixed.output(),
+                self.staging_output.output(),
                 h,
                 c.conv_width,
                 range.len(),
@@ -122,7 +135,7 @@ impl Lfm3TreeWorkspace {
             )?;
             output.copy_range_from_device_on_stream(
                 range.start * h,
-                &self.mixed,
+                &self.staging_output,
                 0,
                 range.len() * h,
                 stream,
@@ -191,7 +204,7 @@ impl Lfm3TreeWorkspace {
             cache.append_prefix_on_stream(&self.k_rope, &self.v, range.len(), stream)?;
             cache.window_attention_into_on_stream(
                 &self.q_rope,
-                self.mixed.output(),
+                self.staging_output.output(),
                 range.len(),
                 position,
                 c.num_attention_heads,
@@ -200,7 +213,7 @@ impl Lfm3TreeWorkspace {
             )?;
             w.mixed.copy_range_from_device_on_stream(
                 range.start * h,
-                &self.mixed,
+                &self.staging_output,
                 0,
                 range.len() * h,
                 stream,
@@ -551,6 +564,64 @@ impl Lfm3DecisionSequence<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires final decision NVFP4 checkpoint in LFM3_DECISION_MODEL_DIR"]
+    fn lfm3_nvfp4_decisions_match_after_prefix_cache_hit() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            prefix: Vec<u32>,
+            suffix: Vec<u32>,
+            labels: Vec<u32>,
+        }
+        let case: Case =
+            serde_json::from_str(include_str!("fixtures/decision-cache-case.json")).unwrap();
+        let model = Lfm3Model::load(std::env::var("LFM3_DECISION_MODEL_DIR").unwrap()).unwrap();
+        assert!(matches!(model.layers[0].gate, FfnLinear::Nvfp4(_)));
+        let mut head = model.new_decision_readout(&case.labels).unwrap();
+        let mut workspace = model.new_workspace(2048).unwrap();
+        let mut sequence = model.new_decision_sequence(1024, 2048).unwrap();
+        let cold = sequence
+            .prefill_branches(&mut workspace, &mut head, &case.prefix, &[&case.suffix])
+            .unwrap();
+        sequence.retain_prefix(&case.prefix);
+        for _ in 0..3 {
+            assert!(sequence.prepare(&case.prefix, true).unwrap());
+            let cached = sequence
+                .prefill_branches(&mut workspace, &mut head, &[], &[&case.suffix])
+                .unwrap();
+            assert_eq!(cold, cached, "cache hit changed decision logits");
+        }
+        assert_eq!(sequence.captured_graphs(), 1);
+        sequence.prepare(&case.prefix, false).unwrap();
+        let siblings = sequence
+            .prefill_branches(
+                &mut workspace,
+                &mut head,
+                &case.prefix,
+                &[&case.suffix, &case.suffix],
+            )
+            .unwrap();
+        assert_eq!(siblings[0], cold[0]);
+        assert_eq!(siblings[1], cold[0]);
+        // Eight different suffix lengths plus the prefix need more than the
+        // usual sixteen plans. Graph capture must retain the complete set.
+        let suffixes = (0..8)
+            .map(|trim| &case.suffix[..case.suffix.len() - trim])
+            .collect::<Vec<_>>();
+        sequence.prepare(&case.prefix, false).unwrap();
+        let cold_many = sequence
+            .prefill_branches(&mut workspace, &mut head, &case.prefix, &suffixes)
+            .unwrap();
+        sequence.retain_prefix(&case.prefix);
+        for _ in 0..3 {
+            assert!(sequence.prepare(&case.prefix, true).unwrap());
+            let cached_many = sequence
+                .prefill_branches(&mut workspace, &mut head, &[], &suffixes)
+                .unwrap();
+            assert_eq!(cold_many, cached_many);
+        }
+    }
 
     fn close(a: &[f32], b: &[f32]) {
         assert_eq!(a.len(), b.len());

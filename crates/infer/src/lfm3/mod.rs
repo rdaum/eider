@@ -90,6 +90,7 @@ impl FfnLinear {
         plans: &mut HashMap<(usize, usize, usize), Fp4TnMatmulPlan>,
         plan_epoch: &mut u64,
         gemm: &mut F32DenseGemm,
+        tree: Option<&mut Lfm3TreeWorkspace>,
         lt: &CublasLt,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -99,6 +100,80 @@ impl FfnLinear {
             };
             return linear.run(x, y, rows, gemm, stream);
         };
+        if let Some(tree) = tree {
+            let (segments, input, output) = tree.projection_staging();
+            if segments.len() > 1 {
+                // Cold, cached, and sibling branches must use the same GEMM
+                // reduction shapes. NVFP4 can amplify a changed reduction order
+                // into a different answer even for an identical request.
+                let cols = weight.matrix().rows;
+                let out = weight.matrix().cols;
+                // Two FFN geometries per segment; retain a complete packed
+                // forward's plans so subsequent graph capture cannot evict them.
+                let plan_capacity = 16.max(2 * segments.len());
+                for segment in segments {
+                    if segment.start == 0 {
+                        Self::run_nvfp4(
+                            weight,
+                            x,
+                            y,
+                            segment.len(),
+                            activation,
+                            plans,
+                            plan_epoch,
+                            plan_capacity,
+                            lt,
+                            stream,
+                        )?;
+                        continue;
+                    }
+                    input.copy_range_from_device_on_stream(
+                        0,
+                        x,
+                        segment.start * cols,
+                        segment.len() * cols,
+                        stream,
+                    )?;
+                    Self::run_nvfp4(
+                        weight,
+                        input,
+                        output,
+                        segment.len(),
+                        activation,
+                        plans,
+                        plan_epoch,
+                        plan_capacity,
+                        lt,
+                        stream,
+                    )?;
+                    y.copy_range_from_device_on_stream(
+                        segment.start * out,
+                        output,
+                        0,
+                        segment.len() * out,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+        Self::run_nvfp4(
+            weight, x, y, rows, activation, plans, plan_epoch, 16, lt, stream,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_nvfp4(
+        weight: &ModelOptCublasLtWeight,
+        x: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+        rows: usize,
+        activation: &mut Nvfp4Matrix,
+        plans: &mut HashMap<(usize, usize, usize), Fp4TnMatmulPlan>,
+        plan_epoch: &mut u64,
+        plan_capacity: usize,
+        lt: &CublasLt,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let cols = weight.matrix().rows;
         let out = weight.matrix().cols;
         // Only the active columns change; the allocation retains chunk capacity.
@@ -114,7 +189,7 @@ impl FfnLinear {
         let key = (rows, out, cols);
         if !plans.contains_key(&key) {
             // Bound cuBLASLt plan/workspace retention for arbitrary prompt sizes.
-            if plans.len() >= 16 {
+            if plans.len() >= plan_capacity {
                 stream.synchronize()?;
                 plans.clear();
                 *plan_epoch += 1;
@@ -599,6 +674,7 @@ impl Lfm3Model {
                 &mut w.plans,
                 &mut w.plan_epoch,
                 &mut w.gemm,
+                tree.as_deref_mut(),
                 &self.lt,
                 st,
             )?;
@@ -610,6 +686,7 @@ impl Lfm3Model {
                 &mut w.plans,
                 &mut w.plan_epoch,
                 &mut w.gemm,
+                tree.as_deref_mut(),
                 &self.lt,
                 st,
             )?;
@@ -628,6 +705,7 @@ impl Lfm3Model {
                 &mut w.plans,
                 &mut w.plan_epoch,
                 &mut w.gemm,
+                tree.as_deref_mut(),
                 &self.lt,
                 st,
             )?;
