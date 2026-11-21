@@ -891,6 +891,9 @@ impl Sm121W4A16GateUp {
                     self.gate_up as u32,
                     self.hidden as u32,
                     routes >= TILED_ROUTES,
+                    // A token selects distinct experts, so an item normally
+                    // holds at most one route per token; larger items loop.
+                    routes.div_ceil(self.top_k).min(u32::MAX as usize) as u32,
                     stream.as_raw(),
                 ),
             )
@@ -1452,6 +1455,24 @@ mod tests {
         assert_eq!(
             &output.copy_to_host(&stream)?[..few * out_features],
             &expected[..few * out_features]
+        );
+        // At most eight rows select the 16-warp single-group variant. These ids
+        // repeat experts within a token, so items still exceed eight columns.
+        let narrow = 8 * top_k;
+        let mut narrow_groups = MoeRouteGroups::new(narrow, 3)?;
+        narrow_groups.group_on_stream(&indices, narrow, &stream)?;
+        output.copy_from_host(&vec![0.0; routes * out_features])?;
+        experts.run_route_groups_on_stream(
+            &narrow_groups,
+            &input,
+            output.output(),
+            narrow,
+            false,
+            &stream,
+        )?;
+        close(
+            &output.copy_to_host(&stream)?[..narrow * out_features],
+            &expected[..narrow * out_features],
         );
         let per_route = DeviceBuffer::from_host(
             &(0..routes)

@@ -3308,6 +3308,7 @@ unsafe extern "C" {
         out_features: u32,
         in_features: u32,
         tiled: bool,
+        max_columns: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[cfg(not(feature = "cuda-oxide"))]

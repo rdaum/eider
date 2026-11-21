@@ -259,69 +259,72 @@ __device__ __forceinline__ uint32_t pack_bf16(float low, float high) {
         | (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(high))) << 16);
 }
 
-// BF16 weights in [expert][out][in] order. One CTA computes a 16-row output
-// tile for one grouped work item of up to 64 routes of the same expert.
-__global__ __launch_bounds__(256) void grouped_bf16_expert_kernel(
+// BF16 weights in [expert][out][in] order. Decode-sized batches: one CTA
+// computes a 16-row output tile for one work item, splitting K across warps.
+// Items with more than `Groups * 8` routes repeat the K loop.
+template<unsigned Warps, unsigned Groups>
+__global__ __launch_bounds__(Warps*32) void grouped_bf16_expert_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
     const uint32_t* item_count, const uint32_t* items, const float* input,
     const uint16_t* weights, float* out, uint32_t top_k, bool per_route_input,
     uint32_t outputs, uint32_t inputs) {
-    // Work items carry up to 64 routes (MoeRouteGroups::columns).
-    constexpr unsigned Warps=8, Groups=8;
     const unsigned item=blockIdx.y;
     if(item>=items[0]) return;
     const unsigned lane=threadIdx.x&31, warp=threadIdx.x>>5;
     const unsigned row0=lane>>2, row1=row0+8, pair=(lane&3)*2;
     const unsigned start=item_start[item], count=item_count[item];
     const uint16_t* w=weights+(size_t(item_expert[item])*outputs+blockIdx.x*16)*inputs;
-    const float* rows[Groups];
-    #pragma unroll
-    for(unsigned g=0;g<Groups;++g) {
-        const unsigned column=g*8+row0;
-        rows[g]=nullptr;
-        if(column<count) {
-            const unsigned route=sorted[start+column];
-            rows[g]=input+size_t(per_route_input ? route : route/top_k)*inputs;
-        }
-    }
-    float d[Groups][4]={};
-    for(unsigned k=warp*16;k<inputs;k+=Warps*16) {
-        const uint32_t a0=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair);
-        const uint32_t a1=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair);
-        const uint32_t a2=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair+8);
-        const uint32_t a3=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair+8);
+    __shared__ float partial[Warps][Groups][128];
+    for(unsigned first=0;first<count;first+=Groups*8) {
+        const float* rows[Groups];
         #pragma unroll
         for(unsigned g=0;g<Groups;++g) {
-            if(g*8>=count) break;
-            uint32_t b0=0,b1=0;
-            if(rows[g]) {
-                const float* x=rows[g]+k+pair;
-                b0=pack_bf16(x[0],x[1]);
-                b1=pack_bf16(x[8],x[9]);
+            const unsigned column=first+g*8+row0;
+            rows[g]=nullptr;
+            if(column<count) {
+                const unsigned route=sorted[start+column];
+                rows[g]=input+size_t(per_route_input ? route : route/top_k)*inputs;
             }
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-                :"+f"(d[g][0]),"+f"(d[g][1]),"+f"(d[g][2]),"+f"(d[g][3])
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
         }
-    }
-    __shared__ float partial[Warps][Groups][128];
-    #pragma unroll
-    for(unsigned g=0;g<Groups;++g) {
-        partial[warp][g][row0*8+pair]=d[g][0];
-        partial[warp][g][row0*8+pair+1]=d[g][1];
-        partial[warp][g][row1*8+pair]=d[g][2];
-        partial[warp][g][row1*8+pair+1]=d[g][3];
-    }
-    __syncthreads();
-    for(unsigned index=threadIdx.x;index<Groups*128;index+=blockDim.x) {
-        const unsigned g=index/128, cell=index%128, column=g*8+cell%8;
-        if(column>=count) continue;
-        float sum=0.f;
+        float d[Groups][4]={};
+        for(unsigned k=warp*16;k<inputs;k+=Warps*16) {
+            const uint32_t a0=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair);
+            const uint32_t a1=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair);
+            const uint32_t a2=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair+8);
+            const uint32_t a3=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair+8);
+            #pragma unroll
+            for(unsigned g=0;g<Groups;++g) {
+                if(first+g*8>=count) break;
+                uint32_t b0=0,b1=0;
+                if(rows[g]) {
+                    const float* x=rows[g]+k+pair;
+                    b0=pack_bf16(x[0],x[1]);
+                    b1=pack_bf16(x[8],x[9]);
+                }
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    :"+f"(d[g][0]),"+f"(d[g][1]),"+f"(d[g][2]),"+f"(d[g][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+        }
         #pragma unroll
-        for(unsigned i=0;i<Warps;++i) sum+=partial[i][g][cell];
-        out[size_t(sorted[start+column])*outputs+blockIdx.x*16+cell/8]=bf(sum);
+        for(unsigned g=0;g<Groups;++g) {
+            partial[warp][g][row0*8+pair]=d[g][0];
+            partial[warp][g][row0*8+pair+1]=d[g][1];
+            partial[warp][g][row1*8+pair]=d[g][2];
+            partial[warp][g][row1*8+pair+1]=d[g][3];
+        }
+        __syncthreads();
+        for(unsigned index=threadIdx.x;index<Groups*128;index+=blockDim.x) {
+            const unsigned g=index/128, cell=index%128, column=first+g*8+cell%8;
+            if(column>=count) continue;
+            float sum=0.f;
+            #pragma unroll
+            for(unsigned i=0;i<Warps;++i) sum+=partial[i][g][cell];
+            out[size_t(sorted[start+column])*outputs+blockIdx.x*16+cell/8]=bf(sum);
+        }
+        __syncthreads();
     }
 }
 
@@ -400,6 +403,48 @@ __global__ __launch_bounds__(256) void grouped_bf16_expert_tiled_kernel(
             o[row0]=bf(d[g][half]);
             o[row1]=bf(d[g][2+half]);
         }
+    }
+}
+
+// Decode-sized BF16 projections: each warp streams one weight row with 16-byte
+// loads and accumulates it against up to MaxRows F32 input rows.
+template<unsigned MaxRows>
+__global__ __launch_bounds__(256) void bf16_matvec_kernel(const float* __restrict__ x,
+    const uint16_t* __restrict__ weight, float* __restrict__ y, uint32_t rows,
+    uint32_t outputs, uint32_t inputs) {
+    const unsigned lane=threadIdx.x&31;
+    const unsigned output=blockIdx.x*(blockDim.x/32)+(threadIdx.x>>5);
+    if(output>=outputs) return;
+    const uint16_t* w=weight+size_t(output)*inputs;
+    float acc[MaxRows]={};
+    for(unsigned k=lane*8;k<inputs;k+=32*8) {
+        const uint4 packed=*reinterpret_cast<const uint4*>(w+k);
+        const uint32_t words[4]={packed.x,packed.y,packed.z,packed.w};
+        float wv[8];
+        #pragma unroll
+        for(unsigned i=0;i<4;++i) {
+            wv[2*i]=__uint_as_float(words[i]<<16);
+            wv[2*i+1]=__uint_as_float(words[i]&0xffff0000u);
+        }
+        #pragma unroll
+        for(unsigned r=0;r<MaxRows;++r) {
+            if(r>=rows) break;
+            const float4 lo=*reinterpret_cast<const float4*>(x+size_t(r)*inputs+k);
+            const float4 hi=*reinterpret_cast<const float4*>(x+size_t(r)*inputs+k+4);
+            float sum=acc[r];
+            sum=__fmaf_rn(wv[0],lo.x,sum); sum=__fmaf_rn(wv[1],lo.y,sum);
+            sum=__fmaf_rn(wv[2],lo.z,sum); sum=__fmaf_rn(wv[3],lo.w,sum);
+            sum=__fmaf_rn(wv[4],hi.x,sum); sum=__fmaf_rn(wv[5],hi.y,sum);
+            sum=__fmaf_rn(wv[6],hi.z,sum); sum=__fmaf_rn(wv[7],hi.w,sum);
+            acc[r]=sum;
+        }
+    }
+    #pragma unroll
+    for(unsigned r=0;r<MaxRows;++r) {
+        if(r>=rows) break;
+        float sum=acc[r];
+        for(int offset=16;offset;offset>>=1) sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+        if(lane==0) y[size_t(r)*outputs+output]=sum;
     }
 }
 
@@ -492,16 +537,27 @@ extern "C" int infer_inkling2_grouped_bf16_expert(const uint32_t* sorted,
     const uint32_t* item_expert, const uint32_t* item_start, const uint32_t* item_count,
     const uint32_t* items, uint32_t max_items, const float* input, const uint16_t* weights,
     float* out, uint32_t top_k, bool per_route_input, uint32_t outputs, uint32_t inputs,
-    bool tiled, cudaStream_t stream) {
+    bool tiled, uint32_t max_columns, cudaStream_t stream) {
     if(outputs%16 || inputs%16 || !max_items) return cudaErrorInvalidValue;
     if(tiled) {
         if(inputs%8) return cudaErrorInvalidValue;
         grouped_bf16_expert_tiled_kernel<<<dim3((outputs/16+7)/8,max_items),256,0,stream>>>(sorted,
             item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
+    } else if(max_columns<=8) {
+        // A token never selects an expert twice, so decode items hold at most
+        // one route per row.
+        grouped_bf16_expert_kernel<16,1><<<dim3(outputs/16,max_items),512,0,stream>>>(sorted,
+            item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
     } else {
-        grouped_bf16_expert_kernel<<<dim3(outputs/16,max_items),256,0,stream>>>(sorted,item_expert,
-            item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
+        grouped_bf16_expert_kernel<8,8><<<dim3(outputs/16,max_items),256,0,stream>>>(sorted,
+            item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
     }
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_bf16_matvec(const float* x, const uint16_t* weight, float* y,
+    uint32_t rows, uint32_t outputs, uint32_t inputs, cudaStream_t stream) {
+    if(!rows || rows>8 || !outputs || !inputs || inputs%8) return cudaErrorInvalidValue;
+    bf16_matvec_kernel<8><<<(outputs+7)/8,256,0,stream>>>(x,weight,y,rows,outputs,inputs);
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_routed_sum(const float* routes, float* out,

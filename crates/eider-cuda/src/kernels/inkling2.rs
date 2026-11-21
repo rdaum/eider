@@ -140,6 +140,16 @@ unsafe extern "C" {
         outputs: u32,
         inputs: u32,
         tiled: bool,
+        max_columns: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn infer_inkling2_bf16_matvec(
+        x: *const f32,
+        weight: *const u16,
+        y: *mut f32,
+        rows: u32,
+        outputs: u32,
+        inputs: u32,
         stream: *mut c_void,
     ) -> i32;
     fn infer_inkling2_routed_sum(
@@ -701,6 +711,51 @@ pub fn grouped_bf16_expert(
                 outputs as u32,
                 inputs as u32,
                 routes >= TILED_ROUTES,
+                // A token selects distinct experts; larger items loop.
+                routes.div_ceil(top_k).min(u32::MAX as usize) as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Largest batch accepted by [`bf16_matvec`].
+pub const MATVEC_ROWS: usize = 8;
+
+/// Projects up to [`MATVEC_ROWS`] F32 rows through a BF16 `[outputs, inputs]`
+/// weight with F32 accumulation, one warp per output feature.
+pub fn bf16_matvec(
+    x: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
+    mut y: DeviceOutput<'_, f32>,
+    rows: usize,
+    outputs: usize,
+    inputs: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if rows == 0
+        || rows > MATVEC_ROWS
+        || outputs == 0
+        || inputs == 0
+        || !inputs.is_multiple_of(8)
+        || outputs > u32::MAX as usize
+        || inputs > u32::MAX as usize
+        || x.len() < rows * inputs
+        || y.len() < rows * outputs
+        || weight.len() != outputs * inputs
+    {
+        return Err(invalid("BF16 matrix-vector geometry mismatch"));
+    }
+    unsafe {
+        check_cuda(
+            "infer_inkling2_bf16_matvec",
+            infer_inkling2_bf16_matvec(
+                x.ptr,
+                weight.ptr,
+                y.buffer_mut().ptr,
+                rows as u32,
+                outputs as u32,
+                inputs as u32,
                 stream.as_raw(),
             ),
         )
@@ -1050,6 +1105,44 @@ mod tests {
     }
 
     #[test]
+    fn bf16_matvec_matches_cpu_for_each_batch_row() -> Result<()> {
+        crate::set_cuda_device(0)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let (outputs, inputs) = (37, 264);
+        let weights = (0..outputs * inputs)
+            .map(|i| bf(((i * 37 % 101) as f32 - 50.0) / 64.0))
+            .collect::<Vec<_>>();
+        let words = weights
+            .iter()
+            .map(|x| (x.to_bits() >> 16) as u16)
+            .collect::<Vec<_>>();
+        let weight = DeviceBuffer::from_host(&words)?;
+        for rows in [1, 3, MATVEC_ROWS] {
+            let input = (0..rows * inputs)
+                .map(|i| bf(((i * 13 % 29) as f32 - 14.0) / 8.0))
+                .collect::<Vec<_>>();
+            let x = DeviceBuffer::from_host(&input)?;
+            let mut y = DeviceBuffer::zeroed(rows * outputs)?;
+            bf16_matvec(&x, &weight, y.output(), rows, outputs, inputs, &stream)?;
+            let expected = (0..rows)
+                .flat_map(|r| {
+                    let input = &input;
+                    let weights = &weights;
+                    (0..outputs).map(move |o| {
+                        weights[o * inputs..][..inputs]
+                            .iter()
+                            .zip(&input[r * inputs..][..inputs])
+                            .map(|(w, x)| w * x)
+                            .sum::<f32>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            close(&y.copy_to_host(&stream)?, &expected, 1e-3)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn grouped_bf16_experts_match_cpu_for_shared_and_per_route_inputs() -> Result<()> {
         crate::set_cuda_device(0)?;
         let stream = CudaStream::new_non_blocking()?;
@@ -1113,6 +1206,28 @@ mod tests {
                 }
             }
             close(&output.copy_to_host(&stream)?, &expected, 0.05)?;
+            // Eight rows select the single-group kernel; these ids repeat
+            // experts within a token, so its items still loop.
+            let narrow = 8 * top_k;
+            let mut narrow_groups = MoeRouteGroups::new(narrow, experts)?;
+            narrow_groups.group_on_stream(&ids_device, narrow, &stream)?;
+            grouped_bf16_expert(
+                &narrow_groups,
+                &input_device,
+                &weights_device,
+                output.output(),
+                narrow,
+                top_k,
+                outputs,
+                inputs,
+                per_route_input,
+                &stream,
+            )?;
+            close(
+                &output.copy_to_host(&stream)?[..narrow * outputs],
+                &expected[..narrow * outputs],
+                0.05,
+            )?;
             // Fewer routes select the split-K kernel.
             let few = TILED_ROUTES - top_k;
             let mut few_groups = MoeRouteGroups::new(few, experts)?;

@@ -3,7 +3,7 @@
 use super::config::{Inkling2Config, TextConfig, invalid};
 use eider_cuda::{
     CudaStream, DeviceBuffer, F32DenseGemm, Result, Sm121W4A16GateUp, Sm121W4A16HostWeight,
-    round_f32_to_bf16_prefix_in_place_on_stream,
+    inkling2, round_f32_to_bf16_prefix_in_place_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use std::path::Path;
@@ -40,7 +40,9 @@ impl Linear {
         round_f32_to_bf16_prefix_in_place_on_stream(y.inout(), rows * self.rows, stream)
     }
 
-    /// Applies the projection to `rows` inputs with F32 outputs.
+    /// Applies the projection to `rows` BF16-valued inputs with F32 outputs.
+    /// Decode-sized batches use a bandwidth-bound matrix-vector kernel; prompt
+    /// chunks use the tensor-core GEMM.
     pub fn run_f32(
         &self,
         x: &DeviceBuffer<f32>,
@@ -49,6 +51,17 @@ impl Linear {
         rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        if rows <= inkling2::MATVEC_ROWS {
+            return inkling2::bf16_matvec(
+                x,
+                &self.weight,
+                y.output(),
+                rows,
+                self.rows,
+                self.cols,
+                stream,
+            );
+        }
         gemm.run_on_stream(
             x,
             &self.weight,

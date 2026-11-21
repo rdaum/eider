@@ -400,8 +400,9 @@ __global__ void group_routes_kernel(
 
 // Decode-sized batches: one CTA computes a 16-row output tile for one work
 // item, splitting K across warps. Each decoded weight fragment feeds one MMA
-// per eight routes, whose N columns are the routes.
-template <unsigned Warps>
+// per eight routes, whose N columns are the routes. Items with more than
+// `Groups * 8` routes repeat the K loop for the remaining columns.
+template <unsigned Warps, unsigned Groups>
 __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
     const std::uint32_t* __restrict__ sorted, const std::uint32_t* __restrict__ item_expert,
     const std::uint32_t* __restrict__ item_start, const std::uint32_t* __restrict__ item_count,
@@ -409,7 +410,6 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
     const std::uint8_t* __restrict__ tiled_weight, const std::uint8_t* __restrict__ tiled_scales,
     const float* __restrict__ global_scales, float* __restrict__ output, unsigned top_k,
     bool per_route_input, unsigned out_features, unsigned in_features) {
-    constexpr unsigned Groups = kGroupColumns / 8;
     const unsigned item = blockIdx.y;
     if (item >= items[0]) return;
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -420,63 +420,66 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
         tiled_weight + size_t(expert) * out_features * in_features / 2;
     const std::uint8_t* scales = tiled_scales + size_t(expert) * out_features * in_features / kTileK;
     const float global = global_scales[expert];
-    const float* rows[Groups];
-    #pragma unroll
-    for (unsigned g = 0; g < Groups; ++g) {
-        const unsigned column = g * 8 + row0;
-        rows[g] = nullptr;
-        if (column < count) {
-            const unsigned route = sorted[start + column];
-            rows[g] = input + size_t(per_route_input ? route : route / top_k) * in_features;
-        }
-    }
-    float d[Groups][4] = {};
-    for (unsigned k = warp; k < tiles; k += Warps) {
-        const size_t tile = size_t(blockIdx.x) * tiles + k;
-        const auto* w = weight + tile * kPackedTileBytes;
-        const auto* s = scales + tile * kScaleTileBytes;
-        float s0 = 0.f, s1 = 0.f;
-        if ((lane & 3) == 0) {
-            s0 = e4m3_value(s[row0]) * global;
-            s1 = e4m3_value(s[row1]) * global;
-        }
-        s0 = __shfl_sync(0xffffffffu, s0, row0 * 4);
-        s1 = __shfl_sync(0xffffffffu, s1, row0 * 4);
-        const auto a0 = dequant_pair(w[row0 * 8 + pair / 2], s0);
-        const auto a1 = dequant_pair(w[row1 * 8 + pair / 2], s1);
-        const auto a2 = dequant_pair(w[row0 * 8 + pair / 2 + 4], s0);
-        const auto a3 = dequant_pair(w[row1 * 8 + pair / 2 + 4], s1);
+    __shared__ float partial[Warps][Groups][16 * 8];
+    for (unsigned first = 0; first < count; first += Groups * 8) {
+        const float* rows[Groups];
         #pragma unroll
         for (unsigned g = 0; g < Groups; ++g) {
-            if (g * 8 >= count) break;
-            unsigned b0 = 0, b1 = 0;
-            if (rows[g]) {
-                const float* x = rows[g] + k * kTileK + pair;
-                b0 = pack_bf16_pair(x[0], x[1]);
-                b1 = pack_bf16_pair(x[8], x[9]);
+            const unsigned column = first + g * 8 + row0;
+            rows[g] = nullptr;
+            if (column < count) {
+                const unsigned route = sorted[start + column];
+                rows[g] = input + size_t(per_route_input ? route : route / top_k) * in_features;
             }
-            mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b0, b1);
         }
-    }
-    __shared__ float partial[Warps][Groups][16 * 8];
-    #pragma unroll
-    for (unsigned g = 0; g < Groups; ++g) {
-        partial[warp][g][row0 * 8 + pair] = d[g][0];
-        partial[warp][g][row0 * 8 + pair + 1] = d[g][1];
-        partial[warp][g][row1 * 8 + pair] = d[g][2];
-        partial[warp][g][row1 * 8 + pair + 1] = d[g][3];
-    }
-    __syncthreads();
-    for (unsigned index = threadIdx.x; index < Groups * 128; index += blockDim.x) {
-        const unsigned g = index / 128, cell = index % 128;
-        const unsigned column = g * 8 + cell % 8;
-        if (column >= count) continue;
-        float sum = 0.f;
+        float d[Groups][4] = {};
+        for (unsigned k = warp; k < tiles; k += Warps) {
+            const size_t tile = size_t(blockIdx.x) * tiles + k;
+            const auto* w = weight + tile * kPackedTileBytes;
+            const auto* s = scales + tile * kScaleTileBytes;
+            float s0 = 0.f, s1 = 0.f;
+            if ((lane & 3) == 0) {
+                s0 = e4m3_value(s[row0]) * global;
+                s1 = e4m3_value(s[row1]) * global;
+            }
+            s0 = __shfl_sync(0xffffffffu, s0, row0 * 4);
+            s1 = __shfl_sync(0xffffffffu, s1, row0 * 4);
+            const auto a0 = dequant_pair(w[row0 * 8 + pair / 2], s0);
+            const auto a1 = dequant_pair(w[row1 * 8 + pair / 2], s1);
+            const auto a2 = dequant_pair(w[row0 * 8 + pair / 2 + 4], s0);
+            const auto a3 = dequant_pair(w[row1 * 8 + pair / 2 + 4], s1);
+            #pragma unroll
+            for (unsigned g = 0; g < Groups; ++g) {
+                if (first + g * 8 >= count) break;
+                unsigned b0 = 0, b1 = 0;
+                if (rows[g]) {
+                    const float* x = rows[g] + k * kTileK + pair;
+                    b0 = pack_bf16_pair(x[0], x[1]);
+                    b1 = pack_bf16_pair(x[8], x[9]);
+                }
+                mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b0, b1);
+            }
+        }
         #pragma unroll
-        for (unsigned w = 0; w < Warps; ++w) sum += partial[w][g][cell];
-        const unsigned route = sorted[start + column];
-        output[size_t(route) * out_features + blockIdx.x * kTileM + cell / 8] =
-            __bfloat162float(__float2bfloat16_rn(sum));
+        for (unsigned g = 0; g < Groups; ++g) {
+            partial[warp][g][row0 * 8 + pair] = d[g][0];
+            partial[warp][g][row0 * 8 + pair + 1] = d[g][1];
+            partial[warp][g][row1 * 8 + pair] = d[g][2];
+            partial[warp][g][row1 * 8 + pair + 1] = d[g][3];
+        }
+        __syncthreads();
+        for (unsigned index = threadIdx.x; index < Groups * 128; index += blockDim.x) {
+            const unsigned g = index / 128, cell = index % 128;
+            const unsigned column = first + g * 8 + cell % 8;
+            if (column >= count) continue;
+            float sum = 0.f;
+            #pragma unroll
+            for (unsigned w = 0; w < Warps; ++w) sum += partial[w][g][cell];
+            const unsigned route = sorted[start + column];
+            output[size_t(route) * out_features + blockIdx.x * kTileM + cell / 8] =
+                __bfloat162float(__float2bfloat16_rn(sum));
+        }
+        __syncthreads();
     }
 }
 
@@ -593,10 +596,12 @@ extern "C" cudaError_t infer_sm121_w4a16_grouped_routes_on_stream(
     const std::uint32_t* items, unsigned max_items, const float* input,
     const std::uint8_t* tiled_weight, const std::uint8_t* tiled_scales,
     const float* global_scales, float* output, unsigned top_k, bool per_route_input,
-    unsigned out_features, unsigned in_features, bool tiled, cudaStream_t stream) {
+    unsigned out_features, unsigned in_features, bool tiled, unsigned max_columns,
+    cudaStream_t stream) {
     if (!sorted || !item_expert || !item_start || !item_count || !items || !max_items || !input
         || !tiled_weight || !tiled_scales || !global_scales || !output || !top_k
         || out_features % kTileM || in_features % kTileK) return cudaErrorInvalidValue;
+    const dim3 grid(out_features / kTileM, max_items);
     if (tiled) {
         constexpr unsigned Warps = 8;
         if (in_features % 8) return cudaErrorInvalidValue;
@@ -605,8 +610,14 @@ extern "C" cudaError_t infer_sm121_w4a16_grouped_routes_on_stream(
                 sorted, item_expert, item_start, item_count, items, input, tiled_weight,
                 tiled_scales, global_scales, output, top_k, per_route_input, out_features,
                 in_features);
+    } else if (max_columns <= 8) {
+        // A token never selects an expert twice, so decode items hold at most
+        // one route per row.
+        grouped_w4a16_kernel<16, 1><<<grid, 16 * 32, 0, stream>>>(
+            sorted, item_expert, item_start, item_count, items, input, tiled_weight, tiled_scales,
+            global_scales, output, top_k, per_route_input, out_features, in_features);
     } else {
-        grouped_w4a16_kernel<8><<<dim3(out_features / kTileM, max_items), 256, 0, stream>>>(
+        grouped_w4a16_kernel<8, kGroupColumns / 8><<<grid, 8 * 32, 0, stream>>>(
             sorted, item_expert, item_start, item_count, items, input, tiled_weight, tiled_scales,
             global_scales, output, top_k, per_route_input, out_features, in_features);
     }
