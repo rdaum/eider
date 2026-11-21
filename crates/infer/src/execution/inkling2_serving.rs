@@ -1,8 +1,10 @@
 //! Inkling 2 text and tool serving with shared global KV pages and retained prompt prefixes.
 
-use crate::inkling2::{Inkling2Model, Inkling2Sequence, Inkling2SequenceCache, Inkling2Workspace};
+use crate::inkling2::{
+    Inkling2Model, Inkling2Sequence, Inkling2SequenceCache, Inkling2Workspace, PAGE_TOKENS,
+};
 use eider_cuda::{Error, Result};
-use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::cache::{PrefixTargets, SequenceCacheConfig};
 use eider_runtime::chat::{CheckpointChatTemplate, Inkling2PromptRenderer};
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
@@ -29,9 +31,9 @@ struct Request<'m, 't> {
     stop: StopBuffer,
     usage: ChatUsage,
     called_tools: bool,
-    /// Page-aligned prompt position whose history is retained, or zero.
-    prefix_target: usize,
-    prefix_retained: bool,
+    /// Prompt positions whose history is retained: the shared preamble and
+    /// the largest aligned prompt prefix.
+    prefix: PrefixTargets,
 }
 
 pub(crate) struct Inkling2ChatService<'m, 't> {
@@ -83,12 +85,19 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
         }
         // The reference frontend renders Inkling natively rather than through
         // the checkpoint's Jinja template.
-        let prompt = self.renderer.render(
+        let rendered = self.renderer.render(
             &request.messages,
             &request.tools,
             request.template,
             request.parallel_tool_calls,
         )?;
+        let prefix = PrefixTargets::new(
+            rendered.token_ids.len(),
+            rendered.conversation_start,
+            PAGE_TOKENS,
+            self.retain_prefixes,
+        );
+        let prompt = rendered.token_ids;
         let total = prompt
             .len()
             .checked_add(request.generation.max_new_tokens)
@@ -130,12 +139,7 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                     ..ChatUsage::default()
                 },
                 called_tools: false,
-                prefix_target: if self.retain_prefixes {
-                    self.cache.cacheable_prefix_tokens(admission.prompt_tokens)
-                } else {
-                    0
-                },
-                prefix_retained: false,
+                prefix,
             },
         );
         self.waiting.push_back(id);
@@ -163,7 +167,7 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             let cached = sequence.position();
             request.position = cached;
             request.usage.cached_prompt_tokens = cached;
-            request.prefix_retained = cached == request.prefix_target;
+            request.prefix.restored(cached);
             let bytes = sequence.device_bytes();
             let restore = sequence.restore_duration();
             request.sequence = Some(sequence);
@@ -245,27 +249,26 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                 continue;
             }
             lifecycle(EngineLifecycleEvent::PrefillStarted(id));
-            // Stop at the retained-prefix boundary so its history can be copied.
-            let limit = if request.prefix_retained || request.prefix_target == 0 {
-                request.prompt.len()
-            } else {
-                request.prefix_target
-            };
-            let end = (request.position + token_budget.min(self.prefill.capacity())).min(limit);
+            // Stop at each retained-prefix boundary so its history can be copied.
+            let rows = request
+                .prefix
+                .chunk(request.position, token_budget.min(self.prefill.capacity()))
+                .min(request.prompt.len() - request.position);
+            let end = request.position + rows;
             self.model.forward(
                 &mut self.prefill,
                 sequence,
                 &mut self.cache,
                 &request.prompt[request.position..end],
             )?;
-            if !request.prefix_retained && end == request.prefix_target {
+            if request.prefix.next() == Some(end) {
                 if let Err(error) =
                     self.model
                         .retain_prefix(&mut self.cache, sequence, &request.prompt)
                 {
                     tracing::warn!(%error, "could not retain Inkling 2 prompt prefix");
                 }
-                request.prefix_retained = true;
+                request.prefix.advance();
             }
             token_budget -= end - request.position;
             sequence_budget -= 1;

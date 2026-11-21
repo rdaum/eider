@@ -48,6 +48,16 @@ struct Ids {
     end_message: u32,
 }
 
+/// Rendered Inkling 2 prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Inkling2Prompt {
+    /// Prompt token IDs.
+    pub token_ids: Vec<u32>,
+    /// Position after the tool declarations, leading system messages, and
+    /// effort block, where the first conversation message begins.
+    pub conversation_start: Option<usize>,
+}
+
 /// Inkling 2 renderer holding a payload tokenizer that splits special tokens.
 pub struct Inkling2PromptRenderer {
     payload: Tokenizer,
@@ -87,8 +97,9 @@ impl Inkling2PromptRenderer {
         tools: &[ChatTool],
         options: ChatTemplateOptions,
         parallel_tool_calls: bool,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Inkling2Prompt> {
         let mut ids = Vec::new();
+        let mut conversation_start = None;
         if !tools.is_empty() {
             let declarations = tool_declarations(tools)?;
             self.block(
@@ -122,6 +133,7 @@ impl Inkling2PromptRenderer {
                 && let Some(text) = effort.take()
             {
                 self.block(&mut ids, ChatRole::System, None, Kind::Text, &text)?;
+                conversation_start = Some(ids.len());
             }
             match message.role {
                 ChatRole::Assistant => self.assistant(&mut ids, message, &mut tool_names)?,
@@ -145,7 +157,10 @@ impl Inkling2PromptRenderer {
         if let Some(text) = effort {
             self.block(&mut ids, ChatRole::System, None, Kind::Text, &text)?;
         }
-        Ok(ids)
+        Ok(Inkling2Prompt {
+            token_ids: ids,
+            conversation_start,
+        })
     }
 
     fn assistant(
@@ -431,10 +446,17 @@ mod tests {
             ..ChatTemplateOptions::default()
         };
         for (key, parallel) in [("parallel", true), ("single", false)] {
+            let prompt = renderer.render(&messages, &tools, low, parallel).unwrap();
+            assert_eq!(prompt.token_ids, expected[key], "{key}");
+            // The conversation starts at the first user message.
+            let start = prompt.conversation_start.expect("conversation start");
             assert_eq!(
-                renderer.render(&messages, &tools, low, parallel).unwrap(),
-                expected[key],
-                "{key}"
+                prompt.token_ids[start],
+                tokenizer.token_to_id(MESSAGE_USER).unwrap()
+            );
+            assert_eq!(
+                prompt.token_ids[start - 1],
+                tokenizer.token_to_id(END_MESSAGE).unwrap()
             );
         }
         let disabled = ChatTemplateOptions {
@@ -445,7 +467,8 @@ mod tests {
         assert_eq!(
             renderer
                 .render(&[ChatMessage::user("Hi")], &[], disabled, true)
-                .unwrap(),
+                .unwrap()
+                .token_ids,
             expected["no_tools_no_thinking"]
         );
     }

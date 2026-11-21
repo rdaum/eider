@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
 
 mod inkling2;
 
-pub use inkling2::Inkling2PromptRenderer;
+pub use inkling2::{Inkling2Prompt, Inkling2PromptRenderer};
 
 const TEMPLATE_NAME: &str = "chat_template";
 
@@ -213,6 +213,10 @@ pub struct TokenizedChatPrompt {
     pub text: String,
     /// Prompt token IDs produced without an additional tokenizer post-processor.
     pub token_ids: Vec<u32>,
+    /// Token position where the leading system and developer messages end,
+    /// when their own rendering is an exact prefix of the prompt. Prompts
+    /// that share these instructions and tool declarations share this prefix.
+    pub conversation_start: Option<usize>,
 }
 
 /// Checkpoint-owned chat template paired with its tokenizer.
@@ -335,17 +339,50 @@ impl CheckpointChatTemplate {
         options: ChatTemplateOptions,
     ) -> Result<TokenizedChatPrompt> {
         let text = self.render(messages, tools, options)?;
+        let token_ids = self.tokenize(&text)?;
+        let conversation_start = self.conversation_start(messages, tools, options, &token_ids);
+        Ok(TokenizedChatPrompt {
+            text,
+            token_ids,
+            conversation_start,
+        })
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
-            .encode(text.as_str(), false)
+            .encode(text, false)
             .map_err(|error| Error::Format {
                 label: "chat prompt tokenization",
                 detail: error.to_string(),
             })?;
-        Ok(TokenizedChatPrompt {
-            text,
-            token_ids: encoding.get_ids().to_vec(),
-        })
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Renders only the leading system and developer messages. Templates may
+    /// reject such a conversation or render it differently from the same
+    /// messages within the full prompt; neither yields a boundary.
+    fn conversation_start(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        options: ChatTemplateOptions,
+        token_ids: &[u32],
+    ) -> Option<usize> {
+        let leading = messages
+            .iter()
+            .take_while(|message| matches!(message.role, ChatRole::System | ChatRole::Developer))
+            .count();
+        if leading == 0 || leading == messages.len() {
+            return None;
+        }
+        let options = ChatTemplateOptions {
+            add_generation_prompt: false,
+            ..options
+        };
+        let text = self.render(&messages[..leading], tools, options).ok()?;
+        let prefix = self.tokenize(&text).ok()?;
+        (prefix.len() < token_ids.len() && token_ids.starts_with(&prefix)).then_some(prefix.len())
     }
 }
 
@@ -706,6 +743,76 @@ mod tests {
                 .unwrap(),
             "[system:system\n\ndeveloper][user:question]"
         );
+    }
+
+    fn word_template(source: &str) -> CheckpointChatTemplate {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        let words = [
+            "[unk]",
+            "system",
+            "user",
+            "assistant",
+            "rules",
+            "question",
+            "multi",
+            "|",
+        ];
+        let vocab = words
+            .iter()
+            .enumerate()
+            .map(|(id, word)| (word.to_string(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+        CheckpointChatTemplate {
+            environment: build_environment(source.into()).unwrap(),
+            tokenizer,
+            template_path: PathBuf::new(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+            native_developer_role: true,
+        }
+    }
+
+    #[test]
+    fn conversation_start_marks_a_stable_system_preamble() {
+        let messages = [ChatMessage::system("rules"), ChatMessage::user("question")];
+        let stable = word_template(
+            "{% for m in messages %}{{ m.role }} {{ m.content }} | {% endfor %}\
+             {% if add_generation_prompt %}assistant{% endif %}",
+        );
+        let prompt = stable
+            .render_and_tokenize(&messages, &[], ChatTemplateOptions::default())
+            .unwrap();
+        // "system rules |" precedes the conversation.
+        assert_eq!(prompt.conversation_start, Some(3));
+        assert_eq!(&prompt.token_ids[..3], &[1, 4, 7]);
+
+        // A preamble that changes once later messages exist is not shared.
+        let unstable = word_template(
+            "{% if messages|length > 1 %}multi {% endif %}\
+             {% for m in messages %}{{ m.role }} {{ m.content }} | {% endfor %}",
+        );
+        let prompt = unstable
+            .render_and_tokenize(&messages, &[], ChatTemplateOptions::default())
+            .unwrap();
+        assert_eq!(prompt.conversation_start, None);
+
+        // Without leading instructions there is no preamble.
+        let prompt = stable
+            .render_and_tokenize(
+                &[ChatMessage::user("question")],
+                &[],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(prompt.conversation_start, None);
     }
 
     fn tool_definition() -> ChatTool {

@@ -28,12 +28,14 @@ fn main() -> Result<()> {
         .next()
         .unwrap_or_else(|| "Explain looped inference in one sentence.".to_string());
     let template = CheckpointChatTemplate::from_model_dir(&root)?;
-    let prompt = Inkling2PromptRenderer::new(template.tokenizer())?.render(
-        &[ChatMessage::user(text)],
-        &[],
-        ChatTemplateOptions::default(),
-        true,
-    )?;
+    let prompt = Inkling2PromptRenderer::new(template.tokenizer())?
+        .render(
+            &[ChatMessage::user(text)],
+            &[],
+            ChatTemplateOptions::default(),
+            true,
+        )?
+        .token_ids;
     println!("prompt token ids: {prompt:?}");
     let model = Inkling2Model::load(root)?;
     let mut workspace = model.new_workspace(prompt.len().max(1))?;
