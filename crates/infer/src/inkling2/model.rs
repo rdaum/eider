@@ -7,14 +7,19 @@
 //! for every chunk; only per-visit caches persist in the sequence.
 
 use super::config::{Inkling2Config, Visit, invalid};
+use super::sequence::{
+    Inkling2CacheContext, Inkling2PageTable, Inkling2SequenceCache, PAGE_TOKENS, cache_error,
+};
 use super::weights::{Controller, ExpertStorage, ShortConvolution, Weights};
 use eider_cuda::{
     CudaStream, DeviceBuffer, F32DenseGemm, GemmPrecision, MoeRouteGroups, PinnedHostBuffer,
-    Result, SinkAttentionCache, SinkAttentionWorkspace, add_f32_prefix_into_on_stream,
+    RelativeKv, Result, SinkAttentionCache, SinkAttentionWorkspace, add_f32_prefix_into_on_stream,
     argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream, inkling2,
     round_f32_to_bf16_prefix_in_place_on_stream,
 };
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Attention Residual blocks hold at most the embedding and three later blocks.
 const BLOCKS: usize = 4;
@@ -22,26 +27,98 @@ const BLOCKS: usize = 4;
 pub struct Inkling2Model {
     config: Inkling2Config,
     weights: Weights,
-    stream: CudaStream,
+    pub(super) stream: CudaStream,
+    pub(super) cache_namespace: Arc<()>,
+    /// Page-bundle slot of each global cache layer; `None` for local visits.
+    global_slots: Vec<Option<usize>>,
+    /// Private bytes of one sequence; they do not depend on its context.
+    private_bytes: usize,
 }
 
-struct VisitState {
-    cache: SinkAttentionCache,
+/// Request-private history of one visit. Global visits keep their KV in
+/// shared pages, so only local visits own a KV ring.
+pub(super) struct VisitState {
+    cache: Option<SinkAttentionCache>,
     k_conv: DeviceBuffer<f32>,
     v_conv: DeviceBuffer<f32>,
     attention_conv: DeviceBuffer<f32>,
     mlp_conv: DeviceBuffer<f32>,
 }
 
+impl VisitState {
+    fn convolutions(&self) -> [&DeviceBuffer<f32>; 4] {
+        [
+            &self.k_conv,
+            &self.v_conv,
+            &self.attention_conv,
+            &self.mlp_conv,
+        ]
+    }
+
+    pub(super) fn device_bytes(&self) -> usize {
+        self.cache
+            .as_ref()
+            .map_or(0, SinkAttentionCache::device_bytes)
+            + self
+                .convolutions()
+                .iter()
+                .map(|buffer| buffer.device_bytes())
+                .sum::<usize>()
+    }
+
+    pub(super) fn snapshot(&self, stream: &CudaStream) -> Result<Self> {
+        let copy = |buffer: &DeviceBuffer<f32>| {
+            let mut copy = DeviceBuffer::zeroed(buffer.len())?;
+            copy.copy_prefix_from_device_on_stream(buffer, buffer.len(), stream)?;
+            Ok::<_, eider_cuda::Error>(copy)
+        };
+        Ok(Self {
+            cache: self
+                .cache
+                .as_ref()
+                .map(|cache| cache.snapshot(stream))
+                .transpose()?,
+            k_conv: copy(&self.k_conv)?,
+            v_conv: copy(&self.v_conv)?,
+            attention_conv: copy(&self.attention_conv)?,
+            mlp_conv: copy(&self.mlp_conv)?,
+        })
+    }
+
+    pub(super) fn restore(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        match (&mut self.cache, &source.cache) {
+            (Some(cache), Some(source)) => cache.restore(source, stream)?,
+            (None, None) => {}
+            _ => return Err(invalid("visit snapshot geometry mismatch")),
+        }
+        for (target, source) in [
+            (&mut self.k_conv, &source.k_conv),
+            (&mut self.v_conv, &source.v_conv),
+            (&mut self.attention_conv, &source.attention_conv),
+            (&mut self.mlp_conv, &source.mlp_conv),
+        ] {
+            if target.len() != source.len() {
+                return Err(invalid("convolution snapshot geometry mismatch"));
+            }
+            target.copy_prefix_from_device_on_stream(source, source.len(), stream)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Inkling2Sequence<'m> {
     model: &'m Inkling2Model,
-    visits: Vec<VisitState>,
-    position: usize,
+    pub(super) visits: Vec<VisitState>,
+    pub(super) position: usize,
     capacity: usize,
-    valid: bool,
+    pub(super) valid: bool,
     logits: DeviceBuffer<f32>,
     next_id: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
+    pub(super) table: Inkling2PageTable,
+    pub(super) cache_id: Option<seqcache::SequenceId>,
+    pub(super) cache_identity: Option<Arc<()>>,
+    pub(super) restore_duration: Duration,
 }
 
 /// Per-chunk Attention Residual state, `[rows, hidden]` per buffer.
@@ -125,11 +202,37 @@ impl Inkling2Model {
         let weights = Weights::load(root, &config)?;
         let stream = CudaStream::new_non_blocking()?;
         stream.synchronize()?;
-        Ok(Self {
+        let mut next = 0;
+        let global_slots = config
+            .schedule()
+            .into_iter()
+            .map(|visit| {
+                (!visit.local).then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect();
+        let mut model = Self {
             config,
             weights,
             stream,
-        })
+            cache_namespace: Arc::new(()),
+            global_slots,
+            private_bytes: 0,
+        };
+        model.private_bytes = model.new_sequence(1)?.private_bytes();
+        Ok(model)
+    }
+
+    /// Global visits sharing one page bundle.
+    pub(super) fn global_visits(&self) -> usize {
+        self.global_slots.iter().flatten().count()
+    }
+
+    /// Request-private device bytes of every sequence.
+    pub(super) fn private_sequence_bytes(&self) -> usize {
+        self.private_bytes
     }
 
     pub fn config(&self) -> &Inkling2Config {
@@ -223,7 +326,8 @@ impl Inkling2Model {
         })
     }
 
-    pub fn new_sequence(&self, capacity: usize) -> Result<Inkling2Sequence<'_>> {
+    /// Allocates request-private state; [`Inkling2Model::admit`] attaches it to a cache.
+    pub(super) fn new_sequence(&self, capacity: usize) -> Result<Inkling2Sequence<'_>> {
         let c = &self.config.text_config;
         if capacity == 0 || capacity > c.model_max_length {
             return Err(invalid("sequence exceeds the text checkpoint context"));
@@ -236,14 +340,12 @@ impl Inkling2Model {
             .into_iter()
             .map(|visit| {
                 Ok(VisitState {
-                    cache: SinkAttentionCache::new(
-                        if visit.local {
-                            c.sliding_window_size
-                        } else {
-                            capacity
-                        },
-                        c.num_key_value_heads,
-                    )?,
+                    cache: visit
+                        .local
+                        .then(|| {
+                            SinkAttentionCache::new(c.sliding_window_size, c.num_key_value_heads)
+                        })
+                        .transpose()?,
                     k_conv: DeviceBuffer::zeroed(history)?,
                     v_conv: DeviceBuffer::zeroed(history)?,
                     attention_conv: DeviceBuffer::zeroed(h * (c.sconv_kernel_size - 1))?,
@@ -260,15 +362,21 @@ impl Inkling2Model {
             logits: DeviceBuffer::zeroed(c.vocab_size)?,
             next_id: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
+            table: Inkling2PageTable::new(capacity)?,
+            cache_id: None,
+            cache_identity: None,
+            restore_duration: Duration::ZERO,
         })
     }
 
     /// Executes an ordered prompt chunk or a single decode token. Logits are
-    /// produced for the chunk's last token.
+    /// produced for the chunk's last token. Global K/V pages are reserved before
+    /// the chunk and committed after it.
     pub fn forward(
         &self,
         w: &mut Inkling2Workspace,
         s: &mut Inkling2Sequence,
+        cache: &mut Inkling2SequenceCache,
         tokens: &[u32],
     ) -> Result<()> {
         let c = &self.config.text_config;
@@ -284,11 +392,46 @@ impl Inkling2Model {
         {
             return Err(invalid("invalid model, sequence, tokens or workspace"));
         }
+        s.validate_cache(cache)?;
+        let id = s.cache_id.ok_or_else(|| invalid("unadmitted sequence"))?;
+        let reservation = cache
+            .reserve_append(
+                id,
+                tokens.len(),
+                &mut Inkling2CacheContext {
+                    stream: &self.stream,
+                    table: &mut s.table,
+                },
+            )
+            .map_err(cache_error)?;
         s.valid = false;
-        let result = self.forward_chunk(w, s, tokens);
-        let completion = self.synchronize();
-        result?;
-        completion?;
+        let result = self
+            .forward_chunk(w, s, tokens)
+            .and_then(|()| self.synchronize());
+        let committed = result.and_then(|()| {
+            cache
+                .commit_append(
+                    reservation.clone(),
+                    tokens.len(),
+                    &mut Inkling2CacheContext {
+                        stream: &self.stream,
+                        table: &mut s.table,
+                    },
+                )
+                .map_err(cache_error)
+        });
+        if let Err(error) = committed {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Inkling2CacheContext {
+                        stream: &self.stream,
+                        table: &mut s.table,
+                    },
+                )
+                .map_err(cache_error)?;
+            return Err(error);
+        }
         s.position += tokens.len();
         s.valid = true;
         Ok(())
@@ -552,8 +695,18 @@ impl Inkling2Model {
             c.rel_extent,
             stream,
         )?;
+        let kv = match (&mut state.cache, self.global_slots[visit.cache_layer]) {
+            (Some(ring), None) => RelativeKv::Ring(ring),
+            (None, Some(slot)) => RelativeKv::Pages {
+                table: &s.table.device,
+                layer_offset: slot * 2 * PAGE_TOKENS * kv,
+                position: s.position,
+                kv_heads,
+            },
+            _ => return Err(invalid("visit KV storage does not match its schedule")),
+        };
         w.attention.run_relative(
-            &mut state.cache,
+            kv,
             &w.q_clipped,
             &w.k_clipped,
             &w.v_normalized,
@@ -969,25 +1122,25 @@ impl Inkling2Workspace<'_> {
 }
 
 impl Inkling2Sequence<'_> {
+    /// Private device state and page-table bytes. Shared global pages are
+    /// accounted once by the sequence cache.
     pub fn device_bytes(&self) -> usize {
+        self.private_bytes() + self.table.bytes()
+    }
+
+    pub(super) fn private_bytes(&self) -> usize {
         self.visits
             .iter()
-            .map(|visit| {
-                visit.cache.device_bytes()
-                    + [
-                        &visit.k_conv,
-                        &visit.v_conv,
-                        &visit.attention_conv,
-                        &visit.mlp_conv,
-                    ]
-                    .iter()
-                    .map(|buffer| buffer.device_bytes())
-                    .sum::<usize>()
-            })
+            .map(VisitState::device_bytes)
             .sum::<usize>()
             + self.logits.device_bytes()
             + self.next_id.device_bytes()
             + self.next_value.device_bytes()
+    }
+
+    /// Time spent restoring retained visit history during admission.
+    pub fn restore_duration(&self) -> Duration {
+        self.restore_duration
     }
 
     pub fn position(&self) -> usize {

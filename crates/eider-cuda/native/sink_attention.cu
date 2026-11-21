@@ -240,16 +240,14 @@ extern "C" cudaError_t infer_causal_sink_attention(
     return cudaGetLastError();
 }
 
-// Rows are evaluated in sub-chunks whose softmax partials fit `partial_capacity`.
-// Every sub-chunk reads earlier rows of the same chunk from `k`/`v`; the
-// chunk is appended to the cache once all rows have attended.
-extern "C" cudaError_t infer_causal_relative_attention(
-    const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, const float* k, const float* v,
-    const float* relative, const float* gate, const float* sinks, float* partial, float* out,
-    uint32_t end, uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity,
-    uint32_t rel_extent, uint64_t partial_capacity, cudaStream_t stream) {
-    if(!q || !ck || !cv || !k || !v || !relative || !gate || !sinks || !partial || !out
-        || !rel_extent || !rows) return cudaErrorInvalidValue;
+template <bool Paged>
+cudaError_t relative_attention(
+    const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
+    uint32_t layer_offset, const float* k, const float* v, const float* relative,
+    const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
+    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
+    uint64_t partial_capacity, cudaStream_t stream) {
+    constexpr uint32_t PageTokens=128;
     for(uint32_t first=0;first<rows;) {
         const uint32_t splits=(min(uint64_t(end)+rows,uint64_t(capacity))+255)/256;
         const uint64_t per_row=uint64_t(qheads)*splits*130;
@@ -257,20 +255,41 @@ extern "C" cudaError_t infer_causal_relative_attention(
         if(count==0) return cudaErrorInvalidValue;
         const size_t qoff=size_t(first)*qheads;
         if(count>=64)
-            prefill_attention<false><<<dim3(qheads,(count+15)/16,splits),256,0,stream>>>(
-                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,nullptr,0,0,
-                nullptr,relative+qoff*rel_extent,rel_extent,first);
+            prefill_attention<Paged><<<dim3(qheads,(count+15)/16,splits),256,0,stream>>>(
+                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,pages,
+                layer_offset,PageTokens,nullptr,relative+qoff*rel_extent,rel_extent,first);
         else
-            partial_attention<false><<<dim3(qheads,count,splits),32,0,stream>>>(
-                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,nullptr,0,0,
-                nullptr,nullptr,nullptr,nullptr,0,0,relative+qoff*rel_extent,rel_extent,first);
+            partial_attention<Paged><<<dim3(qheads,count,splits),32,0,stream>>>(
+                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,pages,
+                layer_offset,PageTokens,nullptr,nullptr,nullptr,nullptr,0,0,
+                relative+qoff*rel_extent,rel_extent,first);
         merge_relative_attention<<<qheads*count,32,0,stream>>>(
             partial,gate+qoff*128,sinks+qoff,out+qoff*128,splits,qheads);
         first+=count;
     }
-    append_kv<false><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
-        k,v,ck,cv,end,rows,kvheads*128,capacity,nullptr,0,0,nullptr);
+    append_kv<Paged><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
+        k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,PageTokens,nullptr);
     return cudaGetLastError();
+}
+
+// Rows are evaluated in sub-chunks whose softmax partials fit `partial_capacity`.
+// Every sub-chunk reads earlier rows of the same chunk from `k`/`v`; the
+// chunk is appended to the cache once all rows have attended. With `pages`,
+// K/V live in 128-token page bundles at `layer_offset` and the window is
+// unbounded; otherwise they live in a `capacity`-position local ring.
+extern "C" cudaError_t infer_causal_relative_attention(
+    const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
+    uint32_t layer_offset, const float* k, const float* v, const float* relative,
+    const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
+    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
+    uint64_t partial_capacity, cudaStream_t stream) {
+    if(!q || !k || !v || !relative || !gate || !sinks || !partial || !out || !rel_extent || !rows
+        || (pages ? (ck || cv) : (!ck || !cv))) return cudaErrorInvalidValue;
+    if(pages)
+        return relative_attention<true>(q,nullptr,nullptr,pages,layer_offset,k,v,relative,gate,
+            sinks,partial,out,end,rows,qheads,kvheads,UINT32_MAX,rel_extent,partial_capacity,stream);
+    return relative_attention<false>(q,ck,cv,nullptr,0,k,v,relative,gate,sinks,partial,out,end,
+        rows,qheads,kvheads,capacity,rel_extent,partial_capacity,stream);
 }
 
 // Page bundles hold [global layer][K/V][page token][KV head][dimension].

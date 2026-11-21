@@ -52,6 +52,8 @@ unsafe extern "C" {
         q: *const f32,
         ck: *mut u16,
         cv: *mut u16,
+        pages: *const DeviceAddress<u16>,
+        layer_offset: u32,
         k: *const f32,
         v: *const f32,
         relative: *const f32,
@@ -251,6 +253,25 @@ impl SinkAttentionDecodeBatch {
 }
 
 /// Split-attention scratch shared across model layers.
+/// K/V storage read and appended by relative attention.
+pub enum RelativeKv<'a> {
+    /// A bounded local ring that tracks its own position.
+    Ring(&'a mut SinkAttentionCache),
+    /// Shared 128-token page bundles of one global layer. `layer_offset` is the
+    /// element offset of the layer's keys within a page; values follow them.
+    Pages {
+        /// Device addresses of the sequence's page bundles.
+        table: &'a DeviceBuffer<DeviceAddress<u16>>,
+        /// Element offset of this layer's keys within each page bundle.
+        layer_offset: usize,
+        /// Tokens already appended before this chunk.
+        position: usize,
+        /// Key/value heads per token.
+        kv_heads: usize,
+    },
+}
+
+/// Softmax partial storage shared by sink-attention evaluations.
 pub struct SinkAttentionWorkspace {
     partial: DeviceBuffer<f32>,
     rows: usize,
@@ -450,7 +471,7 @@ impl SinkAttentionWorkspace {
     #[allow(clippy::too_many_arguments)]
     pub fn run_relative(
         &mut self,
-        cache: &mut SinkAttentionCache,
+        kv: RelativeKv<'_>,
         q: &DeviceBuffer<f32>,
         k: &DeviceBuffer<f32>,
         v: &DeviceBuffer<f32>,
@@ -462,33 +483,56 @@ impl SinkAttentionWorkspace {
         rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let end = cache
-            .position
+        let (position, kv_heads, capacity) = match &kv {
+            RelativeKv::Ring(cache) => (cache.position, cache.kv_heads, cache.capacity),
+            RelativeKv::Pages {
+                position, kv_heads, ..
+            } => (*position, *kv_heads, self.max_context),
+        };
+        let end = position
             .checked_add(rows)
             .filter(|&v| v <= u32::MAX as usize)
             .ok_or_else(|| invalid("position overflow"))?;
         if rows == 0
-            || cache.capacity > self.max_context
-            || !self.heads.is_multiple_of(cache.kv_heads)
+            || capacity > self.max_context
+            || kv_heads == 0
+            || !self.heads.is_multiple_of(kv_heads)
             || q.len() < rows * self.heads * 128
             || out.len() < rows * self.heads * 128
-            || k.len() < rows * cache.kv_heads * 128
-            || v.len() < rows * cache.kv_heads * 128
+            || k.len() < rows * kv_heads * 128
+            || v.len() < rows * kv_heads * 128
             || relative.len() < rows * self.heads * rel_extent
             || gate.len() < rows * self.heads * 128
             || sinks.len() < rows * self.heads
             || rel_extent == 0
             || rel_extent > u32::MAX as usize
+            || matches!(&kv, RelativeKv::Pages { table, layer_offset, .. }
+                if table.len() < end.div_ceil(128) || *layer_offset > u32::MAX as usize)
         {
             return Err(invalid("relative attention buffer or capacity mismatch"));
         }
+        let (ck, cv, pages, layer_offset) = match &kv {
+            RelativeKv::Ring(cache) => (cache.key.ptr, cache.value.ptr, std::ptr::null(), 0),
+            RelativeKv::Pages {
+                table,
+                layer_offset,
+                ..
+            } => (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                table.ptr.cast_const(),
+                *layer_offset as u32,
+            ),
+        };
         unsafe {
             check_cuda(
                 "infer_causal_relative_attention",
                 infer_causal_relative_attention(
                     q.ptr,
-                    cache.key.ptr,
-                    cache.value.ptr,
+                    ck,
+                    cv,
+                    pages,
+                    layer_offset,
                     k.ptr,
                     v.ptr,
                     relative.ptr,
@@ -496,18 +540,20 @@ impl SinkAttentionWorkspace {
                     sinks.ptr,
                     self.partial.ptr,
                     out.ptr,
-                    cache.position as u32,
+                    position as u32,
                     rows as u32,
                     self.heads as u32,
-                    cache.kv_heads as u32,
-                    cache.capacity as u32,
+                    kv_heads as u32,
+                    capacity as u32,
                     rel_extent as u32,
                     self.partial.len() as u64,
                     stream.as_raw(),
                 ),
             )?;
         }
-        cache.position = end;
+        if let RelativeKv::Ring(cache) = kv {
+            cache.position = end;
+        }
         Ok(())
     }
 

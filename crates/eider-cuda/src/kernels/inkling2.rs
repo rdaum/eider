@@ -771,7 +771,7 @@ pub fn finish_logits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SinkAttentionCache, SinkAttentionWorkspace};
+    use crate::{DeviceAddress, RelativeKv, SinkAttentionCache, SinkAttentionWorkspace};
 
     fn bf(x: f32) -> f32 {
         let bits = x.to_bits();
@@ -1156,7 +1156,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         )?;
         workspace.run_relative(
-            &mut cache, &query, &key, &v1, &r1, &gate, &sinks, &mut out, 4, 1, &stream,
+            RelativeKv::Ring(&mut cache),
+            &query,
+            &key,
+            &v1,
+            &r1,
+            &gate,
+            &sinks,
+            &mut out,
+            4,
+            1,
+            &stream,
         )?;
         let first = [vec![bf(0.5 / (1.0 + (-1f32).exp())); 128], vec![0.25; 128]].concat();
         close(&out.copy_to_host(&stream)?, &first, 0.0001)?;
@@ -1167,7 +1177,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         )?;
         workspace.run_relative(
-            &mut cache, &query, &key, &v2, &r2, &gate, &sinks, &mut out, 4, 1, &stream,
+            RelativeKv::Ring(&mut cache),
+            &query,
+            &key,
+            &v2,
+            &r2,
+            &gate,
+            &sinks,
+            &mut out,
+            4,
+            1,
+            &stream,
         )?;
         let expected_head = 0.5;
         close(
@@ -1214,7 +1234,7 @@ mod tests {
             for &rows in sizes {
                 let mut out = DeviceBuffer::zeroed(rows * heads * 128)?;
                 workspace.run_relative(
-                    &mut cache,
+                    RelativeKv::Ring(&mut cache),
                     &slice(&q, heads * 128, first, rows)?,
                     &slice(&k, 128, first, rows)?,
                     &slice(&v, 128, first, rows)?,
@@ -1238,6 +1258,61 @@ mod tests {
         let grouped = run(&mut SinkAttentionWorkspace::new(1, heads, 256)?, &chunks)?;
         close(&chunked, &expected, 2e-5)?;
         close(&grouped, &expected, 0.0)?;
+
+        // Global pages have no window: compare with a ring holding all rows.
+        let full = {
+            let mut cache = SinkAttentionCache::new(128, 1)?;
+            let mut workspace = SinkAttentionWorkspace::new(1, heads, 256)?;
+            let mut outputs = Vec::new();
+            for first in 0..total {
+                let mut out = DeviceBuffer::zeroed(heads * 128)?;
+                workspace.run_relative(
+                    RelativeKv::Ring(&mut cache),
+                    &slice(&q, heads * 128, first, 1)?,
+                    &slice(&k, 128, first, 1)?,
+                    &slice(&v, 128, first, 1)?,
+                    &slice(&rel, heads * extent, first, 1)?,
+                    &slice(&gate, heads * 128, first, 1)?,
+                    &slice(&sinks, heads, first, 1)?,
+                    &mut out,
+                    extent,
+                    1,
+                    &stream,
+                )?;
+                outputs.extend_from_slice(&out.copy_to_host(&stream)?);
+            }
+            outputs
+        };
+        // One page bundle: [layer 1][K/V][128 tokens][1 head][128].
+        let page = DeviceBuffer::<u16>::zeroed(2 * 128 * 128)?;
+        let table = DeviceBuffer::<DeviceAddress<u16>>::from_host(&[page.cuda_address()])?;
+        let mut workspace = SinkAttentionWorkspace::new(128, heads, 256)?;
+        let mut paged = Vec::new();
+        let mut first = 0;
+        for rows in chunks {
+            let mut out = DeviceBuffer::zeroed(rows * heads * 128)?;
+            workspace.run_relative(
+                RelativeKv::Pages {
+                    table: &table,
+                    layer_offset: 0,
+                    position: first,
+                    kv_heads: 1,
+                },
+                &slice(&q, heads * 128, first, rows)?,
+                &slice(&k, 128, first, rows)?,
+                &slice(&v, 128, first, rows)?,
+                &slice(&rel, heads * extent, first, rows)?,
+                &slice(&gate, heads * 128, first, rows)?,
+                &slice(&sinks, heads, first, rows)?,
+                &mut out,
+                extent,
+                rows,
+                &stream,
+            )?;
+            paged.extend_from_slice(&out.copy_to_host(&stream)?);
+            first += rows;
+        }
+        close(&paged, &full, 2e-5)?;
         Ok(())
     }
 }

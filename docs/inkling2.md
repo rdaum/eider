@@ -24,8 +24,8 @@ PI_EIDER_PROVIDER=eider-chat scripts/run-pi-eider-inkling2.sh
 ```
 
 The launchers default to offline operation. The server launcher restricts the
-initial deployment to one active sequence and sets `--retained-prefix-gib 0`
-because this family's retained-prefix support is not implemented. Pi defaults
+initial deployment to one active sequence and retains up to 8 GiB of prompt
+prefixes (`--retained-prefix-gib 8`). Pi defaults
 to `eider-inkling2-mini-text` with low reasoning effort, and selects Responses
 unless `PI_EIDER_PROVIDER=eider-chat` is set.
 
@@ -44,7 +44,7 @@ Eider implements normalized Attention Residuals, separate Q/K/V/MLP message
 controllers, relative-distance attention bias, projected output gates and
 LSE-based attention sinks, local and global attention, and the checkpoint's
 capped SwiGLU router/selector semantics. Local KV rings retain 1024 positions;
-only the eight global visits allocate sequence-length history. The default
+only the eight global visits keep sequence-length history. The default
 context limit is 262144 tokens.
 
 A forward call evaluates a chunk of consecutive tokens visit by visit. A visit
@@ -58,8 +58,27 @@ by expert on the device; each work item of up to 64 routes decodes an expert
 tile once. Prefill-sized batches stage route activations in shared memory and
 tile 128 output rows per CTA, while decode-sized batches split K across warps.
 The LM head runs only on the chunk's last row. Prompt chunks default to 1024
-tokens. One active sequence is the catalogue default. There is no prefix
-retention or CUDA graph replay for Inkling yet.
+tokens. One active sequence is the catalogue default. There is no CUDA graph
+replay for Inkling yet.
+
+## Sequence cache
+
+Inkling uses the shared `seqcache` manager. The eight global visits append
+BF16 K/V to 128-token page bundles laid out as `[global visit][K/V][page
+token][KV head][dimension]`, about 4 MiB per page; relative attention reads
+them through each sequence's device page table. The cache reserves a
+request's worst-case pages at admission and keeps it waiting while the budget
+is exhausted.
+
+The rest of the history is request-private: forty 1024-position local KV rings
+and the K, V, attention-output, and MLP-output convolution inputs of all 48
+visits, about 172 MB per sequence. A retained prefix shares the global pages
+and copies that private history at the prompt's largest page-aligned prefix.
+A later request with the same prefix restores the copy and prefills only the
+remainder. Because the private history can only be resumed where it was
+copied, a retained entry serves prompts that extend that exact prefix, such as
+the next turn of an agent session; a new session that shares only the system
+prompt does not hit it.
 
 ## Checkpoint precision
 
@@ -98,9 +117,7 @@ when it produced any. Calls to undeclared functions are errors. Only `auto` and
 ## Current boundary
 
 - Vision, image inputs, DSpark/MTP, variable loop counts, promoted MXFP8 KV,
-  prefix retention, and native MXFP8 activations are not implemented.
-- Use `--retained-prefix-gib 0` for new deployments. A nonzero budget currently
-  produces an explicit warning; prompts are always recomputed.
+  and native MXFP8 activations are not implemented.
 
 The SGLang implementation at commit
 `92e894ef904bfdb5c0cf2f2a541cbd4eec023573` is the executable specification for
@@ -145,11 +162,14 @@ single-token prefill for the 26-token prompt. With 1024-token chunks, the
 decode runs at about 19 tokens/s on GB10.
 
 Pi completed read, write, and execute tool tasks through both the Responses and
-Chat Completions providers. Without prefix retention, every agent turn
-re-prefills its roughly 2200-token prompt, about 2.2 s before the first token.
+Chat Completions providers. A session's first turn prefilled its 2055-token
+prompt in about 2.1 s; later turns restored 2048–2304 cached tokens and reached
+the first token in 0.27–0.58 s. With the paged global KV, the 26-token greedy
+probe reproduces its tokens, and a 1923-token prompt that restores 1920 cached
+tokens generates the same tokens as the uncached run.
 
 The reference deployment's SM12x expert path quantizes activations with the
 Four Over Six NVFP4 encoding. Eider's W4A16 path, like vLLM's Hopper path, keeps
 BF16 activations, so token-level parity with SM12x vLLM is not expected over
-long generations. Cancellation, multi-sequence batching, prefix retention, and
-decode graph replay have not been validated for this family.
+long generations. Cancellation, multi-sequence batching, and decode graph
+replay have not been validated for this family.

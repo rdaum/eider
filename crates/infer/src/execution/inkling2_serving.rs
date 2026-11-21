@@ -1,6 +1,6 @@
-//! Inkling 2 text and tool serving with complete per-request loop and convolution state.
+//! Inkling 2 text and tool serving with shared global KV pages and retained prompt prefixes.
 
-use crate::inkling2::{Inkling2Model, Inkling2Sequence, Inkling2Workspace};
+use crate::inkling2::{Inkling2Model, Inkling2Sequence, Inkling2SequenceCache, Inkling2Workspace};
 use eider_cuda::{Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::{CheckpointChatTemplate, Inkling2PromptRenderer};
@@ -29,6 +29,9 @@ struct Request<'m, 't> {
     stop: StopBuffer,
     usage: ChatUsage,
     called_tools: bool,
+    /// Page-aligned prompt position whose history is retained, or zero.
+    prefix_target: usize,
+    prefix_retained: bool,
 }
 
 pub(crate) struct Inkling2ChatService<'m, 't> {
@@ -37,6 +40,8 @@ pub(crate) struct Inkling2ChatService<'m, 't> {
     renderer: Inkling2PromptRenderer,
     config: SchedulerConfig,
     prefill: Inkling2Workspace<'m>,
+    cache: Inkling2SequenceCache,
+    retain_prefixes: bool,
     next_id: u64,
     waiting: VecDeque<EngineRequestId>,
     requests: BTreeMap<EngineRequestId, Request<'m, 't>>,
@@ -53,16 +58,17 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
         if config.max_context_tokens > model.config().text_config.model_max_length {
             return Err(error("scheduler context exceeds checkpoint context"));
         }
-        if cache.max_retained_bytes != 0 {
-            tracing::warn!(
-                "Inkling 2 prefix retention is not implemented; all requests will execute their full prompts"
-            );
-        }
         Ok(Self {
             model,
             template,
             renderer: Inkling2PromptRenderer::new(template.tokenizer())?,
             prefill: model.new_workspace(config.prefill_token_capacity)?,
+            cache: model.new_sequence_cache(
+                config.max_active_sequences,
+                config.max_context_tokens,
+                cache.max_retained_bytes,
+            )?,
+            retain_prefixes: cache.max_retained_bytes != 0,
             config,
             next_id: 1,
             waiting: VecDeque::new(),
@@ -124,6 +130,12 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                     ..ChatUsage::default()
                 },
                 called_tools: false,
+                prefix_target: if self.retain_prefixes {
+                    self.cache.cacheable_prefix_tokens(admission.prompt_tokens)
+                } else {
+                    0
+                },
+                prefix_retained: false,
             },
         );
         self.waiting.push_back(id);
@@ -139,18 +151,29 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             };
             let request = self.requests.get_mut(&id).expect("queued request");
             let allocation = Instant::now();
-            let sequence = self
-                .model
-                .new_sequence((request.prompt.len() + request.generation.max_new_tokens).max(1))?;
+            // The cache reserves worst-case pages; admission waits when it is full.
+            let Some(sequence) = self.model.admit(
+                &mut self.cache,
+                (request.prompt.len() + request.generation.max_new_tokens).max(1),
+                &request.prompt,
+            )?
+            else {
+                break;
+            };
+            let cached = sequence.position();
+            request.position = cached;
+            request.usage.cached_prompt_tokens = cached;
+            request.prefix_retained = cached == request.prefix_target;
             let bytes = sequence.device_bytes();
+            let restore = sequence.restore_duration();
             request.sequence = Some(sequence);
             self.waiting.pop_front();
             lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
-                cached_prompt_tokens: 0,
-                allocation_duration: allocation.elapsed(),
-                checkpoint_copy_duration: Default::default(),
+                cached_prompt_tokens: cached,
+                allocation_duration: allocation.elapsed().saturating_sub(restore),
+                checkpoint_copy_duration: restore,
                 admitted_after_tick_start: started.elapsed(),
             }));
         }
@@ -169,7 +192,8 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             }
             decode_budget -= 1;
             if let Some(token) = request.last_token {
-                self.model.forward(&mut self.prefill, sequence, &[token])?;
+                self.model
+                    .forward(&mut self.prefill, sequence, &mut self.cache, &[token])?;
             }
             let token = if request.sampler.config().uses_fast_argmax() {
                 self.model.argmax_with_logit(sequence)?.0
@@ -221,13 +245,28 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                 continue;
             }
             lifecycle(EngineLifecycleEvent::PrefillStarted(id));
-            let end = (request.position + token_budget.min(self.prefill.capacity()))
-                .min(request.prompt.len());
+            // Stop at the retained-prefix boundary so its history can be copied.
+            let limit = if request.prefix_retained || request.prefix_target == 0 {
+                request.prompt.len()
+            } else {
+                request.prefix_target
+            };
+            let end = (request.position + token_budget.min(self.prefill.capacity())).min(limit);
             self.model.forward(
                 &mut self.prefill,
                 sequence,
+                &mut self.cache,
                 &request.prompt[request.position..end],
             )?;
+            if !request.prefix_retained && end == request.prefix_target {
+                if let Err(error) =
+                    self.model
+                        .retain_prefix(&mut self.cache, sequence, &request.prompt)
+                {
+                    tracing::warn!(%error, "could not retain Inkling 2 prompt prefix");
+                }
+                request.prefix_retained = true;
+            }
             token_budget -= end - request.position;
             sequence_budget -= 1;
             request.position = end;
@@ -265,14 +304,18 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             if reason == ChatFinishReason::Eos && request.called_tools {
                 reason = ChatFinishReason::ToolCalls;
             }
+            let released = request
+                .sequence
+                .as_ref()
+                .map_or(0, Inkling2Sequence::device_bytes);
+            if let Some(sequence) = request.sequence.take() {
+                self.model.finish(&mut self.cache, sequence)?;
+            }
             tick.finished.push(EngineFinished {
                 request_id: id,
                 finish_reason: reason,
                 usage: request.usage,
-                released_sequence_device_bytes: request
-                    .sequence
-                    .as_ref()
-                    .map_or(0, Inkling2Sequence::device_bytes),
+                released_sequence_device_bytes: released,
             });
         }
         Ok(tick)
@@ -292,15 +335,21 @@ impl EngineService for Inkling2ChatService<'_, '_> {
     }
 
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
-        let Some(request) = self.requests.remove(&id) else {
+        let Some(mut request) = self.requests.remove(&id) else {
             return EngineCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
+        let released = request
+            .sequence
+            .as_ref()
+            .map_or(0, Inkling2Sequence::device_bytes);
+        if let Some(sequence) = request.sequence.take()
+            && let Err(error) = self.model.finish(&mut self.cache, sequence)
+        {
+            tracing::error!(%error, "failed to release cancelled Inkling 2 sequence");
+        }
         EngineCancelOutcome::Cancelled {
-            released_sequence_device_bytes: request
-                .sequence
-                .as_ref()
-                .map_or(0, Inkling2Sequence::device_bytes),
+            released_sequence_device_bytes: released,
         }
     }
 

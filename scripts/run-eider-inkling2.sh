@@ -15,8 +15,9 @@ add_default() {
 }
 
 add_default --max-active-sequences 1
-# Prefix retention is not implemented for Inkling's per-visit recurrent state.
-add_default --retained-prefix-gib 0
+# Each retained prefix copies about 172 MB of local KV and convolution history
+# and shares its global KV pages.
+add_default --retained-prefix-gib 8
 
 exec cargo run --release --manifest-path "$repo_dir/Cargo.toml" \
   -p eider-api --bin eider-serve -- inkling-2-mini-text --offline "${server_args[@]}"
