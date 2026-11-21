@@ -11,15 +11,15 @@ __device__ __forceinline__ float bf(float x) {
 __device__ __forceinline__ float bf16(uint16_t x) {
     return __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&x));
 }
+// Block-wide sum for blocks of whole warps; every thread receives the result.
+// `partial` must hold one value per warp.
 __device__ float block_sum(float x, float* partial) {
-    const int lane=threadIdx.x;
-    partial[lane]=x;
+    const unsigned lane=threadIdx.x&31, warp=threadIdx.x>>5, warps=blockDim.x>>5;
+    for(int offset=16;offset;offset>>=1) x+=__shfl_xor_sync(0xffffffffu,x,offset);
+    if(lane==0) partial[warp]=x;
     __syncthreads();
-    for(int stride=blockDim.x/2;stride;stride>>=1) {
-        if(lane<stride) partial[lane]+=partial[lane+stride];
-        __syncthreads();
-    }
-    const float sum=partial[0];
+    float sum=0.f;
+    for(unsigned w=0;w<warps;++w) sum+=partial[w];
     // Back-to-back reductions reuse `partial`; every lane must read first.
     __syncthreads();
     return sum;
@@ -57,46 +57,71 @@ __global__ void rms_kernel(const float* x, const float* gamma, float* out,
 
 // One normalized pseudo-query over at most five previous block outputs.
 // A non-null addend is added to the last (partial) source independently.
-__global__ void attn_res_kernel(const float* const* unused,
+// One pass accumulates every source's query dot and squared norm; a single
+// warp-shuffle and shared-memory reduction combines them.
+__global__ __launch_bounds__(256) void attn_res_kernel(
     const float* s0, const float* s1, const float* s2, const float* s3, const float* s4,
     const float* addend, const float* query, float* out, uint32_t sources,
     uint32_t width, float eps) {
-    __shared__ float partial[256], dots[5], norms[5], weights[5];
-    const int lane=threadIdx.x;
+    constexpr unsigned MaxSources=5, Warps=8;
+    __shared__ float reduced[Warps][2*MaxSources];
+    __shared__ float coefficient[MaxSources];
+    const unsigned lane=threadIdx.x&31, warp=threadIdx.x>>5;
     const size_t row=size_t(blockIdx.x)*width;
-    const float* src[5]={s0,s1,s2,s3,s4};
+    const float* src[MaxSources]={s0,s1,s2,s3,s4};
     const float scale=rsqrtf(float(width));
-    for(uint32_t n=0;n<sources;++n) {
-        float dot=0, sum=0;
-        for(int i=lane;i<width;i+=blockDim.x) {
+    float dot[MaxSources]={}, sum[MaxSources]={};
+    for(unsigned i=threadIdx.x;i<width;i+=blockDim.x) {
+        const float q=query[i]*scale;
+        #pragma unroll
+        for(unsigned n=0;n<MaxSources;++n) {
+            if(n>=sources) break;
             float x=src[n][row+i];
             if(addend && n+1==sources) x=__fadd_rn(x,addend[row+i]);
-            dot=__fmaf_rn(x,query[i]*scale,dot);
-            sum=__fmaf_rn(x,x,sum);
+            dot[n]=__fmaf_rn(x,q,dot[n]);
+            sum[n]=__fmaf_rn(x,x,sum[n]);
         }
-        dot=block_sum(dot,partial);
-        if(lane==0) dots[n]=dot;
-        sum=block_sum(sum,partial);
-        if(lane==0) norms[n]=rsqrtf(sum/width+eps);
-        __syncthreads();
+    }
+    #pragma unroll
+    for(unsigned n=0;n<MaxSources;++n) {
+        for(int offset=16;offset;offset>>=1) {
+            dot[n]+=__shfl_xor_sync(0xffffffffu,dot[n],offset);
+            sum[n]+=__shfl_xor_sync(0xffffffffu,sum[n],offset);
+        }
     }
     if(lane==0) {
-        float maximum=-INFINITY;
-        for(uint32_t n=0;n<sources;++n) maximum=fmaxf(maximum,dots[n]*norms[n]);
-        float total=0;
-        for(uint32_t n=0;n<sources;++n) {
-            weights[n]=expf(dots[n]*norms[n]-maximum);
-            total+=weights[n];
+        #pragma unroll
+        for(unsigned n=0;n<MaxSources;++n) {
+            reduced[warp][2*n]=dot[n];
+            reduced[warp][2*n+1]=sum[n];
         }
-        for(uint32_t n=0;n<sources;++n) weights[n]/=total;
     }
     __syncthreads();
-    for(int i=lane;i<width;i+=blockDim.x) {
+    if(threadIdx.x==0) {
+        float logits[MaxSources], norms[MaxSources], maximum=-INFINITY;
+        for(unsigned n=0;n<sources;++n) {
+            float d=0.f, q=0.f;
+            for(unsigned w=0;w<Warps;++w) { d+=reduced[w][2*n]; q+=reduced[w][2*n+1]; }
+            norms[n]=rsqrtf(q/width+eps);
+            logits[n]=d*norms[n];
+            maximum=fmaxf(maximum,logits[n]);
+        }
+        float total=0.f;
+        for(unsigned n=0;n<sources;++n) {
+            logits[n]=expf(logits[n]-maximum);
+            total+=logits[n];
+        }
+        for(unsigned n=0;n<sources;++n) coefficient[n]=logits[n]/total*norms[n];
+    }
+    __syncthreads();
+    for(unsigned i=threadIdx.x;i<width;i+=blockDim.x) {
         float value=0;
-        for(uint32_t n=0;n<sources;++n) {
+        #pragma unroll
+        for(unsigned n=0;n<MaxSources;++n) {
+            if(n>=sources) break;
             float x=src[n][row+i];
             if(addend && n+1==sources) x=__fadd_rn(x,addend[row+i]);
-            value=__fmaf_rn(weights[n]*norms[n],x,value);
+            value=__fmaf_rn(coefficient[n],x,value);
         }
         out[row+i]=value;
     }
@@ -481,7 +506,7 @@ extern "C" int infer_inkling2_attn_res(const float* const* unused,
     const float* addend, const float* query, float* out, uint32_t rows,
     uint32_t sources, uint32_t width, float eps, cudaStream_t stream) {
     if(sources==0 || sources>5) return cudaErrorInvalidValue;
-    attn_res_kernel<<<rows,256,0,stream>>>(unused,s0,s1,s2,s3,s4,addend,query,out,sources,width,eps);
+    attn_res_kernel<<<rows,256,0,stream>>>(s0,s1,s2,s3,s4,addend,query,out,sources,width,eps);
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_controller_norm(const float* destination,
