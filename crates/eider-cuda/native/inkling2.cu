@@ -285,21 +285,46 @@ __device__ __forceinline__ uint32_t pack_bf16(float low, float high) {
         | (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(high))) << 16);
 }
 
-// BF16 weights in [expert][out][in] order. Decode-sized batches: one CTA
+__device__ __forceinline__ float e4m3(uint8_t code) {
+    const uint32_t sign=uint32_t(code&0x80u)<<24, exponent=(code>>3)&0x0fu, mantissa=code&7u;
+    if(exponent==0) {
+        const float value=float(mantissa)*0x1p-9f;
+        return sign ? -value : value;
+    }
+    return __uint_as_float(sign|((exponent+120u)<<23)|(mantissa<<20));
+}
+
+__device__ __forceinline__ float e8m0(uint8_t code) {
+    return code ? __uint_as_float(uint32_t(code)<<23) : 0x1p-127f;
+}
+
+// BF16 MMA operand for MXFP8 weights `w[row][k]` and `w[row][k + 1]`. Both lie
+// in one 32-value scale group. E4M3 times a power of two is exact in BF16.
+__device__ __forceinline__ uint32_t mxfp8_pair(const uint8_t* w, const uint8_t* scales,
+                                               uint32_t row, uint32_t inputs, uint32_t k) {
+    const uint16_t bytes=*reinterpret_cast<const uint16_t*>(w+size_t(row)*inputs+k);
+    const float scale=e8m0(scales[size_t(row)*(inputs/32)+k/32]);
+    return pack_bf16(e4m3(bytes&0xffu)*scale,e4m3(bytes>>8)*scale);
+}
+
+// MXFP8 weights in [expert][out][in] order with one E8M0 scale per 32 inputs.
+// Decode-sized batches: one CTA
 // computes a 16-row output tile for one work item, splitting K across warps.
 // Items with more than `Groups * 8` routes repeat the K loop.
 template<unsigned Warps, unsigned Groups>
-__global__ __launch_bounds__(Warps*32) void grouped_bf16_expert_kernel(
+__global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
     const uint32_t* item_count, const uint32_t* items, const float* input,
-    const uint16_t* weights, float* out, uint32_t top_k, bool per_route_input,
-    uint32_t outputs, uint32_t inputs) {
+    const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
+    bool per_route_input, uint32_t outputs, uint32_t inputs) {
     const unsigned item=blockIdx.y;
     if(item>=items[0]) return;
     const unsigned lane=threadIdx.x&31, warp=threadIdx.x>>5;
     const unsigned row0=lane>>2, row1=row0+8, pair=(lane&3)*2;
     const unsigned start=item_start[item], count=item_count[item];
-    const uint16_t* w=weights+(size_t(item_expert[item])*outputs+blockIdx.x*16)*inputs;
+    const size_t base=size_t(item_expert[item])*outputs+blockIdx.x*16;
+    const uint8_t* w=weights+base*inputs;
+    const uint8_t* sc=weight_scales+base*(inputs/32);
     __shared__ float partial[Warps][Groups][128];
     for(unsigned first=0;first<count;first+=Groups*8) {
         const float* rows[Groups];
@@ -314,10 +339,10 @@ __global__ __launch_bounds__(Warps*32) void grouped_bf16_expert_kernel(
         }
         float d[Groups][4]={};
         for(unsigned k=warp*16;k<inputs;k+=Warps*16) {
-            const uint32_t a0=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair);
-            const uint32_t a1=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair);
-            const uint32_t a2=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+pair+8);
-            const uint32_t a3=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+pair+8);
+            const uint32_t a0=mxfp8_pair(w,sc,row0,inputs,k+pair);
+            const uint32_t a1=mxfp8_pair(w,sc,row1,inputs,k+pair);
+            const uint32_t a2=mxfp8_pair(w,sc,row0,inputs,k+pair+8);
+            const uint32_t a3=mxfp8_pair(w,sc,row1,inputs,k+pair+8);
             #pragma unroll
             for(unsigned g=0;g<Groups;++g) {
                 if(first+g*8>=count) break;
@@ -357,11 +382,11 @@ __global__ __launch_bounds__(Warps*32) void grouped_bf16_expert_kernel(
 // Prefill-sized batches: one CTA computes 128 output rows for one work item,
 // each warp owning a 16-row tile over the full K. Route activations are staged
 // once per 64-wide K chunk, so each activation is read once per CTA.
-__global__ __launch_bounds__(256) void grouped_bf16_expert_tiled_kernel(
+__global__ __launch_bounds__(256) void grouped_mxfp8_expert_tiled_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
     const uint32_t* item_count, const uint32_t* items, const float* input,
-    const uint16_t* weights, float* out, uint32_t top_k, bool per_route_input,
-    uint32_t outputs, uint32_t inputs) {
+    const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
+    bool per_route_input, uint32_t outputs, uint32_t inputs) {
     constexpr unsigned Warps=8, Columns=64, Groups=Columns/8, Chunk=64, Words=Chunk/2, Stride=Words+4;
     __shared__ uint32_t staged[Columns][Stride];
     __shared__ const float* rows[Columns];
@@ -379,7 +404,9 @@ __global__ __launch_bounds__(256) void grouped_bf16_expert_tiled_kernel(
     }
     const unsigned tile=blockIdx.x*Warps+warp;
     const bool active=tile*16<outputs;
-    const uint16_t* w=weights+(size_t(item_expert[item])*outputs+tile*16)*inputs;
+    const size_t base=size_t(item_expert[item])*outputs+tile*16;
+    const uint8_t* w=weights+base*inputs;
+    const uint8_t* sc=weight_scales+base*(inputs/32);
     float d[Groups][4]={};
     __syncthreads();
     for(unsigned k0=0;k0<inputs;k0+=Chunk) {
@@ -400,10 +427,10 @@ __global__ __launch_bounds__(256) void grouped_bf16_expert_tiled_kernel(
             for(unsigned kt=0;kt<Chunk/16;++kt) {
                 const unsigned k=k0+kt*16;
                 if(k>=inputs) break;
-                const uint32_t a0=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+quad*2);
-                const uint32_t a1=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+quad*2);
-                const uint32_t a2=*reinterpret_cast<const uint32_t*>(w+size_t(row0)*inputs+k+quad*2+8);
-                const uint32_t a3=*reinterpret_cast<const uint32_t*>(w+size_t(row1)*inputs+k+quad*2+8);
+                const uint32_t a0=mxfp8_pair(w,sc,row0,inputs,k+quad*2);
+                const uint32_t a1=mxfp8_pair(w,sc,row1,inputs,k+quad*2);
+                const uint32_t a2=mxfp8_pair(w,sc,row0,inputs,k+quad*2+8);
+                const uint32_t a3=mxfp8_pair(w,sc,row1,inputs,k+quad*2+8);
                 #pragma unroll
                 for(unsigned g=0;g<Groups;++g) {
                     if(g*8>=count) break;
@@ -559,24 +586,24 @@ extern "C" int infer_inkling2_capped_swiglu(const float* gate_up,
     capped_swiglu_kernel<<<(count+255)/256,256,0,stream>>>(gate_up,gammas,out,routes,intermediate,gate_cap,up_cap);
     return cudaGetLastError();
 }
-extern "C" int infer_inkling2_grouped_bf16_expert(const uint32_t* sorted,
+extern "C" int infer_inkling2_grouped_mxfp8_expert(const uint32_t* sorted,
     const uint32_t* item_expert, const uint32_t* item_start, const uint32_t* item_count,
-    const uint32_t* items, uint32_t max_items, const float* input, const uint16_t* weights,
-    float* out, uint32_t top_k, bool per_route_input, uint32_t outputs, uint32_t inputs,
-    bool tiled, uint32_t max_columns, cudaStream_t stream) {
-    if(outputs%16 || inputs%16 || !max_items) return cudaErrorInvalidValue;
+    const uint32_t* items, uint32_t max_items, const float* input, const uint8_t* weights,
+    const uint8_t* scales, float* out, uint32_t top_k, bool per_route_input, uint32_t outputs,
+    uint32_t inputs, bool tiled, uint32_t max_columns, cudaStream_t stream) {
+    if(outputs%16 || inputs%32 || !max_items) return cudaErrorInvalidValue;
     if(tiled) {
         if(inputs%8) return cudaErrorInvalidValue;
-        grouped_bf16_expert_tiled_kernel<<<dim3((outputs/16+7)/8,max_items),256,0,stream>>>(sorted,
-            item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
+        grouped_mxfp8_expert_tiled_kernel<<<dim3((outputs/16+7)/8,max_items),256,0,stream>>>(sorted,
+            item_expert,item_start,item_count,items,input,weights,scales,out,top_k,per_route_input,outputs,inputs);
     } else if(max_columns<=8) {
         // A token never selects an expert twice, so decode items hold at most
         // one route per row.
-        grouped_bf16_expert_kernel<16,1><<<dim3(outputs/16,max_items),512,0,stream>>>(sorted,
-            item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
+        grouped_mxfp8_expert_kernel<16,1><<<dim3(outputs/16,max_items),512,0,stream>>>(sorted,
+            item_expert,item_start,item_count,items,input,weights,scales,out,top_k,per_route_input,outputs,inputs);
     } else {
-        grouped_bf16_expert_kernel<8,8><<<dim3(outputs/16,max_items),256,0,stream>>>(sorted,
-            item_expert,item_start,item_count,items,input,weights,out,top_k,per_route_input,outputs,inputs);
+        grouped_mxfp8_expert_kernel<8,8><<<dim3(outputs/16,max_items),256,0,stream>>>(sorted,
+            item_expert,item_start,item_count,items,input,weights,scales,out,top_k,per_route_input,outputs,inputs);
     }
     return cudaGetLastError();
 }

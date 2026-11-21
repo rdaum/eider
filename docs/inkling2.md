@@ -58,8 +58,14 @@ by expert on the device; each work item of up to 64 routes decodes an expert
 tile once. Prefill-sized batches stage route activations in shared memory and
 tile 128 output rows per CTA, while decode-sized batches split K across warps.
 The LM head runs only on the chunk's last row. Prompt chunks default to 1024
-tokens. One active sequence is the catalogue default. There is no CUDA graph
-replay for Inkling yet.
+tokens. One active sequence is the catalogue default.
+
+Single-token decode replays a CUDA graph captured once per sequence. Relative
+attention and log-scaled L2 clipping read the position from device memory;
+attention partitions are bounded by a multiple of 256 tokens, and the graph is
+recaptured when the position outgrows that bound or the workspace changes.
+Dense projections of at most eight rows use a warp-per-output BF16
+matrix-vector kernel instead of tensor-core GEMMs.
 
 ## Sequence cache
 
@@ -85,9 +91,10 @@ prompt does not hit it.
 - Physical layers 0–19 retain packed NVFP4 expert weights and execute through
   Eider's grouped SM121 W4A16 expert kernels. N-major gate/up storage and
   per-expert outer scales are converted to the native weight tiles at load.
-- Physical layers 20–23 use an explicit MXFP8-to-BF16 preparation fallback.
-  This uses more resident memory than the source MXFP8 storage and is not the
-  reference runtime's native W8A8 path.
+- Physical layers 20–23 keep their MXFP8 weights resident (E4M3 values with one
+  E8M0 scale per 32 inputs). The grouped expert kernels decode them to BF16 MMA
+  operands, which is exact, and keep BF16 activations; this is W8A16, not the
+  reference runtime's W8A8 path.
 - The W4A16 path does not reproduce the reference deployment's Four Over Six
   activation quantization or FP4 activation arithmetic. Numerical comparisons
   must therefore check model behaviour and tolerances rather than assume
@@ -159,7 +166,9 @@ answered correctly. Both Chat Completions and streaming Responses returned
 reasoning followed by text. Chunked prefill produced the same greedy tokens as
 single-token prefill for the 26-token prompt. With 1024-token chunks, the
 3527-token prompt prefilled at about 965 tokens/s (3.7 s to the first token);
-decode runs at about 19 tokens/s on GB10.
+decode runs at about 25 tokens/s on GB10 (about 24 at a 3.5k-token context).
+Decode is GPU-bound: dense projections, NVFP4 experts, and the LM head read
+about 5 GB of weights per token.
 
 Pi completed read, write, and execute tool tasks through both the Responses and
 Chat Completions providers. A session's first turn prefilled its 2055-token

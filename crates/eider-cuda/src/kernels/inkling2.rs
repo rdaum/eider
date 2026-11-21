@@ -126,7 +126,7 @@ unsafe extern "C" {
         up_cap: f32,
         stream: *mut c_void,
     ) -> i32;
-    fn infer_inkling2_grouped_bf16_expert(
+    fn infer_inkling2_grouped_mxfp8_expert(
         sorted: *const u32,
         item_expert: *const u32,
         item_start: *const u32,
@@ -134,7 +134,8 @@ unsafe extern "C" {
         items: *const u32,
         max_items: u32,
         input: *const f32,
-        weights: *const u16,
+        weights: *const u8,
+        scales: *const u8,
         out: *mut f32,
         top_k: u32,
         per_route_input: bool,
@@ -662,15 +663,17 @@ pub fn capped_swiglu(
     }
 }
 
-/// Runs prepared BF16 expert weights `[experts, outputs, inputs]` for grouped
-/// routes. Route `r` reads input row `r / top_k`, or row `r` with
-/// `per_route_input`, and writes BF16-rounded output row `r`. Decode-sized
-/// batches split K across warps; larger batches stage route activations.
+/// Runs MXFP8 expert weights `[experts, outputs, inputs]` (E4M3 values with one
+/// E8M0 scale per 32 inputs) for grouped routes. Route `r` reads input row
+/// `r / top_k`, or row `r` with `per_route_input`, and writes BF16-rounded
+/// output row `r`. Decode-sized batches split K across warps; larger batches
+/// stage route activations.
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_bf16_expert(
+pub fn grouped_mxfp8_expert(
     groups: &MoeRouteGroups,
     input: &DeviceBuffer<f32>,
-    weights: &DeviceBuffer<u16>,
+    weights: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
     mut out: DeviceOutput<'_, f32>,
     routes: usize,
     top_k: usize,
@@ -689,19 +692,20 @@ pub fn grouped_bf16_expert(
         || outputs == 0
         || inputs == 0
         || !outputs.is_multiple_of(16)
-        || !inputs.is_multiple_of(16)
+        || !inputs.is_multiple_of(32)
         || outputs > u32::MAX as usize
         || inputs > u32::MAX as usize
         || input.len() < input_rows * inputs
         || out.len() < routes * outputs
         || weights.len() != groups.experts() * outputs * inputs
+        || scales.len() != weights.len() / 32
     {
-        return Err(invalid("grouped BF16 expert geometry mismatch"));
+        return Err(invalid("grouped MXFP8 expert geometry mismatch"));
     }
     unsafe {
         check_cuda(
-            "infer_inkling2_grouped_bf16_expert",
-            infer_inkling2_grouped_bf16_expert(
+            "infer_inkling2_grouped_mxfp8_expert",
+            infer_inkling2_grouped_mxfp8_expert(
                 groups.sorted.ptr,
                 groups.item_expert.ptr,
                 groups.item_start.ptr,
@@ -710,6 +714,7 @@ pub fn grouped_bf16_expert(
                 groups.max_items(routes) as u32,
                 input.ptr,
                 weights.ptr,
+                scales.ptr,
                 out.buffer_mut().ptr,
                 top_k as u32,
                 per_route_input,
@@ -1149,21 +1154,37 @@ mod tests {
     }
 
     #[test]
-    fn grouped_bf16_experts_match_cpu_for_shared_and_per_route_inputs() -> Result<()> {
+    fn grouped_mxfp8_experts_match_cpu_for_shared_and_per_route_inputs() -> Result<()> {
         crate::set_cuda_device(0)?;
         let stream = CudaStream::new_non_blocking()?;
         // 120 routes select the tiled kernel and give expert 1 two work items;
         // 96 inputs end inside a staged K chunk.
         let (experts, outputs, inputs, top_k, rows) = (3, 32, 96, 2, 60);
         let routes = rows * top_k;
-        let weights = (0..experts * outputs * inputs)
-            .map(|i| bf(((i * 37 % 101) as f32 - 50.0) / 64.0))
-            .collect::<Vec<_>>();
-        let words = weights
+        let e4m3 = |code: u8| {
+            let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
+            let exponent = (code >> 3) & 0xf;
+            let mantissa = f32::from(code & 7);
+            sign * if exponent == 0 {
+                mantissa / 8.0 * 2f32.powi(-6)
+            } else {
+                (1.0 + mantissa / 8.0) * 2f32.powi(i32::from(exponent) - 7)
+            }
+        };
+        // Avoid the E4M3 NaN codes 0x7f and 0xff.
+        let codes = (0..experts * outputs * inputs)
+            .map(|i| ((i * 37 + i / 7) % 127) as u8 | if i % 3 == 0 { 0x80 } else { 0 })
+            .collect::<Vec<u8>>();
+        let scale_codes = (0..codes.len() / 32)
+            .map(|i| 112 + (i % 9) as u8)
+            .collect::<Vec<u8>>();
+        let weights = codes
             .iter()
-            .map(|x| (x.to_bits() >> 16) as u16)
+            .enumerate()
+            .map(|(i, &code)| e4m3(code) * 2f32.powi(i32::from(scale_codes[i / 32]) - 127))
             .collect::<Vec<_>>();
-        let weights_device = DeviceBuffer::from_host(&words)?;
+        let weights_device = DeviceBuffer::from_host(&codes)?;
+        let scales_device = DeviceBuffer::from_host(&scale_codes)?;
         // Expert 1 receives more than one 32-route work item.
         let ids = (0..routes)
             .map(|r| {
@@ -1186,10 +1207,11 @@ mod tests {
                 .collect::<Vec<_>>();
             let input_device = DeviceBuffer::from_host(&input)?;
             let mut output = DeviceBuffer::zeroed(routes * outputs)?;
-            grouped_bf16_expert(
+            grouped_mxfp8_expert(
                 &groups,
                 &input_device,
                 &weights_device,
+                &scales_device,
                 output.output(),
                 routes,
                 top_k,
@@ -1217,10 +1239,11 @@ mod tests {
             let narrow = 8 * top_k;
             let mut narrow_groups = MoeRouteGroups::new(narrow, experts)?;
             narrow_groups.group_on_stream(&ids_device, narrow, &stream)?;
-            grouped_bf16_expert(
+            grouped_mxfp8_expert(
                 &narrow_groups,
                 &input_device,
                 &weights_device,
+                &scales_device,
                 output.output(),
                 narrow,
                 top_k,
@@ -1238,10 +1261,11 @@ mod tests {
             let few = TILED_ROUTES - top_k;
             let mut few_groups = MoeRouteGroups::new(few, experts)?;
             few_groups.group_on_stream(&ids_device, few, &stream)?;
-            grouped_bf16_expert(
+            grouped_mxfp8_expert(
                 &few_groups,
                 &input_device,
                 &weights_device,
+                &scales_device,
                 output.output(),
                 few,
                 top_k,

@@ -225,8 +225,8 @@ Before handing work back:
   inputs. Preserve normalized Attention Residuals, distinct global/layer
   normalization, normalized short convolution with newest-first global K/V
   taps, relative-attention LSE sinks, per-expert outer scales, and interleaved
-  capped SwiGLU semantics. Its last-four-layer MXFP8 path is an explicit BF16
-  preparation fallback, not native W8A8 execution.
+  capped SwiGLU semantics. Its last four layers execute MXFP8 weights with BF16
+  activations (W8A16), not the reference W8A8 path.
 - Keep CUDA stream semantics explicit. Non-blocking streams do not synchronize
   with the default stream.
 - Do not add permanent debug flags or probe prints. Do not revert unrelated

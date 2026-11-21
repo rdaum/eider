@@ -906,10 +906,11 @@ impl Inkling2Model {
                 false,
                 stream,
             )?,
-            ExpertStorage::Bf16(experts) => inkling2::grouped_bf16_expert(
+            ExpertStorage::Mxfp8(experts) => inkling2::grouped_mxfp8_expert(
                 &w.groups,
                 &w.mlp_normalized,
-                &experts.gate_up,
+                &experts.gate_up.values,
+                &experts.gate_up.scales,
                 w.expert_gate_up.output(),
                 routes,
                 top_k,
@@ -938,10 +939,11 @@ impl Inkling2Model {
                 true,
                 stream,
             )?,
-            ExpertStorage::Bf16(experts) => inkling2::grouped_bf16_expert(
+            ExpertStorage::Mxfp8(experts) => inkling2::grouped_mxfp8_expert(
                 &w.groups,
                 &w.expert_hidden,
-                &experts.down,
+                &experts.down.values,
+                &experts.down.scales,
                 w.expert_down.output(),
                 routes,
                 top_k,

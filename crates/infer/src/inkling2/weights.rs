@@ -258,14 +258,19 @@ pub(super) struct Nvfp4Experts {
     pub gate_up: Sm121W4A16GateUp,
     pub down: Sm121W4A16GateUp,
 }
-pub(super) struct Bf16Experts {
-    pub gate_up: DeviceBuffer<u16>,
-    pub down: DeviceBuffer<u16>,
+/// E4M3 values `[experts, outputs, inputs]` with one E8M0 scale per 32 inputs.
+pub(super) struct Mxfp8Weights {
+    pub values: DeviceBuffer<u8>,
+    pub scales: DeviceBuffer<u8>,
+}
+pub(super) struct Mxfp8Experts {
+    pub gate_up: Mxfp8Weights,
+    pub down: Mxfp8Weights,
 }
 pub(super) enum ExpertStorage {
     Nvfp4(Nvfp4Experts),
-    /// Correctness-first W8A16 fallback for the final four MXFP8 layers.
-    Bf16(Bf16Experts),
+    /// The final four layers' MXFP8 weights with BF16 activations.
+    Mxfp8(Mxfp8Experts),
 }
 
 pub(super) struct MoE {
@@ -296,7 +301,7 @@ impl MoE {
                 )?,
             })
         } else {
-            ExpertStorage::Bf16(Bf16Experts {
+            ExpertStorage::Mxfp8(Mxfp8Experts {
                 gate_up: load_mxfp8_experts(
                     cp,
                     &format!("{prefix}.w13"),
@@ -484,7 +489,7 @@ impl Weights {
                 precision = if layer < 20 {
                     "NVFP4 W4A16"
                 } else {
-                    "MXFP8 to BF16"
+                    "MXFP8 W8A16"
                 },
                 "loaded Inkling 2 text layer"
             );
@@ -652,14 +657,14 @@ fn load_nvfp4_experts(
     Sm121W4A16GateUp::from_prepared_with_top_k(&weights, c.num_experts_per_tok)
 }
 
-/// Expands the final four N-major MXFP8 layers once during checkpoint preparation.
+/// Uploads the final four N-major MXFP8 layers after checking every value is finite.
 fn load_mxfp8_experts(
     cp: &ModelOptCheckpoint,
     prefix: &str,
     c: &TextConfig,
     outputs: usize,
     inputs: usize,
-) -> Result<DeviceBuffer<u16>> {
+) -> Result<Mxfp8Weights> {
     let experts = c.n_routed_experts;
     let weight_shape = vec![experts, outputs, inputs];
     let scale_shape = vec![experts, outputs, inputs / 32];
@@ -669,25 +674,19 @@ fn load_mxfp8_experts(
     {
         return Err(invalid(format!("MXFP8 expert extent mismatch at {prefix}")));
     }
-    let mut prepared = Vec::with_capacity(experts * outputs * inputs);
-    for expert in 0..experts {
-        let weight = &raw.bytes[expert * outputs * inputs..(expert + 1) * outputs * inputs];
-        let scales =
-            &raw.scales[expert * outputs * inputs / 32..(expert + 1) * outputs * inputs / 32];
-        for output in 0..outputs {
-            for input in 0..inputs {
-                let scale = e8m0(scales[output * (inputs / 32) + input / 32])?;
-                let value = fp8_e4m3(weight[output * inputs + input]) * scale;
-                if !value.is_finite() {
-                    return Err(invalid(format!(
-                        "invalid MXFP8 value at {prefix}[{expert}]"
-                    )));
-                }
-                prepared.push(to_bf16(value));
-            }
+    for (group, values) in raw.bytes.as_chunks::<32>().0.iter().enumerate() {
+        let scale = e8m0(raw.scales[group])?;
+        if values
+            .iter()
+            .any(|&value| !(fp8_e4m3(value) * scale).is_finite())
+        {
+            return Err(invalid(format!("invalid MXFP8 value at {prefix}")));
         }
     }
-    DeviceBuffer::from_host(&prepared)
+    Ok(Mxfp8Weights {
+        values: DeviceBuffer::from_host(&raw.bytes)?,
+        scales: DeviceBuffer::from_host(&raw.scales)?,
+    })
 }
 
 fn fp8_e4m3(byte: u8) -> f32 {
@@ -711,11 +710,6 @@ fn e8m0(byte: u8) -> Result<f32> {
     Ok(2f32.powi(byte as i32 - 127))
 }
 
-fn to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,7 +723,5 @@ mod tests {
         assert!(fp8_e4m3(0xff).is_nan());
         assert_eq!(e8m0(127).unwrap(), 1.0);
         assert!(e8m0(255).is_err());
-        assert_eq!(f32::from_bits(u32::from(to_bf16(1.0)) << 16), 1.0);
-        assert_eq!(to_bf16(f32::NAN) & 0x7fff, 0x7fc0);
     }
 }
