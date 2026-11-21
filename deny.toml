@@ -6,6 +6,9 @@ unused-ignored-advisory = "deny"
 ignore = [
     # Remove when tokenizers and simdeez no longer depend on paste.
     { id = "RUSTSEC-2024-0436", reason = "Unmaintained compile-time macro dependency of tokenizers and simdeez; no compatible dependency update removes it" },
+    # Remove when hf-hub's mandatory hf-xet/xet-* dependencies drop chrono and humantime.
+    { id = "RUSTSEC-2026-0543", reason = "Unmaintained chrono reached only through hf-hub 1.0's xet-client, xet-data and xet-runtime 1.8.1; no compatible dependency update removes it" },
+    { id = "RUSTSEC-2026-0542", reason = "Unmaintained humantime reached only through hf-hub 1.0's xet-runtime 1.8.1; no compatible dependency update removes it" },
 ]
 
 [bans]
