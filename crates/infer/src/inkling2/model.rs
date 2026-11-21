@@ -12,10 +12,10 @@ use super::sequence::{
 };
 use super::weights::{Controller, ExpertStorage, ShortConvolution, Weights};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, F32DenseGemm, GemmPrecision, MoeRouteGroups, PinnedHostBuffer,
-    RelativeKv, Result, SinkAttentionCache, SinkAttentionWorkspace, add_f32_prefix_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream, inkling2,
-    round_f32_to_bf16_prefix_in_place_on_stream,
+    CudaGraphExec, CudaStream, DeviceBuffer, F32DenseGemm, GemmPrecision, MoeRouteGroups,
+    PinnedHostBuffer, RelativeKv, ReplayPosition, Result, SinkAttentionCache,
+    SinkAttentionWorkspace, add_f32_prefix_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, inkling2, round_f32_to_bf16_prefix_in_place_on_stream,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +23,8 @@ use std::time::Duration;
 
 /// Attention Residual blocks hold at most the embedding and three later blocks.
 const BLOCKS: usize = 4;
+/// Decode graphs bound attention to a multiple of the 256-key partition.
+const DECODE_BOUND_TOKENS: usize = 256;
 
 pub struct Inkling2Model {
     config: Inkling2Config,
@@ -119,6 +121,10 @@ pub struct Inkling2Sequence<'m> {
     pub(super) cache_id: Option<seqcache::SequenceId>,
     pub(super) cache_identity: Option<Arc<()>>,
     pub(super) restore_duration: Duration,
+    /// Tokens already appended, read by captured decode launches.
+    device_position: DeviceBuffer<u32>,
+    /// Decode graph, its workspace, and the attention bound it was captured for.
+    graph: Option<(Arc<()>, usize, CudaGraphExec)>,
 }
 
 /// Per-chunk Attention Residual state, `[rows, hidden]` per buffer.
@@ -144,6 +150,8 @@ impl Residual {
 pub struct Inkling2Workspace<'m> {
     model: &'m Inkling2Model,
     capacity: usize,
+    /// Distinguishes workspaces whose buffers a decode graph captured.
+    identity: Arc<()>,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
     gemm: F32DenseGemm,
@@ -261,6 +269,7 @@ impl Inkling2Model {
         Ok(Inkling2Workspace {
             model: self,
             capacity,
+            identity: Arc::new(()),
             host_tokens: PinnedHostBuffer::zeroed(capacity)?,
             tokens: DeviceBuffer::zeroed(capacity)?,
             gemm,
@@ -366,6 +375,8 @@ impl Inkling2Model {
             cache_id: None,
             cache_identity: None,
             restore_duration: Duration::ZERO,
+            device_position: DeviceBuffer::zeroed(1)?,
+            graph: None,
         })
     }
 
@@ -405,9 +416,17 @@ impl Inkling2Model {
             )
             .map_err(cache_error)?;
         s.valid = false;
-        let result = self
-            .forward_chunk(w, s, tokens)
-            .and_then(|()| self.synchronize());
+        let result = (|| {
+            w.host_tokens.as_mut_slice()[..tokens.len()].copy_from_slice(tokens);
+            w.tokens
+                .copy_range_from_pinned_on_stream(0, &w.host_tokens, &self.stream)?;
+            if tokens.len() == 1 {
+                self.replay_decode(w, s)
+            } else {
+                self.forward_chunk(w, s, tokens.len(), None)
+            }
+        })()
+        .and_then(|()| self.synchronize());
         let committed = result.and_then(|()| {
             cache
                 .commit_append(
@@ -433,22 +452,50 @@ impl Inkling2Model {
             return Err(error);
         }
         s.position += tokens.len();
+        for cache in s.visits.iter_mut().filter_map(|visit| visit.cache.as_mut()) {
+            cache.record_replay_position(s.position)?;
+        }
         s.valid = true;
         Ok(())
     }
 
+    /// Replays the sequence's single-token graph, capturing it again when the
+    /// workspace changes or the position outgrows its attention partitions.
+    fn replay_decode(&self, w: &mut Inkling2Workspace, s: &mut Inkling2Sequence) -> Result<()> {
+        let bound = (s.position + 1)
+            .div_ceil(DECODE_BOUND_TOKENS)
+            .saturating_mul(DECODE_BOUND_TOKENS)
+            .min(self.config.text_config.model_max_length);
+        s.device_position
+            .copy_range_from_host(0, &[s.position as u32])?;
+        let current = s.graph.as_ref().is_some_and(|(identity, previous, _)| {
+            Arc::ptr_eq(identity, &w.identity) && *previous == bound
+        });
+        if !current {
+            s.graph = None;
+            let graph = self
+                .stream
+                .capture(|_| self.forward_chunk(w, s, 1, Some(bound)))?;
+            s.graph = Some((Arc::clone(&w.identity), bound, graph));
+        }
+        s.graph
+            .as_ref()
+            .expect("captured decode graph")
+            .2
+            .launch(&self.stream)
+    }
+
+    /// Evaluates `rows` uploaded tokens. With `replay`, positions come from the
+    /// sequence's device position and attention is bounded by `replay` tokens.
     fn forward_chunk(
         &self,
         w: &mut Inkling2Workspace,
         s: &mut Inkling2Sequence,
-        tokens: &[u32],
+        rows: usize,
+        replay: Option<usize>,
     ) -> Result<()> {
         let c = &self.config.text_config;
         let h = c.hidden_size;
-        let rows = tokens.len();
-        w.host_tokens.as_mut_slice()[..rows].copy_from_slice(tokens);
-        w.tokens
-            .copy_range_from_pinned_on_stream(0, &w.host_tokens, &self.stream)?;
         w.residual.count = 0;
         inkling2::embed(
             &self.weights.embedding,
@@ -463,7 +510,7 @@ impl Inkling2Model {
         )?;
         let core = c.loop_config.core_start..c.loop_config.core_end;
         for layer in 0..core.start {
-            self.layer(w, s, self.visit(layer, 0), rows)?;
+            self.layer(w, s, self.visit(layer, 0), rows, replay)?;
         }
         let r = &mut w.residual;
         r.prelude_partial
@@ -494,11 +541,11 @@ impl Inkling2Model {
                 r.count = prelude_count;
             }
             for layer in core.clone() {
-                self.layer(w, s, self.visit(layer, pass), rows)?;
+                self.layer(w, s, self.visit(layer, pass), rows, replay)?;
             }
         }
         for layer in core.end..c.num_hidden_layers {
-            self.layer(w, s, self.visit(layer, 0), rows)?;
+            self.layer(w, s, self.visit(layer, 0), rows, replay)?;
         }
         self.readout(w, s, rows)
     }
@@ -574,6 +621,7 @@ impl Inkling2Model {
         s: &mut Inkling2Sequence,
         visit: Visit,
         rows: usize,
+        replay: Option<usize>,
     ) -> Result<()> {
         let c = &self.config.text_config;
         let h = c.hidden_size;
@@ -648,6 +696,7 @@ impl Inkling2Model {
             c.qk_l2_clip_threshold,
             c.rms_norm_eps,
             s.position,
+            replay.map(|_| &s.device_position),
             tau,
             stream,
         )?;
@@ -661,6 +710,7 @@ impl Inkling2Model {
             c.qk_l2_clip_threshold,
             c.rms_norm_eps,
             s.position,
+            replay.map(|_| &s.device_position),
             None,
             stream,
         )?;
@@ -674,6 +724,7 @@ impl Inkling2Model {
             c.rel_l2_clip_threshold,
             c.rms_norm_eps,
             s.position,
+            replay.map(|_| &s.device_position),
             tau,
             stream,
         )?;
@@ -716,6 +767,10 @@ impl Inkling2Model {
             &mut w.attention_raw,
             c.rel_extent,
             rows,
+            replay.map(|end_bound| ReplayPosition {
+                position: &s.device_position,
+                end_bound,
+            }),
             stream,
         )?;
         a.output.run(

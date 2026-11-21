@@ -92,6 +92,7 @@ unsafe extern "C" {
         threshold: f32,
         eps: f32,
         position: f32,
+        device_position: *const u32,
         tau_floor: u32,
         tau_alpha: f32,
         stream: *mut c_void,
@@ -477,7 +478,8 @@ pub fn commit_short_conv(
     }
 }
 
-/// Applies learned per-channel scaling, L2 clipping, and optional log-context tau.
+/// Applies learned per-channel scaling, L2 clipping, and optional log-context
+/// tau. A `device_position` replaces `position` when the launch executes.
 #[allow(clippy::too_many_arguments)]
 pub fn l2_clip(
     x: &DeviceBuffer<f32>,
@@ -489,6 +491,7 @@ pub fn l2_clip(
     threshold: f32,
     eps: f32,
     position: usize,
+    device_position: Option<&DeviceBuffer<u32>>,
     tau: Option<(usize, f32)>,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -509,6 +512,7 @@ pub fn l2_clip(
         || !eps.is_finite()
         || eps <= 0.0
         || position.saturating_add(rows) >= u32::MAX as usize
+        || device_position.is_some_and(|p| p.len() != 1)
         || tau.is_some_and(|(floor, alpha)| {
             floor == 0 || floor > u32::MAX as usize || !alpha.is_finite()
         })
@@ -529,6 +533,7 @@ pub fn l2_clip(
                 threshold,
                 eps,
                 position as f32,
+                device_position.map_or(std::ptr::null(), |p| p.ptr.cast_const()),
                 floor as u32,
                 alpha,
                 stream.as_raw(),
@@ -916,6 +921,7 @@ mod tests {
             1e-6,
             0,
             None,
+            None,
             &stream,
         )?;
         let norm = input.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1281,6 +1287,7 @@ mod tests {
             &mut out,
             4,
             1,
+            None,
             &stream,
         )?;
         let first = [vec![bf(0.5 / (1.0 + (-1f32).exp())); 128], vec![0.25; 128]].concat();
@@ -1302,6 +1309,7 @@ mod tests {
             &mut out,
             4,
             1,
+            None,
             &stream,
         )?;
         let expected_head = 0.5;
@@ -1359,6 +1367,7 @@ mod tests {
                     &mut out,
                     extent,
                     rows,
+                    None,
                     &stream,
                 )?;
                 outputs.extend_from_slice(&out.copy_to_host(&stream)?);
@@ -1392,6 +1401,7 @@ mod tests {
                     &mut out,
                     extent,
                     1,
+                    None,
                     &stream,
                 )?;
                 outputs.extend_from_slice(&out.copy_to_host(&stream)?);
@@ -1422,6 +1432,7 @@ mod tests {
                 &mut out,
                 extent,
                 rows,
+                None,
                 &stream,
             )?;
             paged.extend_from_slice(&out.copy_to_host(&stream)?);

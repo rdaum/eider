@@ -190,7 +190,7 @@ __global__ void sconv_commit_kernel(const float* x, float* state, uint32_t hidde
 
 __global__ void l2_clip_kernel(const float* x, const float* scale, float* out,
     uint32_t heads, uint32_t dim, float threshold, float eps,
-    float position, uint32_t tau_floor, float tau_alpha) {
+    float position, const uint32_t* device_position, uint32_t tau_floor, float tau_alpha) {
     __shared__ float partial[128];
     const int lane=threadIdx.x;
     const uint32_t head=blockIdx.x, row=blockIdx.y;
@@ -207,6 +207,7 @@ __global__ void l2_clip_kernel(const float* x, const float* scale, float* out,
     const float norm=sum>0 ? sum*rsqrtf(sum) : 0.f;
     const float clipped=bf(value*fminf(1.f,threshold/(norm+eps)));
     float tau=1.f;
+    if(device_position) position=float(device_position[0]);
     if(tau_floor) tau=1.f+tau_alpha*logf(fmaxf((position+row+1.f)/tau_floor,1.f));
     if(lane<dim) out[offset]=bf(clipped*tau);
 }
@@ -534,8 +535,8 @@ extern "C" int infer_inkling2_sconv_commit(const float* x, float* state,
 }
 extern "C" int infer_inkling2_l2_clip(const float* x, const float* scale, float* out,
     uint32_t rows, uint32_t heads, uint32_t dim, float threshold, float eps, float position,
-    uint32_t tau_floor, float tau_alpha, cudaStream_t stream) {
-    l2_clip_kernel<<<dim3(heads,rows),128,0,stream>>>(x,scale,out,heads,dim,threshold,eps,position,tau_floor,tau_alpha);
+    const uint32_t* device_position, uint32_t tau_floor, float tau_alpha, cudaStream_t stream) {
+    l2_clip_kernel<<<dim3(heads,rows),128,0,stream>>>(x,scale,out,heads,dim,threshold,eps,position,device_position,tau_floor,tau_alpha);
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_rel_projection(const float* r, const uint16_t* projection,

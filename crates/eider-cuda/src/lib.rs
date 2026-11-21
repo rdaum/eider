@@ -22,7 +22,8 @@ pub use kernels::inkling2;
 pub use kernels::lfm3;
 pub use kernels::lilicorr;
 pub use kernels::sink_attention::{
-    RelativeKv, SinkAttentionCache, SinkAttentionDecodeBatch, SinkAttentionWorkspace,
+    RelativeKv, ReplayPosition, SinkAttentionCache, SinkAttentionDecodeBatch,
+    SinkAttentionWorkspace,
 };
 
 mod bitnet;

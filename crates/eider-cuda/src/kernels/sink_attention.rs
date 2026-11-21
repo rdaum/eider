@@ -62,6 +62,8 @@ unsafe extern "C" {
         partial: *mut f32,
         out: *mut f32,
         end: u32,
+        position: *const u32,
+        end_bound: u32,
         rows: u32,
         qheads: u32,
         kvheads: u32,
@@ -253,6 +255,16 @@ impl SinkAttentionDecodeBatch {
 }
 
 /// Split-attention scratch shared across model layers.
+/// Device position read by a captured relative-attention launch at execution
+/// time. `end_bound` bounds `position + rows` for every replay.
+#[derive(Clone, Copy)]
+pub struct ReplayPosition<'a> {
+    /// One `u32` holding the number of tokens already appended.
+    pub position: &'a DeviceBuffer<u32>,
+    /// Upper bound on the position after the chunk, used to size partitions.
+    pub end_bound: usize,
+}
+
 /// K/V storage read and appended by relative attention.
 pub enum RelativeKv<'a> {
     /// A bounded local ring that tracks its own position.
@@ -481,6 +493,7 @@ impl SinkAttentionWorkspace {
         out: &mut DeviceBuffer<f32>,
         rel_extent: usize,
         rows: usize,
+        replay: Option<ReplayPosition<'_>>,
         stream: &CudaStream,
     ) -> Result<()> {
         let (position, kv_heads, capacity) = match &kv {
@@ -508,6 +521,11 @@ impl SinkAttentionWorkspace {
             || rel_extent > u32::MAX as usize
             || matches!(&kv, RelativeKv::Pages { table, layer_offset, .. }
                 if table.len() < end.div_ceil(128) || *layer_offset > u32::MAX as usize)
+            || replay.is_some_and(|replay| {
+                replay.position.len() != 1
+                    || replay.end_bound < end
+                    || replay.end_bound > self.max_context
+            })
         {
             return Err(invalid("relative attention buffer or capacity mismatch"));
         }
@@ -541,6 +559,8 @@ impl SinkAttentionWorkspace {
                     self.partial.ptr,
                     out.ptr,
                     position as u32,
+                    replay.map_or(std::ptr::null(), |replay| replay.position.ptr.cast_const()),
+                    replay.map_or(0, |replay| replay.end_bound as u32),
                     rows as u32,
                     self.heads as u32,
                     kv_heads as u32,

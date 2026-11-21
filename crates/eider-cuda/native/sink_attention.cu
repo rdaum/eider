@@ -245,11 +245,15 @@ cudaError_t relative_attention(
     const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
     uint32_t layer_offset, const float* k, const float* v, const float* relative,
     const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
-    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
-    uint64_t partial_capacity, cudaStream_t stream) {
+    const uint32_t* position, uint32_t end_bound, uint32_t rows, uint32_t qheads,
+    uint32_t kvheads, uint32_t capacity, uint32_t rel_extent, uint64_t partial_capacity,
+    cudaStream_t stream) {
     constexpr uint32_t PageTokens=128;
+    // A device position replaces `end` at execution time; `end_bound` then
+    // bounds the partitions so a captured launch stays valid as it grows.
+    const uint64_t extent=position ? uint64_t(end_bound) : uint64_t(end)+rows;
     for(uint32_t first=0;first<rows;) {
-        const uint32_t splits=(min(uint64_t(end)+rows,uint64_t(capacity))+255)/256;
+        const uint32_t splits=(min(extent,uint64_t(capacity))+255)/256;
         const uint64_t per_row=uint64_t(qheads)*splits*130;
         const uint32_t count=uint32_t(min(uint64_t(rows-first),partial_capacity/per_row));
         if(count==0) return cudaErrorInvalidValue;
@@ -257,18 +261,18 @@ cudaError_t relative_attention(
         if(count>=64)
             prefill_attention<Paged><<<dim3(qheads,(count+15)/16,splits),256,0,stream>>>(
                 q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,pages,
-                layer_offset,PageTokens,nullptr,relative+qoff*rel_extent,rel_extent,first);
+                layer_offset,PageTokens,position,relative+qoff*rel_extent,rel_extent,first);
         else
             partial_attention<Paged><<<dim3(qheads,count,splits),32,0,stream>>>(
                 q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,pages,
-                layer_offset,PageTokens,nullptr,nullptr,nullptr,nullptr,0,0,
+                layer_offset,PageTokens,position,nullptr,nullptr,nullptr,0,0,
                 relative+qoff*rel_extent,rel_extent,first);
         merge_relative_attention<<<qheads*count,32,0,stream>>>(
             partial,gate+qoff*128,sinks+qoff,out+qoff*128,splits,qheads);
         first+=count;
     }
     append_kv<Paged><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
-        k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,PageTokens,nullptr);
+        k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,PageTokens,position);
     return cudaGetLastError();
 }
 
@@ -281,15 +285,17 @@ extern "C" cudaError_t infer_causal_relative_attention(
     const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
     uint32_t layer_offset, const float* k, const float* v, const float* relative,
     const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
-    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
-    uint64_t partial_capacity, cudaStream_t stream) {
+    const uint32_t* position, uint32_t end_bound, uint32_t rows, uint32_t qheads,
+    uint32_t kvheads, uint32_t capacity, uint32_t rel_extent, uint64_t partial_capacity,
+    cudaStream_t stream) {
     if(!q || !k || !v || !relative || !gate || !sinks || !partial || !out || !rel_extent || !rows
         || (pages ? (ck || cv) : (!ck || !cv))) return cudaErrorInvalidValue;
     if(pages)
         return relative_attention<true>(q,nullptr,nullptr,pages,layer_offset,k,v,relative,gate,
-            sinks,partial,out,end,rows,qheads,kvheads,UINT32_MAX,rel_extent,partial_capacity,stream);
+            sinks,partial,out,end,position,end_bound,rows,qheads,kvheads,UINT32_MAX,rel_extent,
+            partial_capacity,stream);
     return relative_attention<false>(q,ck,cv,nullptr,0,k,v,relative,gate,sinks,partial,out,end,
-        rows,qheads,kvheads,capacity,rel_extent,partial_capacity,stream);
+        position,end_bound,rows,qheads,kvheads,capacity,rel_extent,partial_capacity,stream);
 }
 
 // Page bundles hold [global layer][K/V][page token][KV head][dimension].
