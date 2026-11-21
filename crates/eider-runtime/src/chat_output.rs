@@ -166,9 +166,14 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             .as_ref()
             .map(|_| "assistant".to_string());
         let inkling2_special_tokens = inkling2::SpecialTokens::new(tokenizer);
-        let inkling2_state = inkling2_special_tokens
-            .as_ref()
-            .map(|_| inkling2::State::new());
+        let inkling2_state = inkling2_special_tokens.as_ref().map(|_| {
+            inkling2::State::new(
+                tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect(),
+            )
+        });
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
             protocol_special_tokens: if tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).is_some()
@@ -212,9 +217,9 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         }
         if let (Some(tokens), Some(state)) =
             (&self.inkling2_special_tokens, &mut self.inkling2_state)
-            && state.control(tokens, token_id)?
+            && let Some(events) = state.control(tokens, token_id)?
         {
-            return Ok(Vec::new());
+            return Ok(events);
         }
         if let Some((_, marker)) = self
             .protocol_special_tokens
@@ -302,9 +307,13 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         }
         self.finished = true;
         if let Some(state) = &mut self.inkling2_state {
-            // Native Inkling completion closes an open Thinking or Text block.
-            // Cancellation does not call finish and therefore cannot flush it.
-            return Ok(state.finish());
+            // Native Inkling completion closes an open block; truncation drops
+            // a partial tool call. Cancellation does not call finish.
+            return if truncated {
+                Ok(state.finish_truncated())
+            } else {
+                state.finish()
+            };
         }
         if truncated {
             self.parser.finish_truncated()

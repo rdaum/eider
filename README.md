@@ -331,7 +331,7 @@ second column.
 | [`flint-nvfp4`](docs/flint.md) | `eider-flint` | W4A16 GGUF, learned sinks, shared BF16 prefixes, packed decode, CUDA graphs, and native tool calls |
 | [`dory1.0-4b-nvfp4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4) | `eider-dory1.0-4b` | Looped nGPT, native NVFP4, BF16 KV, decode graphs, and selected-label decisions |
 | [`lfm3-1.7b-nvfp4`](docs/lfm3.md) | `eider-lfm3-1.7b` | Official NVFP4, gated convolution, full/sliding attention, and packed selected-label decisions |
-| [`inkling-2-mini-text`](docs/inkling2.md) | `eider-inkling2-mini-text` | Fixed-pass recurrent text execution, relative attention, NVFP4 W4A16 experts, and an MXFP8-to-BF16 fallback |
+| [`inkling-2-mini-text`](docs/inkling2.md) | `eider-inkling2-mini-text` | Fixed-pass recurrent text execution, relative attention, NVFP4 W4A16 experts, an MXFP8-to-BF16 fallback, and native JSON tool calls |
 | [`lfm2.5-24b-a2b-nvfp4`](docs/lfm2.md) | `eider-lfm2.5-24b-a2b` | NVFP4 experts, gated short convolution, GQA, and LFM tool calls |
 | [`qwen3.8-flash-next`](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4) | `eider-qwen3.8-flash-next` | 125B/6B-active MoE, native QSA and GDN, NVMe-paged BF16 n-gram table, 262K text context |
 | [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |

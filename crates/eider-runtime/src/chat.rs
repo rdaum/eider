@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+mod inkling2;
+
+pub use inkling2::Inkling2PromptRenderer;
+
 const TEMPLATE_NAME: &str = "chat_template";
 
 /// Role attached to one structured chat message.

@@ -1,10 +1,9 @@
-//! Text-only Inkling 2 serving with complete per-request loop and convolution state.
+//! Inkling 2 text and tool serving with complete per-request loop and convolution state.
 
-use super::lfm2_serving::emit;
 use crate::inkling2::{Inkling2Model, Inkling2Sequence, Inkling2Workspace};
 use eider_cuda::{Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
-use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat::{CheckpointChatTemplate, Inkling2PromptRenderer};
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
     EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
@@ -29,11 +28,13 @@ struct Request<'m, 't> {
     output: ChatOutputCodec<'t>,
     stop: StopBuffer,
     usage: ChatUsage,
+    called_tools: bool,
 }
 
 pub(crate) struct Inkling2ChatService<'m, 't> {
     model: &'m Inkling2Model,
     template: &'t CheckpointChatTemplate,
+    renderer: Inkling2PromptRenderer,
     config: SchedulerConfig,
     prefill: Inkling2Workspace<'m>,
     next_id: u64,
@@ -60,6 +61,7 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
         Ok(Self {
             model,
             template,
+            renderer: Inkling2PromptRenderer::new(template.tokenizer())?,
             prefill: model.new_workspace(config.prefill_token_capacity)?,
             config,
             next_id: 1,
@@ -70,30 +72,22 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
 
     fn add(&mut self, request: ChatRequest) -> Result<EngineAdmission> {
         request.generation.validate()?;
-        if !request.tools.is_empty()
-            || request.messages.iter().any(|message| {
-                !message.tool_calls.is_empty()
-                    || message.role == eider_runtime::chat::ChatRole::Tool
-            })
-        {
-            return Err(error(
-                "the text-only Inkling 2 adapter does not yet support tool history or definitions",
-            ));
-        }
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(error("empty stop sequence"));
         }
-        let prompt = self.template.render_and_tokenize(
+        // The reference frontend renders Inkling natively rather than through
+        // the checkpoint's Jinja template.
+        let prompt = self.renderer.render(
             &request.messages,
             &request.tools,
             request.template,
+            request.parallel_tool_calls,
         )?;
         let total = prompt
-            .token_ids
             .len()
             .checked_add(request.generation.max_new_tokens)
             .ok_or_else(|| error("prompt plus completion length overflow"))?;
-        if prompt.token_ids.is_empty() || total > self.config.max_context_tokens {
+        if prompt.is_empty() || total > self.config.max_context_tokens {
             return Err(error(format!(
                 "request requires {total} tokens; context limit is {}",
                 self.config.max_context_tokens
@@ -106,17 +100,17 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             .ok_or_else(|| error("request IDs exhausted"))?;
         let admission = EngineAdmission {
             request_id: id,
-            prompt_tokens: prompt.token_ids.len(),
+            prompt_tokens: prompt.len(),
             max_output_tokens: request.generation.max_new_tokens,
         };
         // Inkling samples its own message_model header and content-type markers.
-        let output = ChatOutputCodec::new(self.template.tokenizer(), &[], false)?;
-        let history = TokenHistory::from_tokens(prompt.token_ids.iter().copied());
+        let output = ChatOutputCodec::new(self.template.tokenizer(), &request.tools, false)?;
+        let history = TokenHistory::from_tokens(prompt.iter().copied());
         let sampler = Sampler::new(request.generation.sampling)?;
         self.requests.insert(
             id,
             Request {
-                prompt: prompt.token_ids,
+                prompt,
                 position: 0,
                 sequence: None,
                 generation: request.generation,
@@ -129,6 +123,7 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                     prompt_tokens: admission.prompt_tokens,
                     ..ChatUsage::default()
                 },
+                called_tools: false,
             },
         );
         self.waiting.push_back(id);
@@ -190,18 +185,25 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
             request.usage.reasoning_tokens += usize::from(request.output.is_reasoning());
             tick.generated.push(id);
             let events = request.output.push_token(token)?;
-            let reason = emit(id, &mut request.stop, events, &mut tick.output)
-                .or_else(|| {
-                    request
-                        .generation
-                        .eos_token_ids
-                        .contains(&token)
-                        .then_some(ChatFinishReason::Eos)
-                })
-                .or_else(|| {
-                    (request.usage.completion_tokens >= request.generation.max_new_tokens)
-                        .then_some(ChatFinishReason::Length)
-                });
+            let called_tools = &mut request.called_tools;
+            let reason = emit(
+                id,
+                &mut request.stop,
+                events,
+                &mut tick.output,
+                called_tools,
+            )
+            .or_else(|| {
+                request
+                    .generation
+                    .eos_token_ids
+                    .contains(&token)
+                    .then_some(ChatFinishReason::Eos)
+            })
+            .or_else(|| {
+                (request.usage.completion_tokens >= request.generation.max_new_tokens)
+                    .then_some(ChatFinishReason::Length)
+            });
             if let Some(reason) = reason {
                 done.push((id, reason));
             }
@@ -243,8 +245,14 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                 request.output.finish()?
             };
             if !matches!(reason, ChatFinishReason::Stop(_)) {
-                if let Some(protocol) = emit(id, &mut request.stop, events, &mut tick.output) {
-                    reason = protocol;
+                if let Some(stop) = emit(
+                    id,
+                    &mut request.stop,
+                    events,
+                    &mut tick.output,
+                    &mut request.called_tools,
+                ) {
+                    reason = stop;
                 }
                 let tail = request.stop.finish();
                 if !tail.is_empty() {
@@ -253,6 +261,9 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                         event: ChatOutputEvent::Text(tail),
                     });
                 }
+            }
+            if reason == ChatFinishReason::Eos && request.called_tools {
+                reason = ChatFinishReason::ToolCalls;
             }
             tick.finished.push(EngineFinished {
                 request_id: id,
@@ -299,6 +310,54 @@ impl EngineService for Inkling2ChatService<'_, '_> {
             .filter(|request| request.sequence.is_some())
             .count()
     }
+}
+
+/// Forwards codec events. Inkling writes every parallel call as its own block
+/// and may follow calls with text, so a tool call does not end the turn: the
+/// model's end-of-sampling token does. Only a stop sequence ends it early.
+fn emit(
+    id: EngineRequestId,
+    stop: &mut StopBuffer,
+    events: Vec<ChatOutputEvent>,
+    output: &mut Vec<EngineDelta>,
+    called_tools: &mut bool,
+) -> Option<ChatFinishReason> {
+    for event in events {
+        match event {
+            ChatOutputEvent::Text(text) => {
+                let chunk = stop.push(&text);
+                if !chunk.text.is_empty() {
+                    output.push(EngineDelta {
+                        request_id: id,
+                        event: ChatOutputEvent::Text(chunk.text),
+                    });
+                }
+                if let Some(matched) = chunk.matched {
+                    return Some(ChatFinishReason::Stop(matched));
+                }
+            }
+            event @ ChatOutputEvent::ToolCall(_) => {
+                // Release held-back text so it stays ordered before the call.
+                let tail = stop.finish();
+                if !tail.is_empty() {
+                    output.push(EngineDelta {
+                        request_id: id,
+                        event: ChatOutputEvent::Text(tail),
+                    });
+                }
+                output.push(EngineDelta {
+                    request_id: id,
+                    event,
+                });
+                *called_tools = true;
+            }
+            event @ ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                request_id: id,
+                event,
+            }),
+        }
+    }
+    None
 }
 
 fn error(detail: impl Into<String>) -> Error {

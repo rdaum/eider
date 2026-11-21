@@ -203,6 +203,11 @@ pub fn with_loaded_engine<R>(
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Inkling2 => {
+            // Each parallel call is its own block in Inkling's native format.
+            let defaults = GenerationConfig {
+                supports_parallel_tool_calls: true,
+                ..defaults
+            };
             let model = Inkling2Model::load(&model_dir)?;
             let scheduler = SchedulerConfig {
                 max_context_tokens: scheduler

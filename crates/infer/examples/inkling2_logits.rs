@@ -4,7 +4,9 @@
 
 use eider_cuda::Result;
 use eider_inference::inkling2::Inkling2Model;
-use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
+use eider_runtime::chat::{
+    ChatMessage, ChatTemplateOptions, CheckpointChatTemplate, Inkling2PromptRenderer,
+};
 use eider_runtime::chat_output::ChatOutputCodec;
 use std::path::PathBuf;
 
@@ -18,17 +20,18 @@ fn main() -> Result<()> {
         .next()
         .unwrap_or_else(|| "Explain looped inference in one sentence.".to_string());
     let template = CheckpointChatTemplate::from_model_dir(&root)?;
-    let prompt = template.render_and_tokenize(
+    let prompt = Inkling2PromptRenderer::new(template.tokenizer())?.render(
         &[ChatMessage::user(text)],
         &[],
         ChatTemplateOptions::default(),
+        true,
     )?;
-    println!("prompt token ids: {:?}", prompt.token_ids);
+    println!("prompt token ids: {:?}", prompt);
     let model = Inkling2Model::load(root)?;
-    let mut workspace = model.new_workspace(prompt.token_ids.len().max(1))?;
+    let mut workspace = model.new_workspace(prompt.len().max(1))?;
     let steps = 32;
-    let mut sequence = model.new_sequence(prompt.token_ids.len() + steps)?;
-    model.forward(&mut workspace, &mut sequence, &prompt.token_ids)?;
+    let mut sequence = model.new_sequence(prompt.len() + steps)?;
+    model.forward(&mut workspace, &mut sequence, &prompt)?;
     let mut codec = ChatOutputCodec::new(template.tokenizer(), &[], false)?;
     let mut events = Vec::new();
     let mut generated = Vec::new();
