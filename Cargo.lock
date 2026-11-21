@@ -2485,9 +2485,9 @@ dependencies = [
 
 [[package]]
 name = "rart"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5488e63dd903d52e19ac2103ad488e612bc81d1291079fc2e23e60be515c3a1a"
+checksum = "29b352bfcd92f533670fabdbab1a0adca884134c6318a4491c28e23d1530eec9"
 dependencies = [
  "num-traits",
  "simdeez",
@@ -2865,7 +2865,8 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "seqcache"
 version = "0.1.0"
-source = "git+https://github.com/rdaum/seqcache#8f185373fdf7776020407aa71c3b6ccb1e598bca"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "727101a7d6f4685d8b15828a78a365ab8662dd2a2a2f683f6f2f557802782766"
 dependencies = [
  "fast-telemetry",
  "foldhash",
@@ -3244,7 +3245,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
