@@ -44,6 +44,9 @@ pub mod bonsai;
 /// Recursive Flint NVFP4 model loading and inference.
 pub mod flint;
 
+/// Inkling 2 Mini fixed-pass text-model loading and inference.
+pub mod inkling2;
+
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 

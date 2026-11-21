@@ -48,6 +48,26 @@ unsafe extern "C" {
         page_tokens: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn infer_causal_relative_attention(
+        q: *const f32,
+        ck: *mut u16,
+        cv: *mut u16,
+        k: *const f32,
+        v: *const f32,
+        relative: *const f32,
+        gate: *const f32,
+        sinks: *const f32,
+        partial: *mut f32,
+        out: *mut f32,
+        end: u32,
+        rows: u32,
+        qheads: u32,
+        kvheads: u32,
+        capacity: u32,
+        rel_extent: u32,
+        partial_capacity: u64,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_causal_sink_attention(
         q: *const f32,
         ck: *mut u16,
@@ -424,6 +444,73 @@ impl SinkAttentionWorkspace {
     pub fn device_bytes(&self) -> usize {
         self.partial.device_bytes()
     }
+    /// Runs Inkling relative-bias attention and its projected gate/sink epilogue.
+    /// The sink modulates the real-key LSE; it is not an extra zero-value KV entry.
+    /// Long chunks run in row groups whose softmax partials fit this workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_relative(
+        &mut self,
+        cache: &mut SinkAttentionCache,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        relative: &DeviceBuffer<f32>,
+        gate: &DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        rel_extent: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let end = cache
+            .position
+            .checked_add(rows)
+            .filter(|&v| v <= u32::MAX as usize)
+            .ok_or_else(|| invalid("position overflow"))?;
+        if rows == 0
+            || cache.capacity > self.max_context
+            || !self.heads.is_multiple_of(cache.kv_heads)
+            || q.len() < rows * self.heads * 128
+            || out.len() < rows * self.heads * 128
+            || k.len() < rows * cache.kv_heads * 128
+            || v.len() < rows * cache.kv_heads * 128
+            || relative.len() < rows * self.heads * rel_extent
+            || gate.len() < rows * self.heads * 128
+            || sinks.len() < rows * self.heads
+            || rel_extent == 0
+            || rel_extent > u32::MAX as usize
+        {
+            return Err(invalid("relative attention buffer or capacity mismatch"));
+        }
+        unsafe {
+            check_cuda(
+                "infer_causal_relative_attention",
+                infer_causal_relative_attention(
+                    q.ptr,
+                    cache.key.ptr,
+                    cache.value.ptr,
+                    k.ptr,
+                    v.ptr,
+                    relative.ptr,
+                    gate.ptr,
+                    sinks.ptr,
+                    self.partial.ptr,
+                    out.ptr,
+                    cache.position as u32,
+                    rows as u32,
+                    self.heads as u32,
+                    cache.kv_heads as u32,
+                    cache.capacity as u32,
+                    rel_extent as u32,
+                    self.partial.len() as u64,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        cache.position = end;
+        Ok(())
+    }
+
     /// Reference path for checking and timing the serving prefill kernels.
     /// Appends a causal chunk after evaluating it against the previous KV ring.
     /// Inputs must contain BF16-valued Q/K/V in F32 storage.

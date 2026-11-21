@@ -6,6 +6,7 @@ pub(crate) mod deepseek4;
 pub(crate) mod dory;
 pub(crate) mod gemma4_attention;
 pub(crate) mod ggml_blocks;
+pub mod inkling2;
 pub(crate) mod lfm2;
 pub mod lfm3;
 pub mod lilicorr;

@@ -10,6 +10,7 @@ use crate::execution::deepseek4_serving::Deepseek4ChatService;
 use crate::execution::dory_serving::DoryChatService;
 use crate::execution::flint_serving::FlintChatService;
 use crate::execution::gemma4_serving::Gemma4ChatService;
+use crate::execution::inkling2_serving::Inkling2ChatService;
 use crate::execution::laguna_serving::LagunaChatService;
 use crate::execution::lfm2_serving::Lfm2ChatService;
 use crate::execution::lfm3_serving::Lfm3ChatService;
@@ -21,6 +22,7 @@ use crate::execution::serving::Qwen36ChatService;
 use crate::execution::step37_serving::Step37ChatService;
 use crate::flint::FlintModel;
 use crate::gemma4::Gemma4Model;
+use crate::inkling2::Inkling2Model;
 use crate::laguna::LagunaModel;
 use crate::lfm2::Lfm2Model;
 use crate::lfm3::Lfm3Model;
@@ -46,6 +48,8 @@ pub enum CheckpointArchitecture {
     Flint,
     /// Dory normalized looped transformer.
     Dory,
+    /// Inkling 2 Mini fixed-pass text.
+    Inkling2,
     /// Liquid LFM2 MoE.
     Lfm2Moe,
     /// Liquid LFM3 dense hybrid.
@@ -103,6 +107,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
     match config.model_type.as_str() {
         "flint" => Ok(CheckpointArchitecture::Flint),
         "dory" => Ok(CheckpointArchitecture::Dory),
+        "inkling2_loop" => Ok(CheckpointArchitecture::Inkling2),
         "lfm2_moe" => Ok(CheckpointArchitecture::Lfm2Moe),
         "lfm3" => Ok(CheckpointArchitecture::Lfm3),
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
@@ -195,6 +200,18 @@ pub fn with_loaded_engine<R>(
                 ..scheduler
             };
             let mut service = DoryChatService::new(&model, &template, scheduler, sequence_cache)?;
+            Ok(run(&mut service, defaults))
+        }
+        CheckpointArchitecture::Inkling2 => {
+            let model = Inkling2Model::load(&model_dir)?;
+            let scheduler = SchedulerConfig {
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().text_config.model_max_length),
+                ..scheduler
+            };
+            let mut service =
+                Inkling2ChatService::new(&model, &template, scheduler, sequence_cache)?;
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Lfm2Moe => {

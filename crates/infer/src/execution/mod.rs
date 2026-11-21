@@ -9,6 +9,7 @@ pub(crate) mod expert_hotset;
 pub(crate) mod flint_serving;
 pub(crate) mod gemma4_serving;
 pub mod generation;
+pub(crate) mod inkling2_serving;
 pub(crate) mod kv_cache;
 pub(crate) mod laguna_serving;
 pub(crate) mod lfm2_serving;

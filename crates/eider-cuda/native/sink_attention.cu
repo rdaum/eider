@@ -19,7 +19,8 @@ __global__ void partial_attention(
     const __nv_bfloat16* const* batch_keys=nullptr,
     const __nv_bfloat16* const* batch_values=nullptr,
     const __nv_bfloat16* const* const* batch_pages=nullptr,
-    uint32_t layers=0, uint32_t layer=0) {
+    uint32_t layers=0, uint32_t layer=0,
+    const float* relative=nullptr, uint32_t rel_extent=0, uint32_t query_offset=0) {
     const uint32_t head=blockIdx.x, query=blockIdx.y, part=blockIdx.z, lane=threadIdx.x;
     if (position) end=position[DecodeBatch ? query : 0];
     if constexpr (DecodeBatch) {
@@ -27,7 +28,8 @@ __global__ void partial_attention(
         else { ck=batch_keys[query*layers+layer]; cv=batch_values[query*layers+layer]; }
     }
     const uint32_t kvhead=head/(qheads/kvheads);
-    const uint64_t last=uint64_t(end)+(DecodeBatch ? 0 : query)+1, first=last>capacity ? last-capacity : 0;
+    // Chunk-local query rows may start after earlier rows of the same chunk.
+    const uint64_t last=uint64_t(end)+(DecodeBatch ? 0 : query_offset+query)+1, first=last>capacity ? last-capacity : 0;
     float query_value[4], acc[4]={};
     #pragma unroll
     for (int c=0;c<4;++c) query_value[c]=q[(query*qheads+head)*128+lane+c*32];
@@ -45,6 +47,11 @@ __global__ void partial_attention(
             dot=fmaf(query_value[c],key,dot);
         }
         dot=warp_sum(dot)*0.08838834764831845f;
+        if(relative) {
+            const uint64_t distance=uint64_t(end)+query_offset+query-i;
+            if(distance<rel_extent)
+                dot+=relative[(size_t(query)*qheads+head)*rel_extent+distance];
+        }
         const float next=fmaxf(mx,dot), keep=expf(mx-next), p=expf(dot-next);
         total=total*keep+p;
         #pragma unroll
@@ -65,7 +72,8 @@ __global__ void prefill_attention(
     const float* k, const float* v, float* partial, uint32_t end,
     uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity,
     uint32_t splits, const __nv_bfloat16* const* pages, uint32_t layer_offset,
-    uint32_t page_tokens, const uint32_t* position) {
+    uint32_t page_tokens, const uint32_t* position,
+    const float* relative=nullptr, uint32_t rel_extent=0, uint32_t query_offset=0) {
     constexpr unsigned Warps=8, Queries=2, QueryRows=Warps*Queries, Keys=32;
     __shared__ float keys[Keys][128], values[Keys][128];
     const unsigned lane=threadIdx.x%32, warp=threadIdx.x/32;
@@ -78,7 +86,7 @@ __global__ void prefill_attention(
     #pragma unroll
     for(unsigned n=0;n<Queries;++n) {
         const unsigned query=first_query+warp+n*Warps;
-        const uint64_t last=uint64_t(end)+query+1;
+        const uint64_t last=uint64_t(end)+query_offset+query+1;
         const uint64_t first=last>capacity ? last-capacity : 0;
         begin[n]=first+part*256;
         limit[n]=min(last,first+(part+1)*256);
@@ -87,9 +95,9 @@ __global__ void prefill_attention(
         for(unsigned c=0;c<4;++c)
             query_value[n][c]=query<rows ? q[(size_t(query)*qheads+head)*128+lane+c*32] : 0.f;
     }
-    const uint64_t first_last=uint64_t(end)+first_query+1;
+    const uint64_t first_last=uint64_t(end)+query_offset+first_query+1;
     const uint64_t first=first_last>capacity ? first_last-capacity : 0;
-    const uint64_t last=uint64_t(end)+min(first_query+QueryRows,rows);
+    const uint64_t last=uint64_t(end)+query_offset+min(first_query+QueryRows,rows);
     const uint64_t last_first=last>capacity ? last-capacity : 0;
     const uint64_t stop=min(last,last_first+(part+1)*256);
     for(uint64_t tile=first+part*256;tile<stop;tile+=Keys) {
@@ -124,6 +132,11 @@ __global__ void prefill_attention(
                     #pragma unroll
                     for(unsigned c=0;c<4;++c) dot=fmaf(query_value[n][c],key[c],dot);
                     dot=warp_sum(dot)*0.08838834764831845f;
+                    if(relative) {
+                        const uint64_t distance=uint64_t(end)+query_offset+query-(tile+t);
+                        if(distance<rel_extent)
+                            dot+=relative[(size_t(query)*qheads+head)*rel_extent+distance];
+                    }
                     const float next=fmaxf(mx[n],dot), keep=expf(mx[n]-next), p=expf(dot-next);
                     total[n]=total[n]*keep+p;
                     #pragma unroll
@@ -165,6 +178,31 @@ __global__ void merge_attention(const float* partial, const float* sinks, float*
     for(int c=0;c<4;++c) out[row*128+lane+c*32]=acc[c]/total;
 }
 
+// Inkling's sink does not add a zero-value KV entry. It gates ordinary
+// attention using the real-key log-sum-exp and a projected per-head sink.
+__global__ void merge_relative_attention(const float* partial, const float* gate,
+    const float* sinks, float* out, uint32_t splits, uint32_t qheads) {
+    const uint32_t lane=threadIdx.x,row=blockIdx.x,head=row%qheads;
+    const float* src=partial+size_t(row)*splits*130;
+    float mx=-INFINITY,total=0.f,acc[4]={};
+    for(uint32_t s=0;s<splits;++s) mx=fmaxf(mx,src[s*130+128]);
+    for(uint32_t s=0;s<splits;++s) {
+        const float p=expf(src[s*130+128]-mx);
+        total+=src[s*130+129]*p;
+        #pragma unroll
+        for(int c=0;c<4;++c) acc[c]+=src[s*130+lane+c*32]*p;
+    }
+    const float lse=mx+logf(total);
+    const float sink=sinks[row];
+    #pragma unroll
+    for(int c=0;c<4;++c) {
+        const uint32_t column=lane+c*32;
+        const float gate_value=gate[row*128+column];
+        const float factor=1.f/(1.f+expf(-gate_value))/(1.f+expf(-(lse-sink)));
+        out[row*128+column]=__bfloat162float(__float2bfloat16_rn(acc[c]/total*factor));
+    }
+}
+
 template <bool Paged, bool DecodeBatch = false>
 __global__ void append_kv(const float* k,const float* v,__nv_bfloat16* ck,__nv_bfloat16* cv,
                           uint32_t end,uint32_t rows,uint32_t width,uint32_t capacity,
@@ -199,6 +237,39 @@ extern "C" cudaError_t infer_causal_sink_attention(
     partial_attention<false><<<dim3(qheads,rows,splits),32,0,stream>>>(q,ck,cv,k,v,partial,end,rows,qheads,kvheads,capacity,splits,nullptr,0,0,nullptr);
     merge_attention<<<qheads*rows,32,0,stream>>>(partial,sinks,out,splits,qheads);
     append_kv<false><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(k,v,ck,cv,end,rows,kvheads*128,capacity,nullptr,0,0,nullptr);
+    return cudaGetLastError();
+}
+
+// Rows are evaluated in sub-chunks whose softmax partials fit `partial_capacity`.
+// Every sub-chunk reads earlier rows of the same chunk from `k`/`v`; the
+// chunk is appended to the cache once all rows have attended.
+extern "C" cudaError_t infer_causal_relative_attention(
+    const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, const float* k, const float* v,
+    const float* relative, const float* gate, const float* sinks, float* partial, float* out,
+    uint32_t end, uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity,
+    uint32_t rel_extent, uint64_t partial_capacity, cudaStream_t stream) {
+    if(!q || !ck || !cv || !k || !v || !relative || !gate || !sinks || !partial || !out
+        || !rel_extent || !rows) return cudaErrorInvalidValue;
+    for(uint32_t first=0;first<rows;) {
+        const uint32_t splits=(min(uint64_t(end)+rows,uint64_t(capacity))+255)/256;
+        const uint64_t per_row=uint64_t(qheads)*splits*130;
+        const uint32_t count=uint32_t(min(uint64_t(rows-first),partial_capacity/per_row));
+        if(count==0) return cudaErrorInvalidValue;
+        const size_t qoff=size_t(first)*qheads;
+        if(count>=64)
+            prefill_attention<false><<<dim3(qheads,(count+15)/16,splits),256,0,stream>>>(
+                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,nullptr,0,0,
+                nullptr,relative+qoff*rel_extent,rel_extent,first);
+        else
+            partial_attention<false><<<dim3(qheads,count,splits),32,0,stream>>>(
+                q+qoff*128,ck,cv,k,v,partial,end,count,qheads,kvheads,capacity,splits,nullptr,0,0,
+                nullptr,nullptr,nullptr,nullptr,0,0,relative+qoff*rel_extent,rel_extent,first);
+        merge_relative_attention<<<qheads*count,32,0,stream>>>(
+            partial,gate+qoff*128,sinks+qoff,out+qoff*128,splits,qheads);
+        first+=count;
+    }
+    append_kv<false><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
+        k,v,ck,cv,end,rows,kvheads*128,capacity,nullptr,0,0,nullptr);
     return cudaGetLastError();
 }
 

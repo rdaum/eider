@@ -3277,6 +3277,40 @@ unsafe extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_moe_group_routes_on_stream(
+        ids: *const u32,
+        routes: u32,
+        experts: u32,
+        sorted: *mut u32,
+        item_expert: *mut u32,
+        item_start: *mut u32,
+        item_count: *mut u32,
+        items: *mut u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_moe_group_columns() -> u32;
+    #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_sm121_w4a16_grouped_routes_on_stream(
+        sorted: *const u32,
+        item_expert: *const u32,
+        item_start: *const u32,
+        item_count: *const u32,
+        items: *const u32,
+        max_items: u32,
+        input: *const f32,
+        tiled_weight: *const u8,
+        weight_scale: *const u8,
+        global_scale: *const f32,
+        output: *mut f32,
+        top_k: u32,
+        per_route_input: bool,
+        out_features: u32,
+        in_features: u32,
+        tiled: bool,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm121_w4a16_dense_batch_on_stream(
         input: *const f32,
         weight: *const u8,

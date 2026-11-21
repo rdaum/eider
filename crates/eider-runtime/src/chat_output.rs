@@ -12,6 +12,7 @@ use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::processors::PostProcessorWrapper;
 use tokenizers::{DecodeStream, Tokenizer};
 
+mod inkling2;
 mod lfm2;
 
 const LFM_TOOL_CALL_OPEN: &str = "<|tool_call_start|>";
@@ -97,6 +98,8 @@ pub struct ChatOutputCodec<'tokenizer> {
     protocol_special_tokens: Vec<(u32, &'static str)>,
     muse_special_tokens: Option<MuseSpecialTokens>,
     muse_header: Option<String>,
+    inkling2_special_tokens: Option<inkling2::SpecialTokens>,
+    inkling2_state: Option<inkling2::State>,
     finished: bool,
 }
 
@@ -162,6 +165,10 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         let muse_header = muse_special_tokens
             .as_ref()
             .map(|_| "assistant".to_string());
+        let inkling2_special_tokens = inkling2::SpecialTokens::new(tokenizer);
+        let inkling2_state = inkling2_special_tokens
+            .as_ref()
+            .map(|_| inkling2::State::new());
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
             protocol_special_tokens: if tokenizer.token_to_id(LFM_TOOL_CALL_OPEN).is_some()
@@ -189,6 +196,8 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             gemma_special_tokens,
             muse_special_tokens,
             muse_header,
+            inkling2_special_tokens,
+            inkling2_state,
             finished: false,
         })
     }
@@ -200,6 +209,12 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
                 label: "chat output stream",
                 detail: "cannot push a token after finish".to_string(),
             });
+        }
+        if let (Some(tokens), Some(state)) =
+            (&self.inkling2_special_tokens, &mut self.inkling2_state)
+            && state.control(tokens, token_id)?
+        {
+            return Ok(Vec::new());
         }
         if let Some((_, marker)) = self
             .protocol_special_tokens
@@ -253,6 +268,9 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         else {
             return Ok(Vec::new());
         };
+        if let Some(state) = &mut self.inkling2_state {
+            return Ok(state.push_text(&text));
+        }
         if let Some(header) = &mut self.muse_header {
             header.push_str(&text);
             return Ok(Vec::new());
@@ -262,7 +280,10 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
 
     /// Returns whether the next generated token belongs to the thinking section.
     pub fn is_reasoning(&self) -> bool {
-        self.parser.mode == OutputMode::Reasoning
+        self.inkling2_state
+            .as_ref()
+            .is_some_and(inkling2::State::is_reasoning)
+            || self.parser.mode == OutputMode::Reasoning
     }
 
     /// Finishes protocol parsing and flushes safe pending text.
@@ -280,6 +301,11 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             return Ok(Vec::new());
         }
         self.finished = true;
+        if let Some(state) = &mut self.inkling2_state {
+            // Native Inkling completion closes an open Thinking or Text block.
+            // Cancellation does not call finish and therefore cannot flush it.
+            return Ok(state.finish());
+        }
         if truncated {
             self.parser.finish_truncated()
         } else {

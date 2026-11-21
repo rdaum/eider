@@ -361,6 +361,258 @@ extern "C" cudaError_t infer_sm121_w4a16_dense_batch_on_stream(
     return cudaGetLastError();
 }
 
+namespace {
+constexpr unsigned kGroupColumns = 64;
+
+// Sorts routes by expert and splits each expert's routes into work items of
+// at most kGroupColumns. Route order within an expert does not affect values:
+// every route is a separate MMA column with the same K reduction.
+__global__ void group_routes_kernel(
+    const std::uint32_t* __restrict__ ids, unsigned routes, unsigned experts,
+    std::uint32_t* __restrict__ sorted, std::uint32_t* __restrict__ item_expert,
+    std::uint32_t* __restrict__ item_start, std::uint32_t* __restrict__ item_count,
+    std::uint32_t* __restrict__ items) {
+    extern __shared__ std::uint32_t shared[];
+    std::uint32_t* counts = shared;
+    std::uint32_t* cursor = shared + experts;
+    for (unsigned e = threadIdx.x; e < experts; e += blockDim.x) counts[e] = 0;
+    __syncthreads();
+    for (unsigned r = threadIdx.x; r < routes; r += blockDim.x) atomicAdd(&counts[ids[r]], 1u);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned offset = 0, item = 0;
+        for (unsigned e = 0; e < experts; ++e) {
+            cursor[e] = offset;
+            for (unsigned first = 0; first < counts[e]; first += kGroupColumns) {
+                item_expert[item] = e;
+                item_start[item] = offset + first;
+                item_count[item] = min(kGroupColumns, counts[e] - first);
+                ++item;
+            }
+            offset += counts[e];
+        }
+        items[0] = item;
+    }
+    __syncthreads();
+    for (unsigned r = threadIdx.x; r < routes; r += blockDim.x)
+        sorted[atomicAdd(&cursor[ids[r]], 1u)] = r;
+}
+
+// Decode-sized batches: one CTA computes a 16-row output tile for one work
+// item, splitting K across warps. Each decoded weight fragment feeds one MMA
+// per eight routes, whose N columns are the routes.
+template <unsigned Warps>
+__global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
+    const std::uint32_t* __restrict__ sorted, const std::uint32_t* __restrict__ item_expert,
+    const std::uint32_t* __restrict__ item_start, const std::uint32_t* __restrict__ item_count,
+    const std::uint32_t* __restrict__ items, const float* __restrict__ input,
+    const std::uint8_t* __restrict__ tiled_weight, const std::uint8_t* __restrict__ tiled_scales,
+    const float* __restrict__ global_scales, float* __restrict__ output, unsigned top_k,
+    bool per_route_input, unsigned out_features, unsigned in_features) {
+    constexpr unsigned Groups = kGroupColumns / 8;
+    const unsigned item = blockIdx.y;
+    if (item >= items[0]) return;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned row0 = lane >> 2, row1 = row0 + 8, pair = (lane & 3) * 2;
+    const unsigned expert = item_expert[item], start = item_start[item], count = item_count[item];
+    const unsigned tiles = in_features / kTileK;
+    const std::uint8_t* weight =
+        tiled_weight + size_t(expert) * out_features * in_features / 2;
+    const std::uint8_t* scales = tiled_scales + size_t(expert) * out_features * in_features / kTileK;
+    const float global = global_scales[expert];
+    const float* rows[Groups];
+    #pragma unroll
+    for (unsigned g = 0; g < Groups; ++g) {
+        const unsigned column = g * 8 + row0;
+        rows[g] = nullptr;
+        if (column < count) {
+            const unsigned route = sorted[start + column];
+            rows[g] = input + size_t(per_route_input ? route : route / top_k) * in_features;
+        }
+    }
+    float d[Groups][4] = {};
+    for (unsigned k = warp; k < tiles; k += Warps) {
+        const size_t tile = size_t(blockIdx.x) * tiles + k;
+        const auto* w = weight + tile * kPackedTileBytes;
+        const auto* s = scales + tile * kScaleTileBytes;
+        float s0 = 0.f, s1 = 0.f;
+        if ((lane & 3) == 0) {
+            s0 = e4m3_value(s[row0]) * global;
+            s1 = e4m3_value(s[row1]) * global;
+        }
+        s0 = __shfl_sync(0xffffffffu, s0, row0 * 4);
+        s1 = __shfl_sync(0xffffffffu, s1, row0 * 4);
+        const auto a0 = dequant_pair(w[row0 * 8 + pair / 2], s0);
+        const auto a1 = dequant_pair(w[row1 * 8 + pair / 2], s1);
+        const auto a2 = dequant_pair(w[row0 * 8 + pair / 2 + 4], s0);
+        const auto a3 = dequant_pair(w[row1 * 8 + pair / 2 + 4], s1);
+        #pragma unroll
+        for (unsigned g = 0; g < Groups; ++g) {
+            if (g * 8 >= count) break;
+            unsigned b0 = 0, b1 = 0;
+            if (rows[g]) {
+                const float* x = rows[g] + k * kTileK + pair;
+                b0 = pack_bf16_pair(x[0], x[1]);
+                b1 = pack_bf16_pair(x[8], x[9]);
+            }
+            mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b0, b1);
+        }
+    }
+    __shared__ float partial[Warps][Groups][16 * 8];
+    #pragma unroll
+    for (unsigned g = 0; g < Groups; ++g) {
+        partial[warp][g][row0 * 8 + pair] = d[g][0];
+        partial[warp][g][row0 * 8 + pair + 1] = d[g][1];
+        partial[warp][g][row1 * 8 + pair] = d[g][2];
+        partial[warp][g][row1 * 8 + pair + 1] = d[g][3];
+    }
+    __syncthreads();
+    for (unsigned index = threadIdx.x; index < Groups * 128; index += blockDim.x) {
+        const unsigned g = index / 128, cell = index % 128;
+        const unsigned column = g * 8 + cell % 8;
+        if (column >= count) continue;
+        float sum = 0.f;
+        #pragma unroll
+        for (unsigned w = 0; w < Warps; ++w) sum += partial[w][g][cell];
+        const unsigned route = sorted[start + column];
+        output[size_t(route) * out_features + blockIdx.x * kTileM + cell / 8] =
+            __bfloat162float(__float2bfloat16_rn(sum));
+    }
+}
+
+// Prefill-sized batches: one CTA computes 16 * Warps output rows for one work
+// item, each warp owning a 16-row tile over the full K. Route activations are
+// staged once per 64-wide K chunk as BF16 pairs, so every weight fragment is
+// decoded once per item and every activation is read once per CTA.
+template <unsigned Warps>
+__global__ __launch_bounds__(Warps * 32) void grouped_w4a16_tiled_kernel(
+    const std::uint32_t* __restrict__ sorted, const std::uint32_t* __restrict__ item_expert,
+    const std::uint32_t* __restrict__ item_start, const std::uint32_t* __restrict__ item_count,
+    const std::uint32_t* __restrict__ items, const float* __restrict__ input,
+    const std::uint8_t* __restrict__ tiled_weight, const std::uint8_t* __restrict__ tiled_scales,
+    const float* __restrict__ global_scales, float* __restrict__ output, unsigned top_k,
+    bool per_route_input, unsigned out_features, unsigned in_features) {
+    constexpr unsigned Groups = kGroupColumns / 8, Chunk = 64, Words = Chunk / 2, Stride = Words + 4;
+    __shared__ std::uint32_t staged[kGroupColumns][Stride];
+    __shared__ const float* rows[kGroupColumns];
+    const unsigned item = blockIdx.y;
+    if (item >= items[0]) return;
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned row0 = lane >> 2, row1 = row0 + 8, quad = lane & 3;
+    const unsigned expert = item_expert[item], start = item_start[item], count = item_count[item];
+    for (unsigned column = threadIdx.x; column < kGroupColumns; column += blockDim.x) {
+        rows[column] = nullptr;
+        if (column < count) {
+            const unsigned route = sorted[start + column];
+            rows[column] = input + size_t(per_route_input ? route : route / top_k) * in_features;
+        }
+    }
+    const unsigned out_tile = blockIdx.x * Warps + warp;
+    const bool active = out_tile * kTileM < out_features;
+    const unsigned tiles = in_features / kTileK;
+    const std::uint8_t* weight =
+        tiled_weight + size_t(expert) * out_features * in_features / 2;
+    const std::uint8_t* scales = tiled_scales + size_t(expert) * out_features * in_features / kTileK;
+    const float global = global_scales[expert];
+    float d[Groups][4] = {};
+    __syncthreads();
+    for (unsigned k0 = 0; k0 < in_features; k0 += Chunk) {
+        // Each thread converts four F32 pairs of one route row.
+        for (unsigned index = threadIdx.x; index < kGroupColumns * (Words / 4); index += blockDim.x) {
+            const unsigned column = index / (Words / 4), word = index % (Words / 4) * 4;
+            uint4 packed = make_uint4(0, 0, 0, 0);
+            if (rows[column] && k0 + word * 2 < in_features) {
+                const float4 lo = *reinterpret_cast<const float4*>(rows[column] + k0 + word * 2);
+                const float4 hi = *reinterpret_cast<const float4*>(rows[column] + k0 + word * 2 + 4);
+                packed = make_uint4(pack_bf16_pair(lo.x, lo.y), pack_bf16_pair(lo.z, lo.w),
+                                    pack_bf16_pair(hi.x, hi.y), pack_bf16_pair(hi.z, hi.w));
+            }
+            *reinterpret_cast<uint4*>(&staged[column][word]) = packed;
+        }
+        __syncthreads();
+        if (active) {
+            #pragma unroll
+            for (unsigned kt = 0; kt < Chunk / kTileK; ++kt) {
+                const unsigned k = k0 / kTileK + kt;
+                if (k >= tiles) break;
+                const size_t tile = size_t(out_tile) * tiles + k;
+                const auto* w = weight + tile * kPackedTileBytes;
+                const auto* sc = scales + tile * kScaleTileBytes;
+                float s0 = 0.f, s1 = 0.f;
+                if (quad == 0) {
+                    s0 = e4m3_value(sc[row0]) * global;
+                    s1 = e4m3_value(sc[row1]) * global;
+                }
+                s0 = __shfl_sync(0xffffffffu, s0, row0 * 4);
+                s1 = __shfl_sync(0xffffffffu, s1, row0 * 4);
+                const auto a0 = dequant_pair(w[row0 * 8 + quad], s0);
+                const auto a1 = dequant_pair(w[row1 * 8 + quad], s1);
+                const auto a2 = dequant_pair(w[row0 * 8 + quad + 4], s0);
+                const auto a3 = dequant_pair(w[row1 * 8 + quad + 4], s1);
+                #pragma unroll
+                for (unsigned g = 0; g < Groups; ++g) {
+                    if (g * 8 >= count) break;
+                    const std::uint32_t* b = staged[g * 8 + row0] + kt * 8 + quad;
+                    mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b[0], b[4]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    #pragma unroll
+    for (unsigned g = 0; g < Groups; ++g) {
+        #pragma unroll
+        for (unsigned half = 0; half < 2; ++half) {
+            const unsigned column = g * 8 + quad * 2 + half;
+            if (column >= count) continue;
+            float* out = output + size_t(sorted[start + column]) * out_features + out_tile * kTileM;
+            out[row0] = __bfloat162float(__float2bfloat16_rn(d[g][half]));
+            out[row1] = __bfloat162float(__float2bfloat16_rn(d[g][2 + half]));
+        }
+    }
+}
+}  // namespace
+
+extern "C" cudaError_t infer_moe_group_routes_on_stream(
+    const std::uint32_t* ids, unsigned routes, unsigned experts, std::uint32_t* sorted,
+    std::uint32_t* item_expert, std::uint32_t* item_start, std::uint32_t* item_count,
+    std::uint32_t* items, cudaStream_t stream) {
+    if (!ids || !sorted || !item_expert || !item_start || !item_count || !items || !routes
+        || !experts || experts > 4096) return cudaErrorInvalidValue;
+    group_routes_kernel<<<1, 1024, 2 * experts * sizeof(std::uint32_t), stream>>>(
+        ids, routes, experts, sorted, item_expert, item_start, item_count, items);
+    return cudaGetLastError();
+}
+
+extern "C" unsigned infer_moe_group_columns() { return kGroupColumns; }
+
+extern "C" cudaError_t infer_sm121_w4a16_grouped_routes_on_stream(
+    const std::uint32_t* sorted, const std::uint32_t* item_expert,
+    const std::uint32_t* item_start, const std::uint32_t* item_count,
+    const std::uint32_t* items, unsigned max_items, const float* input,
+    const std::uint8_t* tiled_weight, const std::uint8_t* tiled_scales,
+    const float* global_scales, float* output, unsigned top_k, bool per_route_input,
+    unsigned out_features, unsigned in_features, bool tiled, cudaStream_t stream) {
+    if (!sorted || !item_expert || !item_start || !item_count || !items || !max_items || !input
+        || !tiled_weight || !tiled_scales || !global_scales || !output || !top_k
+        || out_features % kTileM || in_features % kTileK) return cudaErrorInvalidValue;
+    if (tiled) {
+        constexpr unsigned Warps = 8;
+        if (in_features % 8) return cudaErrorInvalidValue;
+        grouped_w4a16_tiled_kernel<Warps>
+            <<<dim3((out_features / kTileM + Warps - 1) / Warps, max_items), Warps * 32, 0, stream>>>(
+                sorted, item_expert, item_start, item_count, items, input, tiled_weight,
+                tiled_scales, global_scales, output, top_k, per_route_input, out_features,
+                in_features);
+    } else {
+        grouped_w4a16_kernel<8><<<dim3(out_features / kTileM, max_items), 256, 0, stream>>>(
+            sorted, item_expert, item_start, item_count, items, input, tiled_weight, tiled_scales,
+            global_scales, output, top_k, per_route_input, out_features, in_features);
+    }
+    return cudaGetLastError();
+}
+
 extern "C" int infer_sm121_w4a16_supported() {
     int device = 0;
     cudaDeviceProp properties{};

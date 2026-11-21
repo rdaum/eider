@@ -58,7 +58,7 @@ fn default_speculative_drafts(model_type: &str) -> usize {
 
 fn default_max_active_sequences(model_type: &str) -> usize {
     match model_type {
-        "flint" => 1,
+        "flint" | "inkling2_loop" => 1,
         "gemma4" => 4,
         _ => 8,
     }
@@ -90,6 +90,20 @@ const CATALOGUE: &[ModelSpec] = &[
             served_model_name: "eider-dory1.0-4b",
             max_context_tokens: 262_144,
             prefill_token_capacity: 2_048,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
+        id: "inkling-2-mini-text",
+        repository: "thinkingmachines/Inkling-2-Mini",
+        revision: "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+        model_type: "inkling2_loop",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-inkling2-mini-text",
+            max_context_tokens: 262_144,
+            prefill_token_capacity: 1_024,
             step_expert_capacity: 240,
         },
     },
@@ -775,6 +789,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "flint"
+            | "inkling2_loop"
             | "bitnet"
             | "dory"
             | "lfm2_moe"
@@ -1033,6 +1048,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
+
+    #[test]
+    fn inkling_catalogue_pins_text_checkpoint_and_local_architecture() {
+        let model = catalogue_model("inkling-2-mini-text").unwrap();
+        assert_eq!(model.repository, "thinkingmachines/Inkling-2-Mini");
+        assert_eq!(model.revision, "ed40e7da625f594fc9c4990f5f66be24873c22d7");
+        assert_eq!(model.defaults.max_context_tokens, 262_144);
+        assert_eq!(model.defaults.served_model_name, "eider-inkling2-mini-text");
+        assert_eq!(default_max_active_sequences(model.model_type), 1);
+        let fixture = CheckpointFixture::new_single("inkling2_loop");
+        assert_eq!(
+            eider_inference::checkpoint_architecture(&fixture.path()).unwrap(),
+            eider_inference::CheckpointArchitecture::Inkling2
+        );
+        assert_eq!(
+            resolve_local_model(fixture.path()).unwrap().preparation,
+            ArtifactKind::None
+        );
+    }
 
     #[test]
     fn catalogue_pins_flint_weights_and_tokenizer() {

@@ -74,6 +74,7 @@ fn main() {
     let dory_flash_object = format!("{out_dir}/dory_flash_attention.o");
     let dory_object = format!("{out_dir}/dory.o");
     let lfm3_object = format!("{out_dir}/lfm3.o");
+    let inkling2_object = format!("{out_dir}/inkling2.o");
     let lfm2_object = format!("{out_dir}/lfm2.o");
     let lilicorr_object = format!("{out_dir}/lilicorr.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
@@ -520,6 +521,7 @@ fn main() {
         dory_object.as_str(),
         lfm2_object.as_str(),
         lfm3_object.as_str(),
+        inkling2_object.as_str(),
         oracle_object.as_str(),
         gpu_counters_object.as_str(),
         non_gemm_object.as_str(),
@@ -611,6 +613,24 @@ fn main() {
         .status()
         .expect("failed to run nvcc for LFM3 kernels");
     assert!(lfm3_status.success(), "nvcc failed to build LFM3 kernels");
+    let inkling2_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
+        .args([
+            "-std=c++17",
+            "-O3",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/inkling2.cu",
+            "-o",
+            &inkling2_object,
+        ])
+        .status()
+        .expect("failed to run nvcc for Inkling 2 kernels");
+    assert!(
+        inkling2_status.success(),
+        "nvcc failed to build Inkling 2 kernels"
+    );
     let ggml_object = format!("{out_dir}/ggml_blocks.o");
     let ggml_status = std::process::Command::new(format!("{cuda_root}/bin/nvcc"))
         .args([
@@ -702,6 +722,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/ngram.cu");
     println!("cargo:rerun-if-changed=native/lfm2.cu");
     println!("cargo:rerun-if-changed=native/lfm3.cu");
+    println!("cargo:rerun-if-changed=native/inkling2.cu");
     println!("cargo:rerun-if-changed=native/ggml_blocks.cu");
     println!("cargo:rerun-if-changed=native/lilicorr.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");

@@ -30,6 +30,20 @@
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         },
         {
+          "id": "eider-inkling2-mini-text",
+          "name": "Inkling 2 Mini fixed-pass text",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
           "id": "eider-lfm3-1.7b",
           "name": "LFM3 1.7B NVFP4",
           "reasoning": true,
@@ -344,6 +358,20 @@
           "id": "eider-dory1.0-4b",
           "name": "Dory 1.0 4B NVFP4",
           "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "eider-inkling2-mini-text",
+          "name": "Inkling 2 Mini fixed-pass text",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
           "input": ["text"],
           "contextWindow": 262144,
           "maxTokens": 8192,

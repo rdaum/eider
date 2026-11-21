@@ -22,6 +22,8 @@ const TILE_M: usize = 16;
 const TILE_K: usize = 16;
 const PACKED_TILE_BYTES: usize = TILE_M * TILE_K / 2;
 const SCALE_TILE_BYTES: usize = TILE_M;
+/// Routed batches at least this large use the activation-staging grouped kernel.
+const TILED_ROUTES: usize = 64;
 
 /// SM121 M16-by-K16-tiled NVFP4 weight prepared from ModelOpt storage.
 pub struct Sm121W4A16HostWeight {
@@ -47,6 +49,113 @@ pub struct Sm121W4A16GateUp {
     weight_scale: DeviceBuffer<u8>,
     global_scale: DeviceBuffer<f32>,
     output_bf16: DeviceBuffer<u16>,
+}
+
+/// Device-side grouping of routed rows by expert for grouped expert GEMMs.
+/// Work item `i` covers up to [`MoeRouteGroups::columns`] routes of one expert.
+pub struct MoeRouteGroups {
+    routes: usize,
+    experts: usize,
+    columns: usize,
+    pub(crate) sorted: DeviceBuffer<u32>,
+    pub(crate) item_expert: DeviceBuffer<u32>,
+    pub(crate) item_start: DeviceBuffer<u32>,
+    pub(crate) item_count: DeviceBuffer<u32>,
+    pub(crate) items: DeviceBuffer<u32>,
+}
+
+impl MoeRouteGroups {
+    /// Allocates grouping storage for up to `routes` routed rows.
+    pub fn new(routes: usize, experts: usize) -> Result<Self> {
+        if routes == 0 || routes > u32::MAX as usize || experts == 0 || experts > 4096 {
+            return Err(Error::Shape {
+                label: "MoE route groups",
+                expected: "positive routes and 1..=4096 experts".to_string(),
+                actual: format!("routes={routes} experts={experts}"),
+            });
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        let columns = unsafe { ffi::infer_moe_group_columns() } as usize;
+        #[cfg(feature = "cuda-oxide")]
+        let columns = 32;
+        let capacity = routes.div_ceil(columns) + experts.min(routes);
+        Ok(Self {
+            routes,
+            experts,
+            columns,
+            sorted: DeviceBuffer::zeroed(routes)?,
+            item_expert: DeviceBuffer::zeroed(capacity)?,
+            item_start: DeviceBuffer::zeroed(capacity)?,
+            item_count: DeviceBuffer::zeroed(capacity)?,
+            items: DeviceBuffer::zeroed(1)?,
+        })
+    }
+
+    /// Expert count the groups were allocated for.
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+
+    /// Routes per work item.
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Upper bound on work items for `routes` grouped routes; the device count
+    /// written by [`MoeRouteGroups::group_on_stream`] bounds the launched work.
+    pub fn max_items(&self, routes: usize) -> usize {
+        routes.div_ceil(self.columns) + self.experts.min(routes)
+    }
+
+    /// Groups the first `routes` expert ids on the stream.
+    pub fn group_on_stream(
+        &mut self,
+        ids: &DeviceBuffer<u32>,
+        routes: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if routes == 0 || routes > self.routes || ids.len() < routes {
+            return Err(Error::Shape {
+                label: "MoE route grouping",
+                expected: format!("1..={} routes", self.routes),
+                actual: format!("routes={routes} ids={}", ids.len()),
+            });
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        unsafe {
+            check_cuda(
+                "infer_moe_group_routes_on_stream",
+                ffi::infer_moe_group_routes_on_stream(
+                    ids.ptr,
+                    routes as u32,
+                    self.experts as u32,
+                    self.sorted.ptr,
+                    self.item_expert.ptr,
+                    self.item_start.ptr,
+                    self.item_count.ptr,
+                    self.items.ptr,
+                    stream.as_raw(),
+                ),
+            )
+        }
+        #[cfg(feature = "cuda-oxide")]
+        {
+            let _ = stream;
+            Err(Error::Format {
+                label: "MoE route grouping",
+                detail: "requires the default CUDA kernel backend".into(),
+            })
+        }
+    }
+
+    /// Returns the number of device bytes owned by the grouping buffers.
+    pub fn device_bytes(&self) -> usize {
+        self.sorted.device_bytes()
+            + self.item_expert.device_bytes()
+            + self.item_start.device_bytes()
+            + self.item_count.device_bytes()
+            + self.items.device_bytes()
+    }
 }
 
 /// Reusable output storage for batched routed SM121 W4A16 gate/up.
@@ -719,6 +828,83 @@ impl Sm121W4A16GateUp {
         &self.output_bf16
     }
 
+    /// Runs every grouped route of a routed batch, decoding each expert tile
+    /// once per work item of routes. `routes` route rows are written as BF16
+    /// values in F32 storage. Route `r` reads input row `r / top_k`, or row `r`
+    /// with `per_route_input`. Decode-sized batches split K across warps;
+    /// larger batches stage route activations and tile 128 output rows per CTA.
+    pub fn run_route_groups_on_stream(
+        &self,
+        groups: &MoeRouteGroups,
+        input: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        routes: usize,
+        per_route_input: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let input_rows = if per_route_input {
+            routes
+        } else {
+            routes.div_ceil(self.top_k)
+        };
+        if routes == 0
+            || routes > groups.routes
+            || groups.experts != self.experts
+            || input.len() < input_rows * self.hidden
+            || output.len() < routes * self.gate_up
+        {
+            return Err(Error::Shape {
+                label: "SM121 W4A16 route groups",
+                expected: format!(
+                    "1..={} routes over {} experts, input>={}, output>={}",
+                    groups.routes,
+                    self.experts,
+                    input_rows * self.hidden,
+                    routes * self.gate_up
+                ),
+                actual: format!(
+                    "routes={routes} experts={} input={} output={}",
+                    groups.experts,
+                    input.len(),
+                    output.len()
+                ),
+            });
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        unsafe {
+            check_cuda(
+                "infer_sm121_w4a16_grouped_routes_on_stream",
+                ffi::infer_sm121_w4a16_grouped_routes_on_stream(
+                    groups.sorted.ptr,
+                    groups.item_expert.ptr,
+                    groups.item_start.ptr,
+                    groups.item_count.ptr,
+                    groups.items.ptr,
+                    groups.max_items(routes) as u32,
+                    input.ptr,
+                    self.tiled_weight.ptr,
+                    self.weight_scale.ptr,
+                    self.global_scale.ptr,
+                    output.buffer_mut().ptr,
+                    self.top_k as u32,
+                    per_route_input,
+                    self.gate_up as u32,
+                    self.hidden as u32,
+                    routes >= TILED_ROUTES,
+                    stream.as_raw(),
+                ),
+            )
+        }
+        #[cfg(feature = "cuda-oxide")]
+        {
+            let _ = (input, output, per_route_input, stream);
+            Err(Error::Format {
+                label: "SM121 W4A16 route groups",
+                detail: "requires the default CUDA kernel backend".into(),
+            })
+        }
+    }
+
     /// Returns the device bytes occupied by expert weights and scales.
     pub fn expert_device_bytes(&self) -> usize {
         self.tiled_weight.device_bytes()
@@ -1179,6 +1365,108 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda-oxide"))]
+    #[serial]
+    #[test]
+    fn route_groups_match_routed_rows_for_shared_and_per_route_inputs() -> Result<()> {
+        crate::set_cuda_device(0)?;
+        // 120 routes give expert 1 more than one 64-route work item; 96 inputs
+        // end inside a staged K chunk; 32 outputs leave tiled warps inactive.
+        let (out_features, in_features, top_k, rows) = (32, 96, 2, 60);
+        let routes = rows * top_k;
+        let hosts = (0..3)
+            .map(|expert| {
+                let values = (0..out_features * in_features)
+                    .map(|i| f32_to_bf16(((i * 31 + expert * 17) % 23) as f32 / 8.0 - 1.4))
+                    .collect::<Vec<_>>();
+                ModelOptNvfp4Linear::quantize_bf16("test", out_features, in_features, &values)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let experts = Sm121W4A16GateUp::new_with_top_k(&hosts, top_k)?;
+        let ids = (0..routes)
+            .map(|r| {
+                if r % 5 == 0 {
+                    0
+                } else if r % 7 == 0 {
+                    2
+                } else {
+                    1
+                }
+            })
+            .collect::<Vec<u32>>();
+        let indices = DeviceBuffer::from_host(&ids)?;
+        // Split-K and sequential-K reductions round F32 sums differently.
+        let close = |actual: &[f32], expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (a - e).abs() <= 0.02 * e.abs().max(1.0),
+                    "index {index}: {a} vs {e}"
+                );
+            }
+        };
+        let input_values = (0..rows * in_features)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 8.0)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input_values)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let workspace = experts.new_batch_workspace(rows)?;
+        let mut expected = DeviceBuffer::zeroed(routes * out_features)?;
+        experts.run_batch_f32_prefix_on_stream(
+            &workspace,
+            &indices,
+            &input,
+            expected.output(),
+            rows,
+            &stream,
+        )?;
+        let expected = expected.copy_to_host(&stream)?.to_vec();
+        let mut groups = MoeRouteGroups::new(routes, 3)?;
+        groups.group_on_stream(&indices, routes, &stream)?;
+        let mut output = DeviceBuffer::zeroed(routes * out_features)?;
+        experts.run_route_groups_on_stream(
+            &groups,
+            &input,
+            output.output(),
+            routes,
+            false,
+            &stream,
+        )?;
+        close(&output.copy_to_host(&stream)?, &expected);
+        // Fewer routes select the decode-sized split-K variant.
+        let few = TILED_ROUTES - top_k;
+        let mut few_groups = MoeRouteGroups::new(few, 3)?;
+        few_groups.group_on_stream(&indices, few, &stream)?;
+        output.copy_from_host(&vec![0.0; routes * out_features])?;
+        experts.run_route_groups_on_stream(
+            &few_groups,
+            &input,
+            output.output(),
+            few,
+            false,
+            &stream,
+        )?;
+        assert_eq!(
+            &output.copy_to_host(&stream)?[..few * out_features],
+            &expected[..few * out_features]
+        );
+        let per_route = DeviceBuffer::from_host(
+            &(0..routes)
+                .flat_map(|r| input_values[r / top_k * in_features..][..in_features].to_vec())
+                .collect::<Vec<_>>(),
+        )?;
+        experts.run_route_groups_on_stream(
+            &groups,
+            &per_route,
+            output.output(),
+            routes,
+            true,
+            &stream,
+        )?;
+        close(&output.copy_to_host(&stream)?, &expected);
         Ok(())
     }
 

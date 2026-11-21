@@ -1774,6 +1774,15 @@ mod tests {
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Deepseek4
         );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"inkling2_loop"}"#,
+        )
+        .expect("write Inkling config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Inkling2
+        );
         fs::remove_dir_all(directory).expect("remove checkpoint directory");
     }
 }

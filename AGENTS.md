@@ -4,7 +4,7 @@ CUDA inference and serving for NVFP4 and mixed-precision models on NVIDIA DGX
 Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
 multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
 families currently include Qwen3.5/3.6 MoE, dense Qwen3.8, Step-3.7,
-Laguna-S-2.1, Gemma 4, Nemotron 3, and DeepSeek V4 Flash.
+Laguna-S-2.1, Gemma 4, Nemotron 3, DeepSeek V4 Flash, and Inkling 2 Mini text.
 Muse Glimmer 30B is supported through the Inferact ModelOpt NVFP4 checkpoint's
 text path; its image and video towers are not served.
 
@@ -218,6 +218,15 @@ Before handing work back:
   Preserve the checkpoint's layer schedule and routing order. Its complete
   routed table is resident in blockwise Q3; original NVFP4 hot overlays must
   keep gate/up and down mappings consistent.
+- Inkling 2 Mini text executes 24 stored layers as 48 visits, each with separate
+  KV and short-convolution state. Later core passes restart from the prelude
+  residual blocks and consume the previous pass only through message
+  controllers, so local layers in later passes still take separate Q/K/V
+  inputs. Preserve normalized Attention Residuals, distinct global/layer
+  normalization, normalized short convolution with newest-first global K/V
+  taps, relative-attention LSE sinks, per-expert outer scales, and interleaved
+  capped SwiGLU semantics. Its last-four-layer MXFP8 path is an explicit BF16
+  preparation fallback, not native W8A8 execution.
 - Keep CUDA stream semantics explicit. Non-blocking streams do not synchronize
   with the default stream.
 - Do not add permanent debug flags or probe prints. Do not revert unrelated

@@ -18,6 +18,7 @@ pub use kernels::dory::{
     dory_embedding, dory_linear, dory_norm, dory_rope_norm, dory_scale_logits,
 };
 pub use kernels::ggml_blocks::{GgmlGemmWorkspace, GgmlWeights};
+pub use kernels::inkling2;
 pub use kernels::lfm3;
 pub use kernels::lilicorr;
 pub use kernels::sink_attention::{
@@ -269,8 +270,8 @@ pub use kernels::sm12x_mma::{
 #[cfg(feature = "cuda-oxide")]
 pub use kernels::sm121_w4a16::Sm121W4A4GroupedWorkspace;
 pub use kernels::sm121_w4a16::{
-    Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, Sm121W4A16HostWeight, Sm121W4A16Linear,
-    Sm121W4A16LinearBatchWorkspace,
+    MoeRouteGroups, Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, Sm121W4A16HostWeight,
+    Sm121W4A16Linear, Sm121W4A16LinearBatchWorkspace,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt_device::{ModelOptCublasLtWeight, ModelOptNvfp4Activation, upload_grouped_nvfp4};
