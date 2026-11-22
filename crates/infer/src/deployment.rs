@@ -208,7 +208,10 @@ pub fn with_loaded_engine<R>(
                 supports_parallel_tool_calls: true,
                 ..defaults
             };
-            let model = Inkling2Model::load(&model_dir)?;
+            // The DSpark draft ships beside the text weights.
+            let draft =
+                scheduler.speculative_drafts > 0 && model_dir.join("mtp.safetensors").is_file();
+            let model = Inkling2Model::load_with_options(&model_dir, draft)?;
             let scheduler = SchedulerConfig {
                 max_context_tokens: scheduler
                     .max_context_tokens

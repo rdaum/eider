@@ -7,6 +7,8 @@ use crate::kernels::sm121_w4a16::MoeRouteGroups;
 use crate::{Error, Result};
 use std::ffi::c_void;
 
+pub mod draft;
+
 unsafe extern "C" {
     fn infer_inkling2_embed(
         embedding: *const u16,

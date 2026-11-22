@@ -1,11 +1,14 @@
 //! Shared global-visit KV pages and retained local and convolution snapshots.
 //!
 //! The eight global visits append BF16 K/V to shared 128-token page bundles laid
-//! out as `[global visit][K/V][page token][KV head][dimension]`. Every other
-//! piece of per-visit history (local KV rings and all short-convolution
-//! inputs) is request-private and retained by copying it into a snapshot.
+//! out as `[global visit][K/V][page token][KV head][dimension]`; with a DSpark
+//! draft a final slot holds its global layer's context K/V. Every other piece
+//! of per-visit history (local KV rings, all short-convolution inputs, and the
+//! draft's local rings) is request-private and retained by copying it into a
+//! snapshot.
 
 use super::config::invalid;
+use super::draft::DraftState;
 use super::model::{Inkling2Model, Inkling2Sequence};
 use eider_cuda::{CudaStream, DeviceAddress, DeviceBuffer, Error, Result};
 use seqcache::{
@@ -22,6 +25,7 @@ pub type Inkling2SequenceCache = SequenceCache<Inkling2PageBackend, Inkling2Snap
 /// Request-private visit history at a retained prompt position.
 pub struct Inkling2Snapshot {
     pub(super) visits: Vec<super::model::VisitState>,
+    pub(super) draft: Option<DraftState>,
 }
 
 impl RetainedSnapshot for Inkling2Snapshot {
@@ -29,7 +33,8 @@ impl RetainedSnapshot for Inkling2Snapshot {
         self.visits
             .iter()
             .map(super::model::VisitState::device_bytes)
-            .sum()
+            .sum::<usize>()
+            + self.draft.as_ref().map_or(0, DraftState::device_bytes)
     }
 }
 
@@ -215,7 +220,8 @@ impl Inkling2Model {
         if sequences == 0 || context == 0 || context > c.model_max_length {
             return Err(invalid("invalid sequence cache capacity"));
         }
-        let elements = self.global_visits() * 2 * PAGE_TOKENS * c.num_key_value_heads * c.head_dim;
+        let slots = self.global_visits() + usize::from(self.draft.is_some());
+        let elements = slots * 2 * PAGE_TOKENS * c.num_key_value_heads * c.head_dim;
         let private = self.private_sequence_bytes();
         let table = Inkling2PageTable::new(context)?.bytes();
         let active = context
@@ -280,6 +286,11 @@ impl Inkling2Model {
                         for (visit, source) in state.visits.iter_mut().zip(&snapshot.visits) {
                             visit.restore(source, &self.stream)?;
                         }
+                        match (state.draft.as_mut(), snapshot.draft.as_ref()) {
+                            (Some(draft), Some(source)) => draft.restore(source, &self.stream)?,
+                            (None, None) => {}
+                            _ => return Err(invalid("draft snapshot presence mismatch")),
+                        }
                         self.stream.synchronize()?;
                         state.restore_duration = start.elapsed();
                     }
@@ -315,7 +326,8 @@ impl Inkling2Model {
             .visits
             .iter()
             .map(super::model::VisitState::device_bytes)
-            .sum::<usize>();
+            .sum::<usize>()
+            + state.draft.as_ref().map_or(0, DraftState::device_bytes);
         if bytes > cache.config().max_snapshot_bytes {
             return Err(invalid(
                 "prefix budget cannot hold the visit-history snapshot",
@@ -326,6 +338,11 @@ impl Inkling2Model {
             .iter()
             .map(|visit| visit.snapshot(&self.stream))
             .collect::<Result<Vec<_>>>()?;
+        let draft = state
+            .draft
+            .as_ref()
+            .map(|draft| draft.snapshot(&self.stream))
+            .transpose()?;
         self.stream.synchronize()?;
         cache
             .retain_prefix(
@@ -333,7 +350,7 @@ impl Inkling2Model {
                     .cache_id
                     .ok_or_else(|| invalid("unadmitted sequence"))?,
                 tokens,
-                Inkling2Snapshot { visits },
+                Inkling2Snapshot { visits, draft },
                 &mut Inkling2CacheContext {
                     stream: &self.stream,
                     table: &mut state.table,

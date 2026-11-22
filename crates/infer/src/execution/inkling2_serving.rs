@@ -10,7 +10,7 @@ use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
     EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
     EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick,
+    EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -44,6 +44,8 @@ pub(crate) struct Inkling2ChatService<'m, 't> {
     prefill: Inkling2Workspace<'m>,
     cache: Inkling2SequenceCache,
     retain_prefixes: bool,
+    /// Tokens drafted per speculative step; zero decodes one token per step.
+    drafts: usize,
     next_id: u64,
     waiting: VecDeque<EngineRequestId>,
     requests: BTreeMap<EngineRequestId, Request<'m, 't>>,
@@ -71,6 +73,7 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                 cache.max_retained_bytes,
             )?,
             retain_prefixes: cache.max_retained_bytes != 0,
+            drafts: config.speculative_drafts.min(model.max_draft_steps()),
             config,
             next_id: 1,
             waiting: VecDeque::new(),
@@ -184,9 +187,9 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
         let mut done = Vec::new();
         let mut decode_budget = self.config.decode_capacity;
         for (&id, request) in &mut self.requests {
-            let Some(sequence) = request.sequence.as_mut() else {
+            if request.sequence.is_none() {
                 continue;
-            };
+            }
             if request.generation.max_new_tokens == 0 {
                 done.push((id, ChatFinishReason::Length));
                 continue;
@@ -195,45 +198,77 @@ impl<'m, 't> Inkling2ChatService<'m, 't> {
                 continue;
             }
             decode_budget -= 1;
-            if let Some(token) = request.last_token {
-                self.model
-                    .forward(&mut self.prefill, sequence, &mut self.cache, &[token])?;
-            }
-            let token = if request.sampler.config().uses_fast_argmax() {
-                self.model.argmax_with_logit(sequence)?.0
-            } else {
-                request
-                    .sampler
-                    .sample(&self.model.logits_to_host(sequence)?, &request.history)?
-                    .id
+            let remaining = request.generation.max_new_tokens - request.usage.completion_tokens;
+            let steps = self.drafts.min(remaining.saturating_sub(1));
+            let tokens = match request.last_token {
+                Some(anchor) if steps > 0 => {
+                    let tokens = speculate(
+                        self.model,
+                        &mut self.prefill,
+                        &mut self.cache,
+                        request,
+                        anchor,
+                        steps,
+                    )?;
+                    // Every step ends with one token the draft did not supply.
+                    tick.verification.push(EngineVerificationProgress {
+                        request_id: id,
+                        cycles: 1,
+                        accepted_drafts: tokens.len() - 1,
+                    });
+                    tokens
+                }
+                last => {
+                    let sequence = request.sequence.as_mut().expect("decoding sequence");
+                    if let Some(token) = last {
+                        self.model.forward(
+                            &mut self.prefill,
+                            sequence,
+                            &mut self.cache,
+                            &[token],
+                        )?;
+                    }
+                    let token = if request.sampler.config().uses_fast_argmax() {
+                        self.model.argmax_with_logit(sequence)?.0
+                    } else {
+                        request
+                            .sampler
+                            .sample(&self.model.logits_to_host(sequence)?, &request.history)?
+                            .id
+                    };
+                    request.history.push(token);
+                    vec![token]
+                }
             };
-            request.last_token = Some(token);
-            request.history.push(token);
-            request.usage.completion_tokens += 1;
-            request.usage.reasoning_tokens += usize::from(request.output.is_reasoning());
-            tick.generated.push(id);
-            let events = request.output.push_token(token)?;
-            let called_tools = &mut request.called_tools;
-            let reason = emit(
-                id,
-                &mut request.stop,
-                events,
-                &mut tick.output,
-                called_tools,
-            )
-            .or_else(|| {
-                request
-                    .generation
-                    .eos_token_ids
-                    .contains(&token)
-                    .then_some(ChatFinishReason::Eos)
-            })
-            .or_else(|| {
-                (request.usage.completion_tokens >= request.generation.max_new_tokens)
-                    .then_some(ChatFinishReason::Length)
-            });
-            if let Some(reason) = reason {
-                done.push((id, reason));
+            request.last_token = tokens.last().copied();
+            for token in tokens {
+                tick.generated.push(id);
+                request.usage.completion_tokens += 1;
+                request.usage.reasoning_tokens += usize::from(request.output.is_reasoning());
+                let events = request.output.push_token(token)?;
+                let called_tools = &mut request.called_tools;
+                let reason = emit(
+                    id,
+                    &mut request.stop,
+                    events,
+                    &mut tick.output,
+                    called_tools,
+                )
+                .or_else(|| {
+                    request
+                        .generation
+                        .eos_token_ids
+                        .contains(&token)
+                        .then_some(ChatFinishReason::Eos)
+                })
+                .or_else(|| {
+                    (request.usage.completion_tokens >= request.generation.max_new_tokens)
+                        .then_some(ChatFinishReason::Length)
+                });
+                if let Some(reason) = reason {
+                    done.push((id, reason));
+                    break;
+                }
             }
         }
         let mut token_budget = self.config.prefill_token_capacity;
@@ -362,6 +397,64 @@ impl EngineService for Inkling2ChatService<'_, '_> {
             .filter(|request| request.sequence.is_some())
             .count()
     }
+}
+
+/// Drafts `steps` tokens after the sampled `anchor`, verifies them in one
+/// target chunk, and returns the accepted drafts followed by the token
+/// sampled where verification stopped. Rejection sampling against the
+/// draft's filtered proposal keeps the request's sampling distribution.
+fn speculate(
+    model: &Inkling2Model,
+    workspace: &mut Inkling2Workspace,
+    cache: &mut Inkling2SequenceCache,
+    request: &mut Request<'_, '_>,
+    anchor: u32,
+    steps: usize,
+) -> Result<Vec<u32>> {
+    let sequence = request.sequence.as_mut().expect("decoding sequence");
+    let mut proposals = Vec::with_capacity(steps);
+    let sampler = &mut request.sampler;
+    let history = &request.history;
+    let drafted = model.draft(workspace, sequence, anchor, steps, &mut |ids, logits| {
+        let (token, probabilities) = sampler.draw_sparse_proposal(ids, logits, history)?;
+        proposals.push((ids.to_vec(), probabilities));
+        Ok(token)
+    })?;
+    let mut block = Vec::with_capacity(steps + 1);
+    block.push(anchor);
+    block.extend(&drafted);
+    model.verify(workspace, sequence, cache, &block)?;
+    let logits = model.verified_logits_to_host(workspace, sequence)?;
+    let vocab = model.config().text_config.vocab_size;
+    let mut tokens = Vec::with_capacity(steps + 1);
+    let mut accepted_all = true;
+    for (row, (&draft, (ids, probabilities))) in drafted.iter().zip(&proposals).enumerate() {
+        let (sampled, accepted) = request.sampler.verify_sparse_draft(
+            &logits[row * vocab..(row + 1) * vocab],
+            &request.history,
+            draft,
+            ids,
+            probabilities,
+        )?;
+        request.history.push(sampled.id);
+        tokens.push(sampled.id);
+        if !accepted {
+            accepted_all = false;
+            break;
+        }
+    }
+    // A rejection's resampled token ends the step; it is not yet in the model.
+    let kept = if accepted_all {
+        let row = &logits[steps * vocab..(steps + 1) * vocab];
+        let bonus = request.sampler.sample(row, &request.history)?.id;
+        request.history.push(bonus);
+        tokens.push(bonus);
+        steps + 1
+    } else {
+        tokens.len()
+    };
+    model.accept(workspace, sequence, cache, kept)?;
+    Ok(tokens)
 }
 
 /// Forwards codec events. Inkling writes every parallel call as its own block

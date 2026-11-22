@@ -9,6 +9,30 @@ pub struct Inkling2Config {
     pub model_type: String,
     pub eos_token_id: u32,
     pub text_config: TextConfig,
+    /// The DSpark draft stored in `mtp.safetensors`.
+    pub mtp_config: Option<DraftConfig>,
+}
+
+/// DSpark draft geometry. Draft layers attend bidirectionally over a block of
+/// one anchor and `block_size - 1` masks and over K/V derived from target
+/// features captured at `target_layer_ids` (schedule visits, the last being
+/// the final-norm output).
+#[derive(Clone, Debug, Deserialize)]
+pub struct DraftConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub local_layer_ids: Vec<usize>,
+    pub sliding_window_size: usize,
+    pub block_size: usize,
+    pub markov_rank: usize,
+    pub markov_head_type: String,
+    pub target_layer_ids: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -136,6 +160,39 @@ impl Inkling2Config {
             return Err(invalid("unsupported local/global attention schedule"));
         }
         Ok(())
+    }
+
+    /// Validates the DSpark draft geometry the draft kernels support.
+    pub fn validate_draft(&self) -> Result<&DraftConfig> {
+        let c = &self.text_config;
+        let d = self
+            .mtp_config
+            .as_ref()
+            .ok_or_else(|| invalid("the checkpoint has no DSpark draft configuration"))?;
+        let visits = self.schedule().len();
+        let taps = &d.target_layer_ids;
+        if d.hidden_size != c.hidden_size
+            || d.num_key_value_heads * d.head_dim != c.num_key_value_heads * c.head_dim
+            || d.head_dim != 128
+            || !d.num_attention_heads.is_multiple_of(d.num_key_value_heads)
+            || d.num_attention_heads / d.num_key_value_heads > 3
+            || d.block_size < 2
+            || d.block_size > 8
+            || d.markov_head_type != "rnn_hidden"
+            || d.local_layer_ids
+                .iter()
+                .any(|&layer| layer >= d.num_hidden_layers)
+            || taps.len() < 2
+            || taps.windows(2).any(|pair| pair[0] >= pair[1])
+            || taps.last() != Some(&visits)
+            || !d.rms_norm_eps.is_finite()
+            || d.rms_norm_eps <= 0.0
+            || !d.rope_theta.is_finite()
+            || d.rope_theta <= 0.0
+        {
+            return Err(invalid("unsupported DSpark draft geometry"));
+        }
+        Ok(d)
     }
 
     /// Maps the 24 stored layers onto 48 independent attention/convolution visits.

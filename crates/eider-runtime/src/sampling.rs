@@ -178,6 +178,48 @@ impl Sampler {
         self.rng.random::<f32>()
     }
 
+    /// Draws a speculative proposal from a sparse draft distribution over
+    /// `ids`, filtered like the request policy: history penalties, top-k,
+    /// temperature, and top-p. Returns the token and the normalized proposal
+    /// probabilities aligned with `ids`, as [`Sampler::verify_sparse_draft`]
+    /// expects.
+    pub fn draw_sparse_proposal(
+        &mut self,
+        ids: &[u32],
+        logits: &[f32],
+        history: &TokenHistory,
+    ) -> Result<(u32, Vec<f32>)> {
+        if ids.is_empty() || ids.len() != logits.len() {
+            return Err(Error::Format {
+                label: "speculative proposal",
+                detail: "expected one logit per candidate".into(),
+            });
+        }
+        let candidates = ids
+            .iter()
+            .zip(logits)
+            .filter(|(_, logit)| logit.is_finite())
+            .map(|(&id, &logit)| Candidate {
+                id,
+                logit,
+                adjusted_logit: adjusted_logit(id, logit, self.config, history),
+            })
+            .collect();
+        let weighted = weigh_candidates(candidates, self.config)?;
+        let token = sample_weighted(&weighted, &mut self.rng)?.id;
+        let total = weighted.iter().map(|(_, weight)| weight).sum::<f32>();
+        let probabilities = ids
+            .iter()
+            .map(|id| {
+                weighted
+                    .iter()
+                    .find(|(candidate, _)| candidate.id == *id)
+                    .map_or(0.0, |(_, weight)| weight / total)
+            })
+            .collect();
+        Ok((token, probabilities))
+    }
+
     /// Verifies a token drawn from a sparse proposal distribution against the
     /// request's filtered target distribution. A rejection samples from
     /// `max(p - q, 0)`; accepted tokens retain the target distribution as well.
@@ -277,6 +319,14 @@ fn weighted_candidates(
             adjusted_logit: adjusted_logit(id as u32, logit, config, history),
         })
         .collect::<Vec<_>>();
+    weigh_candidates(candidates, config)
+}
+
+/// Applies top-k, temperature, and top-p to candidates with adjusted logits.
+fn weigh_candidates(
+    candidates: Vec<Candidate>,
+    config: SamplingConfig,
+) -> Result<Vec<(Candidate, f32)>> {
     if candidates.is_empty() {
         return Err(Error::Format {
             label: "sampling logits",
@@ -488,6 +538,38 @@ mod tests {
             }
             .supports_gpu_sampling(MAX_TOP_K)
         );
+    }
+
+    #[test]
+    fn sparse_proposals_follow_the_request_filters() {
+        let ids = [7, 3, 9, 1];
+        let logits = [2.0, 1.0, 0.0, -1.0];
+        let mut greedy = Sampler::new(SamplingConfig {
+            temperature: 0.0,
+            ..SamplingConfig::default()
+        })
+        .unwrap();
+        let (token, probabilities) = greedy
+            .draw_sparse_proposal(&ids, &logits, &TokenHistory::default())
+            .unwrap();
+        assert_eq!((token, probabilities), (7, vec![1.0, 0.0, 0.0, 0.0]));
+
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+            seed: Some(3),
+            ..SamplingConfig::default()
+        })
+        .unwrap();
+        let (token, probabilities) = sampler
+            .draw_sparse_proposal(&ids, &logits, &TokenHistory::default())
+            .unwrap();
+        assert!(token == 7 || token == 3);
+        let expected = 1.0 / (1.0 + (-1.0f32).exp());
+        assert!((probabilities[0] - expected).abs() < 1e-6);
+        assert!((probabilities[1] - (1.0 - expected)).abs() < 1e-6);
+        assert_eq!(&probabilities[2..], &[0.0, 0.0]);
     }
 
     #[test]

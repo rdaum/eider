@@ -67,6 +67,43 @@ recaptured when the position outgrows that bound or the workspace changes.
 Dense projections of at most eight rows use a warp-per-output BF16
 matrix-vector kernel instead of tensor-core GEMMs.
 
+## Speculative decoding
+
+The checkpoint's DSpark draft (`mtp.safetensors`, BF16) proposes tokens and the
+target verifies them in one chunk. It is loaded when `--speculative-drafts` is
+non-zero; the catalogue default drafts four tokens per step.
+
+- Every target forward captures draft features: the residual partials entering
+  schedule visits 5, 23, and 41 and the final-norm output of every row. For
+  each committed token, three dense draft layers project softmax-weighted mixes
+  of those features to context K/V. Layers 0 and 2 keep a 1024-position local
+  ring; layer 1 stores its K/V in an extra slot of the page bundles, so retained
+  prefixes share it.
+- A draft step runs the last sampled token followed by mask embeddings through
+  the draft layers, which attend bidirectionally over the block and the
+  context. Each mask row's LM-head logits are corrected left to right by the
+  recurrent Markov head, whose output projection is folded into the LM head at
+  load as `[vocabulary, 256]` BF16 weights.
+- Proposals are drawn from the top 32 corrected candidates, filtered by the
+  request's penalties, top-k, temperature, and top-p. Verification accepts each
+  draft with probability `min(1, p/q)` and resamples rejections from
+  `max(p - q, 0)`, so sampling keeps the target distribution; greedy requests
+  reduce to exact matching.
+- A verification chunk produces logits for every row and keeps each visit's
+  convolution inputs and the local-ring slots it overwrites. Accepting a prefix
+  commits those convolution rows, restores the rejected ring slots, and commits
+  only the kept rows to the page cache. Verification replays a CUDA graph per
+  row count.
+
+Verification reads the routed experts of every row. One token reads about
+1.7 GB of expert weights; a five-row chunk of distinct tokens touches several
+times as many experts, so verification costs more than a decode step and short
+blocks are fastest. On GB10 the greedy probe below measured 26 tokens/s without drafts and
+42 tokens/s drafting four tokens on a code prompt (3.0 tokens per step); a
+prose prompt reached 31.5 tokens/s at 2.25 tokens per step. Through Pi with
+the default sampling, tool turns decoded at 36–53 tokens/s and a 600-token code
+answer at 35 tokens/s.
+
 ## Sequence cache
 
 Inkling uses the shared `seqcache` manager. The eight global visits append
@@ -82,9 +119,9 @@ visits, about 172 MB per sequence. A retained prefix shares the global pages
 and copies that private history at the prompt's largest page-aligned prefix.
 A later request with the same prefix restores the copy and prefills only the
 remainder. Because the private history can only be resumed where it was
-copied, a retained entry serves prompts that extend that exact prefix, such as
-the next turn of an agent session; a new session that shares only the system
-prompt does not hit it.
+copied, each prompt also retains a copy at the last page boundary before its
+first conversation message, after the tool declarations, system messages, and
+effort block. A new session that repeats the system prompt resumes there.
 
 ## Checkpoint precision
 
@@ -123,8 +160,8 @@ when it produced any. Calls to undeclared functions are errors. Only `auto` and
 
 ## Current boundary
 
-- Vision, image inputs, DSpark/MTP, variable loop counts, promoted MXFP8 KV,
-  and native MXFP8 activations are not implemented.
+- Vision, image inputs, variable loop counts, promoted MXFP8 KV, and native
+  MXFP8 activations are not implemented.
 
 The SGLang implementation at commit
 `92e894ef904bfdb5c0cf2f2a541cbd4eec023573` is the executable specification for
@@ -139,7 +176,21 @@ cargo test -p eider-runtime -p eider-inference -p eider-api inkling2 -- --test-t
 
 cargo run --release -p eider-inference --example inkling2_logits -- \
     /path/to/Inkling-2-Mini "Explain looped inference in one sentence."
+cargo test -p eider-cuda --lib -- draft rewind_restores
+cargo run --release -p eider-inference --example inkling2_speculative -- \
+    /path/to/Inkling-2-Mini "Write a Python Fibonacci function." 256 4
 ```
+
+The speculative example decodes the same greedy continuation one token at a
+time and with draft blocks, reporting where they first differ, tokens per
+block, and the draft, verify, and accept time per block. Batched verification
+is not bitwise identical to single-token decode, so the continuations can part
+at a near-tie: on the Fibonacci prompt they agree for 59 tokens and part where
+the top two logits differ by 0.04, the smallest margin of the run, whether
+every draft is rejected, every draft is the plain continuation, or the draft
+proposes. The draft was also checked against an independent PyTorch draft
+written from vLLM's `dspark.py` and fed Eider's captured features: all seven
+greedy draft tokens agreed and candidate logits matched within BF16 rounding.
 
 The focused tests use CPU references for Attention Residual math, L2 clipping,
 short-convolution history updates, route normalization, relative-attention

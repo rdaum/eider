@@ -623,3 +623,395 @@ extern "C" int infer_inkling2_finish_logits(float* logits, uint32_t count,
     finish_logits_kernel<<<(count+255)/256,256,0,stream>>>(logits,count,real_vocab,softcap);
     return cudaGetLastError();
 }
+
+// DSpark draft operators. Draft activations are BF16 values in F32 storage;
+// draft K/V share the target's BF16 ring and page-bundle layouts.
+namespace {
+constexpr uint32_t DRAFT_TILE=32;
+constexpr uint32_t DRAFT_MAX_QUERIES=24;
+constexpr uint32_t TOPK_CHUNK=2048;
+constexpr uint32_t TOPK_MERGE=4096;
+
+__global__ void finish_logit_rows_kernel(float* logits, uint32_t count, uint32_t vocab,
+                                         uint32_t real_vocab, float softcap) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<count) logits[i]=i%vocab>=real_vocab ? -INFINITY : softcap*tanhf(logits[i]/softcap);
+}
+
+// RMS normalization of the alpha-weighted sum of feature taps laid out as
+// `[tap][tap_rows][width]`, reading rows `first..first+rows`.
+__global__ void draft_mix_kernel(const float* features, const float* alpha, const float* weight,
+                                 float* out, uint32_t first, uint32_t tap_rows, uint32_t taps,
+                                 uint32_t width, float eps) {
+    __shared__ float partial[32];
+    const size_t row=blockIdx.x;
+    float sum=0.f;
+    for(uint32_t i=threadIdx.x;i<width;i+=blockDim.x) {
+        float mixed=0.f;
+        for(uint32_t t=0;t<taps;++t)
+            mixed+=features[(size_t(t)*tap_rows+first+row)*width+i]*alpha[t];
+        out[row*width+i]=mixed;
+        sum+=mixed*mixed;
+    }
+    const float inv=rsqrtf(block_sum(sum,partial)/width+eps);
+    for(uint32_t i=threadIdx.x;i<width;i+=blockDim.x)
+        out[row*width+i]=bf(out[row*width+i]*inv*weight[i]);
+}
+
+// In-place optional per-head RMS normalization (rounded to BF16) followed by
+// NeoX RoPE at position `first + row` for 128-dimensional heads.
+__global__ void draft_norm_rope_kernel(float* x, const float* weight, uint32_t row_stride,
+                                       uint32_t first, float theta, float eps) {
+    __shared__ float partial[2];
+    const uint32_t lane=threadIdx.x, head=blockIdx.x, row=blockIdx.y;
+    float* p=x+size_t(row)*row_stride+head*128;
+    float a=p[lane], b=p[lane+64];
+    if(weight) {
+        float ss=a*a+b*b;
+        for(int offset=16;offset;offset>>=1) ss+=__shfl_xor_sync(0xffffffffu,ss,offset);
+        if((lane&31)==0) partial[lane>>5]=ss;
+        __syncthreads();
+        const float inv=1.f/sqrtf((partial[0]+partial[1])/128.f+eps);
+        a=bf(a*inv*weight[lane]);
+        b=bf(b*inv*weight[lane+64]);
+    }
+    const float inv_freq=1.f/powf(theta,float(2*lane)/128.f);
+    const float angle=float(first+row)*inv_freq;
+    const float c=cosf(angle), s=sinf(angle);
+    p[lane]=bf(a*c-b*s);
+    p[lane+64]=bf(b*c+a*s);
+}
+
+template <bool Paged>
+__device__ __forceinline__ void draft_context_kv(const __nv_bfloat16* ck, const __nv_bfloat16* cv,
+        const __nv_bfloat16* const* pages, uint32_t layer_offset, uint32_t capacity,
+        uint32_t width, uint64_t position, uint32_t column, float& key, float& value) {
+    if constexpr(Paged) {
+        const __nv_bfloat16* page=pages[position>>7]+layer_offset;
+        const size_t offset=size_t(position&127)*width+column;
+        key=__bfloat162float(page[offset]);
+        value=__bfloat162float(page[size_t(128)*width+offset]);
+    } else {
+        const size_t offset=size_t(position%capacity)*width+column;
+        key=__bfloat162float(ck[offset]);
+        value=__bfloat162float(cv[offset]);
+    }
+}
+
+// Bidirectional attention of `rows` block queries over context keys
+// `[first, end)` followed by the block's own keys. One CTA serves every query
+// head of one KV head over one key split; warps own block rows.
+template <bool Paged>
+__global__ void draft_attention_kernel(const float* q, const float* bk, const float* bv,
+        const __nv_bfloat16* ck, const __nv_bfloat16* cv, const __nv_bfloat16* const* pages,
+        uint32_t layer_offset, uint32_t first, uint32_t end, uint32_t capacity, uint32_t rows,
+        uint32_t qheads, uint32_t kvheads, uint32_t chunk, float* partial) {
+    __shared__ float keys[DRAFT_TILE][129];
+    __shared__ float values[DRAFT_TILE][129];
+    __shared__ float query[DRAFT_MAX_QUERIES][128];
+    const uint32_t kvhead=blockIdx.x, split=blockIdx.y, warp=threadIdx.x>>5, lane=threadIdx.x&31;
+    const uint32_t group=qheads/kvheads, width=kvheads*128;
+    const uint64_t context=end-first, total=context+rows;
+    const uint64_t begin=uint64_t(split)*chunk, stop=min(total,begin+chunk);
+    for(uint32_t i=threadIdx.x;i<rows*group*128;i+=blockDim.x) {
+        const uint32_t index=i/128, d=i%128;
+        query[index][d]=q[(size_t(index/group)*qheads+kvhead*group+index%group)*128+d];
+    }
+    float mx[3]={-INFINITY,-INFINITY,-INFINITY}, total_weight[3]={}, acc[3][4]={};
+    const bool active=warp<rows;
+    for(uint64_t base=begin;base<stop;base+=DRAFT_TILE) {
+        __syncthreads();
+        for(uint32_t i=threadIdx.x;i<DRAFT_TILE*128;i+=blockDim.x) {
+            const uint32_t j=i/128, d=i%128;
+            const uint64_t key=base+j;
+            float kx=0.f, vx=0.f;
+            if(key<stop) {
+                if(key<context) {
+                    draft_context_kv<Paged>(ck,cv,pages,layer_offset,capacity,width,first+key,
+                                            kvhead*128+d,kx,vx);
+                } else {
+                    const size_t offset=size_t(key-context)*width+kvhead*128+d;
+                    kx=bk[offset];
+                    vx=bv[offset];
+                }
+            }
+            keys[j][d]=kx;
+            values[j][d]=vx;
+        }
+        __syncthreads();
+        if(!active) continue;
+        const bool valid=base+lane<stop;
+        for(uint32_t g=0;g<group;++g) {
+            const float* qv=query[warp*group+g];
+            float score=0.f;
+            for(uint32_t d=0;d<128;++d) score=fmaf(qv[d],keys[lane][d],score);
+            score=valid ? score*0.08838834764831845f : -INFINITY;
+            float tile=score;
+            for(int offset=16;offset;offset>>=1) tile=fmaxf(tile,__shfl_xor_sync(0xffffffffu,tile,offset));
+            const float next=fmaxf(mx[g],tile);
+            const float keep=expf(mx[g]-next), p=valid ? expf(score-next) : 0.f;
+            float sum=p;
+            for(int offset=16;offset;offset>>=1) sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+            total_weight[g]=total_weight[g]*keep+sum;
+            #pragma unroll
+            for(int c=0;c<4;++c) acc[g][c]*=keep;
+            for(uint32_t j=0;j<DRAFT_TILE;++j) {
+                const float pj=__shfl_sync(0xffffffffu,p,j);
+                #pragma unroll
+                for(int c=0;c<4;++c) acc[g][c]=fmaf(pj,values[j][lane+c*32],acc[g][c]);
+            }
+            mx[g]=next;
+        }
+    }
+    if(!active) return;
+    for(uint32_t g=0;g<group;++g) {
+        float* dst=partial+((size_t(split)*rows+warp)*qheads+kvhead*group+g)*130;
+        #pragma unroll
+        for(int c=0;c<4;++c) dst[lane+c*32]=acc[g][c];
+        if(lane==0) { dst[128]=mx[g]; dst[129]=total_weight[g]; }
+    }
+}
+
+__global__ void draft_attention_combine_kernel(const float* partial, float* out, uint32_t queries,
+                                               uint32_t splits) {
+    const uint32_t index=blockIdx.x, d=threadIdx.x;
+    float mx=-INFINITY;
+    for(uint32_t s=0;s<splits;++s) mx=fmaxf(mx,partial[(size_t(s)*queries+index)*130+128]);
+    float total=0.f, acc=0.f;
+    for(uint32_t s=0;s<splits;++s) {
+        const float* p=partial+(size_t(s)*queries+index)*130;
+        const float w=p[128]==-INFINITY ? 0.f : expf(p[128]-mx);
+        total+=p[129]*w;
+        acc+=p[d]*w;
+    }
+    out[size_t(index)*128+d]=bf(acc/total);
+}
+
+template <bool Paged>
+__global__ void draft_store_kernel(const float* k, const float* v, __nv_bfloat16* ck,
+        __nv_bfloat16* cv, __nv_bfloat16* const* pages, uint32_t layer_offset, uint32_t first,
+        uint32_t rows, uint32_t width, uint32_t capacity) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=size_t(rows)*width) return;
+    const uint32_t row=i/width, column=i%width;
+    const uint64_t position=uint64_t(first)+row;
+    if constexpr(Paged) {
+        __nv_bfloat16* page=pages[position>>7]+layer_offset;
+        const size_t offset=size_t(position&127)*width+column;
+        page[offset]=__float2bfloat16_rn(k[i]);
+        page[size_t(128)*width+offset]=__float2bfloat16_rn(v[i]);
+    } else {
+        // Only the last `capacity` rows survive in a ring.
+        if(rows>capacity && row<rows-capacity) return;
+        const size_t offset=size_t(position%capacity)*width+column;
+        ck[offset]=__float2bfloat16_rn(k[i]);
+        cv[offset]=__float2bfloat16_rn(v[i]);
+    }
+}
+
+// Rows after the anchor hold the learned mask embedding.
+__global__ void draft_fill_kernel(const float* mask, float* out, uint32_t rows, uint32_t width) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<size_t(rows)*width) out[i]=mask[i%width];
+}
+
+// x[row] += a + b for broadcast rows `a` and optional `b`.
+__global__ void draft_add_broadcast_kernel(float* x, const float* a, const float* b,
+                                           uint32_t rows, uint32_t width) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<size_t(rows)*width) x[i]+=a[i%width]+(b ? b[i%width] : 0.f);
+}
+
+__global__ void draft_markov_input_kernel(const float* state, const uint16_t* embedding,
+                                          const uint32_t* token, float* out, uint32_t rank) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=rank) return;
+    out[i]=state[i];
+    out[rank+i]=bf16(embedding[size_t(token[0])*rank+i]);
+}
+
+// The recurrent head's gate: each reference torch op rounds to BF16.
+__global__ void draft_markov_gate_kernel(const float* raw, float* state, float* latent,
+                                         uint32_t rank) {
+    const uint32_t c=blockIdx.x*blockDim.x+threadIdx.x;
+    if(c>=rank) return;
+    float gate=bf(raw[c]);
+    const float candidate=bf(tanhf(bf(raw[rank+c])));
+    const float out=bf(raw[2*rank+c]);
+    gate=bf(1.f/(1.f+expf(-gate)));
+    const float keep=bf(gate*state[c]);
+    const float update=bf(bf(1.f-gate)*candidate);
+    state[c]=bf(keep+update);
+    latent[c]=bf(tanhf(out));
+}
+
+// Softcapped draft logits over the vocabulary: the base logit plus the
+// folded Markov bias, each rounded to BF16 as in the reference.
+__global__ void draft_markov_logits_kernel(const float* base, const float* bias,
+        const float* fold_bias, float* out, uint32_t vocab, uint32_t real_vocab, float softcap) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=vocab) return;
+    const float x=bf(base[i]+bf(bias[i]+fold_bias[i]));
+    out[i]=i>=real_vocab ? -INFINITY : bf(softcap*tanhf(x/softcap));
+}
+
+// Descending bitonic sort of `n` (a power of two) value/ID pairs; ties order by ID.
+__device__ void bitonic_descending(float* value, uint32_t* id, uint32_t n) {
+    for(uint32_t k=2;k<=n;k<<=1) {
+        for(uint32_t j=k>>1;j>0;j>>=1) {
+            for(uint32_t i=threadIdx.x;i<n;i+=blockDim.x) {
+                const uint32_t l=i^j;
+                if(l<=i) continue;
+                const bool before=value[i]>value[l] || (value[i]==value[l] && id[i]<id[l]);
+                if(((i&k)==0) != before) {
+                    const float tv=value[i]; value[i]=value[l]; value[l]=tv;
+                    const uint32_t ti=id[i]; id[i]=id[l]; id[l]=ti;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void draft_topk_chunks_kernel(const float* logits, uint32_t stride, uint32_t real_vocab,
+        uint32_t k, float* chunk_values, uint32_t* chunk_ids) {
+    __shared__ float value[TOPK_CHUNK];
+    __shared__ uint32_t id[TOPK_CHUNK];
+    const uint32_t chunk=blockIdx.x, row=blockIdx.y, chunks=gridDim.x;
+    for(uint32_t i=threadIdx.x;i<TOPK_CHUNK;i+=blockDim.x) {
+        const uint32_t token=chunk*TOPK_CHUNK+i;
+        value[i]=token<real_vocab ? logits[size_t(row)*stride+token] : -INFINITY;
+        id[i]=token;
+    }
+    __syncthreads();
+    bitonic_descending(value,id,TOPK_CHUNK);
+    for(uint32_t i=threadIdx.x;i<k;i+=blockDim.x) {
+        chunk_values[(size_t(row)*chunks+chunk)*k+i]=value[i];
+        chunk_ids[(size_t(row)*chunks+chunk)*k+i]=id[i];
+    }
+}
+
+__global__ void draft_topk_merge_kernel(const float* chunk_values, const uint32_t* chunk_ids,
+        uint32_t count, uint32_t k, float* values, uint32_t* ids) {
+    __shared__ float value[TOPK_MERGE];
+    __shared__ uint32_t id[TOPK_MERGE];
+    const uint32_t row=blockIdx.x;
+    for(uint32_t i=threadIdx.x;i<TOPK_MERGE;i+=blockDim.x) {
+        value[i]=i<count ? chunk_values[size_t(row)*count+i] : -INFINITY;
+        id[i]=i<count ? chunk_ids[size_t(row)*count+i] : UINT32_MAX;
+    }
+    __syncthreads();
+    bitonic_descending(value,id,TOPK_MERGE);
+    for(uint32_t i=threadIdx.x;i<k;i+=blockDim.x) {
+        values[size_t(row)*k+i]=value[i];
+        ids[size_t(row)*k+i]=id[i];
+    }
+}
+
+// Copies the ring slots that appending `rows` tokens at `position` overwrites,
+// or restores rows `keep..rows` of them.
+__global__ void ring_slots_kernel(uint16_t* key, uint16_t* value, uint16_t* saved_key,
+        uint16_t* saved_value, uint32_t position, const uint32_t* device_position, uint32_t keep,
+        uint32_t rows, uint32_t width, uint32_t capacity, bool restore) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=size_t(rows)*width) return;
+    if(device_position) position=device_position[0];
+    const uint32_t row=i/width;
+    if(row<keep) return;
+    const size_t slot=size_t((uint64_t(position)+row)%capacity)*width+i%width;
+    if(restore) { key[slot]=saved_key[i]; value[slot]=saved_value[i]; }
+    else { saved_key[i]=key[slot]; saved_value[i]=value[slot]; }
+}
+}
+
+extern "C" int infer_inkling2_finish_logit_rows(float* logits, uint32_t rows, uint32_t vocab,
+    uint32_t real_vocab, float softcap, cudaStream_t stream) {
+    const uint32_t count=rows*vocab;
+    finish_logit_rows_kernel<<<(count+255)/256,256,0,stream>>>(logits,count,vocab,real_vocab,softcap);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_mix(const float* features, const float* alpha,
+    const float* weight, float* out, uint32_t first, uint32_t rows, uint32_t tap_rows,
+    uint32_t taps, uint32_t width, float eps, cudaStream_t stream) {
+    draft_mix_kernel<<<rows,256,0,stream>>>(features,alpha,weight,out,first,tap_rows,taps,width,eps);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_norm_rope(float* x, const float* weight, uint32_t rows,
+    uint32_t heads, uint32_t row_stride, uint32_t first, float theta, float eps,
+    cudaStream_t stream) {
+    draft_norm_rope_kernel<<<dim3(heads,rows),64,0,stream>>>(x,weight,row_stride,first,theta,eps);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_attention(const float* q, const float* bk, const float* bv,
+    const __nv_bfloat16* ck, const __nv_bfloat16* cv, const __nv_bfloat16* const* pages,
+    uint32_t layer_offset, uint32_t first, uint32_t end, uint32_t capacity, uint32_t rows,
+    uint32_t qheads, uint32_t kvheads, uint32_t splits, float* partial, float* out,
+    cudaStream_t stream) {
+    if(!rows || rows>8 || !kvheads || qheads%kvheads || qheads/kvheads>3 || !splits)
+        return cudaErrorInvalidValue;
+    const uint64_t total=uint64_t(end-first)+rows;
+    const uint32_t chunk=uint32_t((total+splits-1)/splits+DRAFT_TILE-1)/DRAFT_TILE*DRAFT_TILE;
+    if(pages) draft_attention_kernel<true><<<dim3(kvheads,splits),256,0,stream>>>(q,bk,bv,ck,cv,
+        pages,layer_offset,first,end,capacity,rows,qheads,kvheads,chunk,partial);
+    else draft_attention_kernel<false><<<dim3(kvheads,splits),256,0,stream>>>(q,bk,bv,ck,cv,
+        pages,layer_offset,first,end,capacity,rows,qheads,kvheads,chunk,partial);
+    draft_attention_combine_kernel<<<rows*qheads,128,0,stream>>>(partial,out,rows*qheads,splits);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_store(const float* k, const float* v, __nv_bfloat16* ck,
+    __nv_bfloat16* cv, __nv_bfloat16* const* pages, uint32_t layer_offset, uint32_t first,
+    uint32_t rows, uint32_t width, uint32_t capacity, cudaStream_t stream) {
+    const size_t count=size_t(rows)*width;
+    if(pages) draft_store_kernel<true><<<(count+255)/256,256,0,stream>>>(k,v,ck,cv,pages,
+        layer_offset,first,rows,width,capacity);
+    else draft_store_kernel<false><<<(count+255)/256,256,0,stream>>>(k,v,ck,cv,pages,
+        layer_offset,first,rows,width,capacity);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_fill(const float* mask, float* out, uint32_t rows,
+    uint32_t width, cudaStream_t stream) {
+    const size_t count=size_t(rows)*width;
+    draft_fill_kernel<<<(count+255)/256,256,0,stream>>>(mask,out,rows,width);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_add_broadcast(float* x, const float* a, const float* b,
+    uint32_t rows, uint32_t width, cudaStream_t stream) {
+    const size_t count=size_t(rows)*width;
+    draft_add_broadcast_kernel<<<(count+255)/256,256,0,stream>>>(x,a,b,rows,width);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_markov_input(const float* state, const uint16_t* embedding,
+    const uint32_t* token, float* out, uint32_t rank, cudaStream_t stream) {
+    draft_markov_input_kernel<<<(rank+255)/256,256,0,stream>>>(state,embedding,token,out,rank);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_markov_gate(const float* raw, float* state, float* latent,
+    uint32_t rank, cudaStream_t stream) {
+    draft_markov_gate_kernel<<<(rank+255)/256,256,0,stream>>>(raw,state,latent,rank);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_markov_logits(const float* base, const float* bias,
+    const float* fold_bias, float* out, uint32_t vocab, uint32_t real_vocab, float softcap,
+    cudaStream_t stream) {
+    draft_markov_logits_kernel<<<(vocab+255)/256,256,0,stream>>>(base,bias,fold_bias,out,vocab,
+        real_vocab,softcap);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_draft_topk(const float* logits, uint32_t rows, uint32_t stride,
+    uint32_t real_vocab, uint32_t k, float* chunk_values, uint32_t* chunk_ids, float* values,
+    uint32_t* ids, cudaStream_t stream) {
+    const uint32_t chunks=(real_vocab+TOPK_CHUNK-1)/TOPK_CHUNK;
+    if(!rows || !k || k>TOPK_CHUNK || chunks*k>TOPK_MERGE) return cudaErrorInvalidValue;
+    draft_topk_chunks_kernel<<<dim3(chunks,rows),1024,0,stream>>>(logits,stride,real_vocab,k,
+        chunk_values,chunk_ids);
+    draft_topk_merge_kernel<<<rows,1024,0,stream>>>(chunk_values,chunk_ids,chunks*k,k,values,ids);
+    return cudaGetLastError();
+}
+extern "C" int infer_inkling2_ring_slots(uint16_t* key, uint16_t* value, uint16_t* saved_key,
+    uint16_t* saved_value, uint32_t position, const uint32_t* device_position, uint32_t keep,
+    uint32_t rows, uint32_t width, uint32_t capacity, int restore, cudaStream_t stream) {
+    const size_t count=size_t(rows)*width;
+    ring_slots_kernel<<<(count+255)/256,256,0,stream>>>(key,value,saved_key,saved_value,position,
+        device_position,keep,rows,width,capacity,restore!=0);
+    return cudaGetLastError();
+}

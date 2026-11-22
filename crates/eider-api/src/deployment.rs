@@ -53,7 +53,13 @@ pub struct ServingDefaults {
 }
 
 fn default_speculative_drafts(model_type: &str) -> usize {
-    usize::from(model_type == "qwen3_8_flash_next")
+    match model_type {
+        "qwen3_8_flash_next" => 1,
+        // Inkling's verification reads every routed expert of its rows, so
+        // short DSpark blocks maximize throughput.
+        "inkling2_loop" => 4,
+        _ => 0,
+    }
 }
 
 fn default_max_active_sequences(model_type: &str) -> usize {
@@ -1194,6 +1200,7 @@ mod tests {
         assert_eq!(model.defaults.max_context_tokens, 262_144);
         assert_eq!(model.defaults.prefill_token_capacity, 512);
         assert_eq!(default_speculative_drafts(model.model_type), 1);
+        assert_eq!(default_speculative_drafts("inkling2_loop"), 4);
         assert_eq!(default_speculative_drafts("qwen3_5"), 0);
     }
 

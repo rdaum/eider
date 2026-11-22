@@ -7,16 +7,18 @@
 //! for every chunk; only per-visit caches persist in the sequence.
 
 use super::config::{Inkling2Config, Visit, invalid};
+use super::draft::{Draft, DraftState, DraftWorkspace};
 use super::sequence::{
     Inkling2CacheContext, Inkling2PageTable, Inkling2SequenceCache, PAGE_TOKENS, cache_error,
 };
 use super::weights::{Controller, ExpertStorage, ShortConvolution, Weights};
 use eider_cuda::{
     CudaGraphExec, CudaStream, DeviceBuffer, F32DenseGemm, GemmPrecision, MoeRouteGroups,
-    PinnedHostBuffer, RelativeKv, ReplayPosition, Result, SinkAttentionCache,
+    PinnedHostBuffer, RelativeKv, ReplayPosition, Result, SinkAttentionCache, SinkAttentionRewind,
     SinkAttentionWorkspace, add_f32_prefix_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, inkling2, round_f32_to_bf16_prefix_in_place_on_stream,
 };
+use seqcache::AppendReservation;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +30,9 @@ const DECODE_BOUND_TOKENS: usize = 256;
 
 pub struct Inkling2Model {
     config: Inkling2Config,
-    weights: Weights,
+    pub(super) weights: Weights,
+    /// Speculative draft; when present every forward captures its features.
+    pub(super) draft: Option<Draft>,
     pub(super) stream: CudaStream,
     pub(super) cache_namespace: Arc<()>,
     /// Page-bundle slot of each global cache layer; `None` for local visits.
@@ -121,10 +125,15 @@ pub struct Inkling2Sequence<'m> {
     pub(super) cache_id: Option<seqcache::SequenceId>,
     pub(super) cache_identity: Option<Arc<()>>,
     pub(super) restore_duration: Duration,
+    pub(super) draft: Option<DraftState>,
+    /// A verified chunk awaiting [`Inkling2Model::accept`].
+    pending: Option<(AppendReservation, usize)>,
     /// Tokens already appended, read by captured decode launches.
     device_position: DeviceBuffer<u32>,
     /// Decode graph, its workspace, and the attention bound it was captured for.
     graph: Option<(Arc<()>, usize, CudaGraphExec)>,
+    /// Verification graph, keyed like the decode graph plus its row count.
+    verify_graph: Option<(Arc<()>, usize, usize, CudaGraphExec)>,
 }
 
 /// Per-chunk Attention Residual state, `[rows, hidden]` per buffer.
@@ -154,7 +163,9 @@ pub struct Inkling2Workspace<'m> {
     identity: Arc<()>,
     host_tokens: PinnedHostBuffer<u32>,
     tokens: DeviceBuffer<u32>,
-    gemm: F32DenseGemm,
+    pub(super) gemm: F32DenseGemm,
+    pub(super) draft: Option<DraftWorkspace>,
+    verify: Option<VerifyScratch>,
     attention: SinkAttentionWorkspace,
     groups: MoeRouteGroups,
     residual: Residual,
@@ -203,12 +214,31 @@ pub struct Inkling2Workspace<'m> {
     final_normalized: DeviceBuffer<f32>,
 }
 
+/// History a verification chunk overwrites before its rows are accepted.
+struct VerifyScratch {
+    rows: usize,
+    /// Logits of every verified row.
+    logits: DeviceBuffer<f32>,
+    /// Inputs of each visit's K, V, attention, and MLP convolutions.
+    convolutions: Vec<[DeviceBuffer<f32>; 4]>,
+    /// Local-ring slots of each visit overwritten by the chunk.
+    rings: Vec<Option<SinkAttentionRewind>>,
+}
+
 impl Inkling2Model {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_options(root, false)
+    }
+
+    /// Loads the text model and, with `draft`, its DSpark speculative draft.
+    pub fn load_with_options(root: impl AsRef<Path>, draft: bool) -> Result<Self> {
         let root = root.as_ref();
         let config = Inkling2Config::load(root)?;
         let weights = Weights::load(root, &config)?;
         let stream = CudaStream::new_non_blocking()?;
+        let draft = draft
+            .then(|| Draft::load(root, &config, &weights.lm_head, &stream))
+            .transpose()?;
         stream.synchronize()?;
         let mut next = 0;
         let global_slots = config
@@ -224,6 +254,7 @@ impl Inkling2Model {
         let mut model = Self {
             config,
             weights,
+            draft,
             stream,
             cache_namespace: Arc::new(()),
             global_slots,
@@ -266,6 +297,41 @@ impl Inkling2Model {
         let three = |width| Ok::<_, eider_cuda::Error>([rows(width)?, rows(width)?, rows(width)?]);
         let mut gemm = F32DenseGemm::new(capacity, 3 * h, 0)?;
         gemm.set_precision(GemmPrecision::Bf16);
+        let draft = self
+            .draft
+            .as_ref()
+            .map(|draft| draft.new_workspace(capacity, c.vocab_size, c.unpadded_vocab_size))
+            .transpose()?;
+        let verify = self
+            .draft
+            .as_ref()
+            .map(|draft| {
+                let rows = draft.config.block_size;
+                let schedule = self.config.schedule();
+                let mut convolutions = Vec::with_capacity(schedule.len());
+                let mut rings = Vec::with_capacity(schedule.len());
+                for visit in &schedule {
+                    convolutions.push([
+                        DeviceBuffer::zeroed(rows * kv)?,
+                        DeviceBuffer::zeroed(rows * kv)?,
+                        DeviceBuffer::zeroed(rows * h)?,
+                        DeviceBuffer::zeroed(rows * h)?,
+                    ]);
+                    rings.push(
+                        visit
+                            .local
+                            .then(|| SinkAttentionRewind::new(rows, c.num_key_value_heads))
+                            .transpose()?,
+                    );
+                }
+                Ok::<_, eider_cuda::Error>(VerifyScratch {
+                    rows,
+                    logits: DeviceBuffer::zeroed(rows * c.vocab_size)?,
+                    convolutions,
+                    rings,
+                })
+            })
+            .transpose()?;
         Ok(Inkling2Workspace {
             model: self,
             capacity,
@@ -273,6 +339,8 @@ impl Inkling2Model {
             host_tokens: PinnedHostBuffer::zeroed(capacity)?,
             tokens: DeviceBuffer::zeroed(capacity)?,
             gemm,
+            draft,
+            verify,
             // One row at the full context bounds the softmax partials; long
             // chunks attend in smaller row groups.
             attention: SinkAttentionWorkspace::new(1, c.num_attention_heads, c.model_max_length)?,
@@ -375,8 +443,11 @@ impl Inkling2Model {
             cache_id: None,
             cache_identity: None,
             restore_duration: Duration::ZERO,
+            draft: self.draft.as_ref().map(Draft::new_state).transpose()?,
+            pending: None,
             device_position: DeviceBuffer::zeroed(1)?,
             graph: None,
+            verify_graph: None,
         })
     }
 
@@ -390,19 +461,7 @@ impl Inkling2Model {
         cache: &mut Inkling2SequenceCache,
         tokens: &[u32],
     ) -> Result<()> {
-        let c = &self.config.text_config;
-        if !std::ptr::eq(self, w.model)
-            || !std::ptr::eq(self, s.model)
-            || !s.valid
-            || tokens.is_empty()
-            || tokens.len() > w.capacity
-            || tokens.len() > s.capacity.saturating_sub(s.position)
-            || tokens
-                .iter()
-                .any(|&token| token as usize >= c.unpadded_vocab_size)
-        {
-            return Err(invalid("invalid model, sequence, tokens or workspace"));
-        }
+        self.validate_chunk(w, s, tokens)?;
         s.validate_cache(cache)?;
         let id = s.cache_id.ok_or_else(|| invalid("unadmitted sequence"))?;
         let reservation = cache
@@ -423,7 +482,7 @@ impl Inkling2Model {
             if tokens.len() == 1 {
                 self.replay_decode(w, s)
             } else {
-                self.forward_chunk(w, s, tokens.len(), None)
+                self.forward_chunk(w, s, tokens.len(), None, false)
             }
         })()
         .and_then(|()| self.synchronize());
@@ -451,10 +510,184 @@ impl Inkling2Model {
                 .map_err(cache_error)?;
             return Err(error);
         }
+        let first = s.position;
         s.position += tokens.len();
         for cache in s.visits.iter_mut().filter_map(|visit| visit.cache.as_mut()) {
             cache.record_replay_position(s.position)?;
         }
+        self.commit_draft_context(w, s, 0, tokens.len(), first)?;
+        s.valid = true;
+        Ok(())
+    }
+
+    fn validate_chunk(
+        &self,
+        w: &Inkling2Workspace,
+        s: &Inkling2Sequence,
+        tokens: &[u32],
+    ) -> Result<()> {
+        let c = &self.config.text_config;
+        if !std::ptr::eq(self, w.model)
+            || !std::ptr::eq(self, s.model)
+            || !s.valid
+            || s.pending.is_some()
+            || tokens.is_empty()
+            || tokens.len() > w.capacity
+            || tokens.len() > s.capacity.saturating_sub(s.position)
+            || tokens
+                .iter()
+                .any(|&token| token as usize >= c.unpadded_vocab_size)
+        {
+            return Err(invalid("invalid model, sequence, tokens or workspace"));
+        }
+        Ok(())
+    }
+
+    /// Evaluates a speculative chunk, an anchor followed by drafted tokens,
+    /// producing logits for every row. Nothing is committed until
+    /// [`Inkling2Model::accept`] keeps a prefix of the rows.
+    pub fn verify(
+        &self,
+        w: &mut Inkling2Workspace,
+        s: &mut Inkling2Sequence,
+        cache: &mut Inkling2SequenceCache,
+        tokens: &[u32],
+    ) -> Result<()> {
+        self.validate_chunk(w, s, tokens)?;
+        if w.verify
+            .as_ref()
+            .is_none_or(|verify| tokens.len() > verify.rows)
+        {
+            return Err(invalid("verification exceeds the draft block"));
+        }
+        s.validate_cache(cache)?;
+        let id = s.cache_id.ok_or_else(|| invalid("unadmitted sequence"))?;
+        let reservation = cache
+            .reserve_append(
+                id,
+                tokens.len(),
+                &mut Inkling2CacheContext {
+                    stream: &self.stream,
+                    table: &mut s.table,
+                },
+            )
+            .map_err(cache_error)?;
+        s.valid = false;
+        let result = (|| {
+            w.host_tokens.as_mut_slice()[..tokens.len()].copy_from_slice(tokens);
+            w.tokens
+                .copy_range_from_pinned_on_stream(0, &w.host_tokens, &self.stream)?;
+            self.replay_verify(w, s, tokens.len())
+        })()
+        .and_then(|()| self.synchronize());
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Inkling2CacheContext {
+                        stream: &self.stream,
+                        table: &mut s.table,
+                    },
+                )
+                .map_err(cache_error)?;
+            return Err(error);
+        }
+        s.pending = Some((reservation, tokens.len()));
+        Ok(())
+    }
+
+    /// Copies the logits of the pending verification's rows to the host.
+    pub fn verified_logits_to_host(
+        &self,
+        w: &Inkling2Workspace,
+        s: &Inkling2Sequence,
+    ) -> Result<Vec<f32>> {
+        let rows = s
+            .pending
+            .as_ref()
+            .map(|(_, rows)| *rows)
+            .ok_or_else(|| invalid("no pending verification"))?;
+        let verify = w
+            .verify
+            .as_ref()
+            .ok_or_else(|| invalid("no verification scratch"))?;
+        let vocab = self.config.text_config.vocab_size;
+        let mut logits = verify.logits.copy_to_host(&self.stream)?.into_vec();
+        logits.truncate(rows * vocab);
+        Ok(logits)
+    }
+
+    /// Commits the first `rows` rows of the pending verification and discards
+    /// the rest. The sequence logits become those of the last kept row.
+    pub fn accept(
+        &self,
+        w: &mut Inkling2Workspace,
+        s: &mut Inkling2Sequence,
+        cache: &mut Inkling2SequenceCache,
+        rows: usize,
+    ) -> Result<()> {
+        let c = &self.config.text_config;
+        let (reservation, verified) = s
+            .pending
+            .take()
+            .ok_or_else(|| invalid("no pending verification"))?;
+        if rows == 0 || rows > verified || !std::ptr::eq(self, w.model) {
+            return Err(invalid("accepted rows exceed the verification"));
+        }
+        let verify = w
+            .verify
+            .as_mut()
+            .ok_or_else(|| invalid("no verification scratch"))?;
+        let stream = &self.stream;
+        let h = c.hidden_size;
+        let kv = c.num_key_value_heads * c.head_dim;
+        let width = c.sconv_kernel_size;
+        for ((visit, saved), rewind) in s
+            .visits
+            .iter_mut()
+            .zip(&verify.convolutions)
+            .zip(&mut verify.rings)
+        {
+            let [k, v, attention, mlp] = saved;
+            inkling2::commit_short_conv(k, visit.k_conv.inout(), rows, kv, width, stream)?;
+            inkling2::commit_short_conv(v, visit.v_conv.inout(), rows, kv, width, stream)?;
+            inkling2::commit_short_conv(
+                attention,
+                visit.attention_conv.inout(),
+                rows,
+                h,
+                width,
+                stream,
+            )?;
+            inkling2::commit_short_conv(mlp, visit.mlp_conv.inout(), rows, h, width, stream)?;
+            match (visit.cache.as_mut(), rewind.as_mut()) {
+                (Some(ring), Some(rewind)) => rewind.rewind(ring, rows, stream)?,
+                (None, None) => {}
+                _ => return Err(invalid("verification scratch does not match the schedule")),
+            }
+        }
+        let vocab = c.vocab_size;
+        s.logits.copy_range_from_device_on_stream(
+            0,
+            &verify.logits,
+            (rows - 1) * vocab,
+            vocab,
+            stream,
+        )?;
+        self.synchronize()?;
+        cache
+            .commit_append(
+                reservation,
+                rows,
+                &mut Inkling2CacheContext {
+                    stream,
+                    table: &mut s.table,
+                },
+            )
+            .map_err(cache_error)?;
+        let first = s.position;
+        s.position += rows;
+        self.commit_draft_context(w, s, 0, rows, first)?;
         s.valid = true;
         Ok(())
     }
@@ -475,7 +708,7 @@ impl Inkling2Model {
             s.graph = None;
             let graph = self
                 .stream
-                .capture(|_| self.forward_chunk(w, s, 1, Some(bound)))?;
+                .capture(|_| self.forward_chunk(w, s, 1, Some(bound), false))?;
             s.graph = Some((Arc::clone(&w.identity), bound, graph));
         }
         s.graph
@@ -485,14 +718,64 @@ impl Inkling2Model {
             .launch(&self.stream)
     }
 
+    /// Replays the sequence's verification graph, capturing it again when the
+    /// workspace or row count changes or the block outgrows its attention
+    /// partitions, then records the host-side ring state the launch implies.
+    fn replay_verify(
+        &self,
+        w: &mut Inkling2Workspace,
+        s: &mut Inkling2Sequence,
+        rows: usize,
+    ) -> Result<()> {
+        let bound = (s.position + rows)
+            .div_ceil(DECODE_BOUND_TOKENS)
+            .saturating_mul(DECODE_BOUND_TOKENS)
+            .min(self.config.text_config.model_max_length);
+        s.device_position
+            .copy_range_from_host(0, &[s.position as u32])?;
+        let current = s
+            .verify_graph
+            .as_ref()
+            .is_some_and(|(identity, previous, graph_rows, _)| {
+                Arc::ptr_eq(identity, &w.identity) && *previous == bound && *graph_rows == rows
+            });
+        let position = s.position;
+        if !current {
+            s.verify_graph = None;
+            let graph = self
+                .stream
+                .capture(|_| self.forward_chunk(w, s, rows, Some(bound), true))?;
+            s.verify_graph = Some((Arc::clone(&w.identity), bound, rows, graph));
+        }
+        s.verify_graph
+            .as_ref()
+            .expect("captured verification graph")
+            .3
+            .launch(&self.stream)?;
+        let verify = w
+            .verify
+            .as_mut()
+            .ok_or_else(|| invalid("no verification scratch"))?;
+        for (visit, rewind) in s.visits.iter_mut().zip(&mut verify.rings) {
+            if let (Some(ring), Some(rewind)) = (visit.cache.as_mut(), rewind.as_mut()) {
+                ring.record_replay_position(position + rows)?;
+                rewind.record_replay_save(position, rows)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Evaluates `rows` uploaded tokens. With `replay`, positions come from the
     /// sequence's device position and attention is bounded by `replay` tokens.
+    /// A `verify` chunk produces logits for every row and defers convolution
+    /// and local-ring history until [`Inkling2Model::accept`].
     fn forward_chunk(
         &self,
         w: &mut Inkling2Workspace,
         s: &mut Inkling2Sequence,
         rows: usize,
         replay: Option<usize>,
+        verify: bool,
     ) -> Result<()> {
         let c = &self.config.text_config;
         let h = c.hidden_size;
@@ -509,8 +792,11 @@ impl Inkling2Model {
             &self.stream,
         )?;
         let core = c.loop_config.core_start..c.loop_config.core_end;
+        let mut visit_index = 0;
         for layer in 0..core.start {
-            self.layer(w, s, self.visit(layer, 0), rows, replay)?;
+            self.capture_tap(w, visit_index, rows)?;
+            self.layer(w, s, self.visit(layer, 0), rows, replay, verify)?;
+            visit_index += 1;
         }
         let r = &mut w.residual;
         r.prelude_partial
@@ -541,13 +827,113 @@ impl Inkling2Model {
                 r.count = prelude_count;
             }
             for layer in core.clone() {
-                self.layer(w, s, self.visit(layer, pass), rows, replay)?;
+                self.capture_tap(w, visit_index, rows)?;
+                self.layer(w, s, self.visit(layer, pass), rows, replay, verify)?;
+                visit_index += 1;
             }
         }
         for layer in core.end..c.num_hidden_layers {
-            self.layer(w, s, self.visit(layer, 0), rows, replay)?;
+            self.capture_tap(w, visit_index, rows)?;
+            self.layer(w, s, self.visit(layer, 0), rows, replay, verify)?;
+            visit_index += 1;
         }
-        self.readout(w, s, rows)
+        if self.draft.is_some() {
+            self.final_rows(w, rows)?;
+        }
+        if verify {
+            self.verified_readout(w, rows)
+        } else {
+            self.readout(w, s, rows)
+        }
+    }
+
+    /// Captures the residual partial entering a draft feature visit.
+    fn capture_tap(&self, w: &mut Inkling2Workspace, visit: usize, rows: usize) -> Result<()> {
+        let Some(draft) = self.draft.as_ref() else {
+            return Ok(());
+        };
+        let Some(tap) = draft.residual_taps().iter().position(|&tap| tap == visit) else {
+            return Ok(());
+        };
+        let h = self.config.text_config.hidden_size;
+        let dw = w
+            .draft
+            .as_mut()
+            .ok_or_else(|| invalid("workspace lacks draft scratch"))?;
+        dw.features.copy_range_from_device_on_stream(
+            tap * dw.tap_rows * h,
+            &w.residual.partial,
+            0,
+            rows * h,
+            &self.stream,
+        )
+    }
+
+    /// Final-norm output of every row, the draft's last feature tap.
+    fn final_rows(&self, w: &mut Inkling2Workspace, rows: usize) -> Result<()> {
+        let c = &self.config.text_config;
+        let h = c.hidden_size;
+        let dw = w
+            .draft
+            .as_mut()
+            .ok_or_else(|| invalid("workspace lacks draft scratch"))?;
+        inkling2::attention_residual(
+            &w.residual.sources(),
+            None,
+            &self.weights.residual.output,
+            dw.final_rows.output(),
+            rows,
+            h,
+            c.rms_norm_eps,
+            &self.stream,
+        )?;
+        inkling2::rms_norm(
+            &dw.final_rows,
+            Some(&self.weights.final_norm),
+            dw.final_normalized.output(),
+            rows,
+            h,
+            c.rms_norm_eps,
+            &self.stream,
+        )?;
+        let last = self.draft.as_ref().expect("draft").taps() - 1;
+        dw.features.copy_range_from_device_on_stream(
+            last * dw.tap_rows * h,
+            &dw.final_normalized,
+            0,
+            rows * h,
+            &self.stream,
+        )
+    }
+
+    /// Computes logits for every verified row from the final-norm outputs.
+    fn verified_readout(&self, w: &mut Inkling2Workspace, rows: usize) -> Result<()> {
+        let c = &self.config.text_config;
+        let dw = w
+            .draft
+            .as_ref()
+            .ok_or_else(|| invalid("workspace lacks draft scratch"))?;
+        let verify = w
+            .verify
+            .as_mut()
+            .ok_or_else(|| invalid("no verification scratch"))?;
+        inkling2::bf16_matvec(
+            &dw.final_normalized,
+            &self.weights.lm_head,
+            verify.logits.output(),
+            rows,
+            c.vocab_size,
+            c.hidden_size,
+            &self.stream,
+        )?;
+        inkling2::draft::finish_logit_rows(
+            &mut verify.logits,
+            rows,
+            c.vocab_size,
+            c.unpadded_vocab_size,
+            c.final_logit_softcapping,
+            &self.stream,
+        )
     }
 
     /// Computes logits for the chunk's last row.
@@ -622,6 +1008,7 @@ impl Inkling2Model {
         visit: Visit,
         rows: usize,
         replay: Option<usize>,
+        verify: bool,
     ) -> Result<()> {
         let c = &self.config.text_config;
         let h = c.hidden_size;
@@ -661,6 +1048,13 @@ impl Inkling2Model {
         let state = &mut s.visits[visit.cache_layer];
         let width = c.sconv_kernel_size;
         let kv_heads = c.num_key_value_heads;
+        // A verification keeps each convolution's inputs so accepted rows can
+        // be committed later.
+        let mut deferred = match (verify, w.verify.as_mut()) {
+            (false, _) => None,
+            (true, Some(scratch)) => Some(&mut scratch.convolutions[visit.cache_layer]),
+            (true, None) => return Err(invalid("no verification scratch")),
+        };
         short_conv(
             &w.k,
             &a.k_conv,
@@ -671,6 +1065,7 @@ impl Inkling2Model {
             kv,
             width,
             kv_heads,
+            deferred.as_mut().map(|saved| &mut saved[0]),
             stream,
         )?;
         short_conv(
@@ -683,6 +1078,7 @@ impl Inkling2Model {
             kv,
             width,
             kv_heads,
+            deferred.as_mut().map(|saved| &mut saved[1]),
             stream,
         )?;
         let tau = (!local).then_some((c.log_scaling_n_floor, c.log_scaling_alpha));
@@ -746,6 +1142,13 @@ impl Inkling2Model {
             c.rel_extent,
             stream,
         )?;
+        if verify && let Some(ring) = state.cache.as_mut() {
+            w.verify
+                .as_mut()
+                .and_then(|scratch| scratch.rings[visit.cache_layer].as_mut())
+                .ok_or_else(|| invalid("no ring rewind scratch"))?
+                .save(ring, rows, replay.map(|_| &s.device_position), stream)?;
+        }
         let kv = match (&mut state.cache, self.global_slots[visit.cache_layer]) {
             (Some(ring), None) => RelativeKv::Ring(ring),
             (None, Some(slot)) => RelativeKv::Pages {
@@ -790,6 +1193,10 @@ impl Inkling2Model {
             h,
             width,
             1,
+            w.verify
+                .as_mut()
+                .filter(|_| verify)
+                .map(|scratch| &mut scratch.convolutions[visit.cache_layer][2]),
             stream,
         )?;
 
@@ -832,6 +1239,10 @@ impl Inkling2Model {
             h,
             width,
             1,
+            w.verify
+                .as_mut()
+                .filter(|_| verify)
+                .map(|scratch| &mut scratch.convolutions[visit.cache_layer][3]),
             stream,
         )?;
 
@@ -1141,6 +1552,8 @@ impl Inkling2Model {
     }
 }
 
+/// Applies a short convolution over `state` and the chunk. Its history is
+/// committed at once unless `deferred` keeps the inputs for a later commit.
 #[allow(clippy::too_many_arguments)]
 fn short_conv(
     input: &DeviceBuffer<f32>,
@@ -1152,6 +1565,7 @@ fn short_conv(
     hidden: usize,
     width: usize,
     heads: usize,
+    deferred: Option<&mut DeviceBuffer<f32>>,
     stream: &CudaStream,
 ) -> Result<()> {
     if convolution.dynamic.is_none() != dynamic.is_none() {
@@ -1169,7 +1583,10 @@ fn short_conv(
         heads,
         stream,
     )?;
-    inkling2::commit_short_conv(input, state.inout(), rows, hidden, width, stream)
+    match deferred {
+        Some(saved) => saved.copy_prefix_from_device_on_stream(input, rows * hidden, stream),
+        None => inkling2::commit_short_conv(input, state.inout(), rows, hidden, width, stream),
+    }
 }
 
 impl Inkling2Workspace<'_> {
@@ -1190,6 +1607,7 @@ impl Inkling2Sequence<'_> {
             .iter()
             .map(VisitState::device_bytes)
             .sum::<usize>()
+            + self.draft.as_ref().map_or(0, DraftState::device_bytes)
             + self.logits.device_bytes()
             + self.next_id.device_bytes()
             + self.next_value.device_bytes()

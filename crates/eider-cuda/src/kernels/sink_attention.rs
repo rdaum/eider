@@ -5,6 +5,20 @@ use crate::{CudaStream, DeviceAddress, DeviceBuffer, Error, Result};
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn infer_inkling2_ring_slots(
+        key: *mut u16,
+        value: *mut u16,
+        saved_key: *mut u16,
+        saved_value: *mut u16,
+        position: u32,
+        device_position: *const u32,
+        keep: u32,
+        rows: u32,
+        width: u32,
+        capacity: u32,
+        restore: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn infer_paged_sink_decode_batch(
         q: *const f32,
         keys: *const DeviceAddress<u16>,
@@ -92,10 +106,10 @@ unsafe extern "C" {
 
 /// BF16 KV ring. Capacity is the local window or the global context limit.
 pub struct SinkAttentionCache {
-    key: DeviceBuffer<u16>,
-    value: DeviceBuffer<u16>,
-    capacity: usize,
-    kv_heads: usize,
+    pub(crate) key: DeviceBuffer<u16>,
+    pub(crate) value: DeviceBuffer<u16>,
+    pub(crate) capacity: usize,
+    pub(crate) kv_heads: usize,
     position: usize,
 }
 
@@ -153,6 +167,120 @@ impl SinkAttentionCache {
             .copy_prefix_from_device_on_stream(&source.value, self.value.len(), stream)?;
         self.position = source.position;
         Ok(())
+    }
+}
+
+/// Ring slots an unconfirmed append overwrote, kept so rejected rows can be
+/// withdrawn. Global page bundles need no copy: positions past the committed
+/// length are never read.
+pub struct SinkAttentionRewind {
+    key: DeviceBuffer<u16>,
+    value: DeviceBuffer<u16>,
+    rows: usize,
+    saved: Option<(usize, usize)>,
+}
+
+impl SinkAttentionRewind {
+    /// Allocates room for appends of up to `rows` tokens.
+    pub fn new(rows: usize, kv_heads: usize) -> Result<Self> {
+        let len = rows
+            .checked_mul(kv_heads * 128)
+            .filter(|&len| len > 0)
+            .ok_or_else(|| invalid("invalid rewind capacity"))?;
+        Ok(Self {
+            key: DeviceBuffer::zeroed(len)?,
+            value: DeviceBuffer::zeroed(len)?,
+            rows,
+            saved: None,
+        })
+    }
+
+    /// Copies the slots that appending `rows` tokens to `cache` overwrites.
+    /// With `replay`, a captured launch reads the append position from it.
+    pub fn save(
+        &mut self,
+        cache: &mut SinkAttentionCache,
+        rows: usize,
+        replay: Option<&DeviceBuffer<u32>>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > self.rows
+            || rows > cache.capacity
+            || replay.is_some_and(|position| position.len() != 1)
+        {
+            return Err(invalid("rewind rows exceed capacity"));
+        }
+        ring_slots(cache, self, cache.position, replay, 0, rows, false, stream)?;
+        self.saved = Some((cache.position, rows));
+        Ok(())
+    }
+
+    /// Records the save performed by a replayed capture of an append of
+    /// `rows` tokens at `position`.
+    pub fn record_replay_save(&mut self, position: usize, rows: usize) -> Result<()> {
+        if rows == 0 || rows > self.rows {
+            return Err(invalid("rewind rows exceed capacity"));
+        }
+        self.saved = Some((position, rows));
+        Ok(())
+    }
+
+    /// Withdraws every saved row after the first `keep` and returns the ring
+    /// to `keep` appended tokens past the saved position.
+    pub fn rewind(
+        &mut self,
+        cache: &mut SinkAttentionCache,
+        keep: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let (position, rows) = self
+            .saved
+            .take()
+            .ok_or_else(|| invalid("no saved ring slots"))?;
+        if keep > rows || cache.position != position + rows {
+            return Err(invalid("rewind does not match the saved append"));
+        }
+        if keep < rows {
+            ring_slots(cache, self, position, None, keep, rows, true, stream)?;
+        }
+        cache.position = position + keep;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ring_slots(
+    cache: &mut SinkAttentionCache,
+    rewind: &mut SinkAttentionRewind,
+    position: usize,
+    replay: Option<&DeviceBuffer<u32>>,
+    keep: usize,
+    rows: usize,
+    restore: bool,
+    stream: &CudaStream,
+) -> Result<()> {
+    if position > u32::MAX as usize {
+        return Err(invalid("position overflow"));
+    }
+    unsafe {
+        check_cuda(
+            "infer_inkling2_ring_slots",
+            infer_inkling2_ring_slots(
+                cache.key.ptr,
+                cache.value.ptr,
+                rewind.key.ptr,
+                rewind.value.ptr,
+                position as u32,
+                replay.map_or(std::ptr::null(), |position| position.ptr.cast_const()),
+                keep as u32,
+                rows as u32,
+                (cache.kv_heads * 128) as u32,
+                cache.capacity as u32,
+                i32::from(restore),
+                stream.as_raw(),
+            ),
+        )
     }
 }
 
@@ -649,6 +777,37 @@ mod tests {
     fn bf(x: f32) -> f32 {
         let b = x.to_bits();
         f32::from_bits((b.wrapping_add(0x7fff + ((b >> 16) & 1))) & 0xffff0000)
+    }
+
+    #[test]
+    fn rewind_restores_rejected_ring_slots() -> Result<()> {
+        crate::set_cuda_device(0)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let (capacity, width) = (16, 128);
+        let original = (0..capacity * width).map(|i| i as u16).collect::<Vec<_>>();
+        let mut ring = SinkAttentionCache::new(capacity, 1)?;
+        ring.key = DeviceBuffer::from_host(&original)?;
+        ring.value = DeviceBuffer::from_host(&original)?;
+        ring.record_replay_position(20)?;
+        let mut rewind = SinkAttentionRewind::new(5, 1)?;
+        rewind.save(&mut ring, 5, None, &stream)?;
+        // An append of positions 20..25 overwrites slots 4..9.
+        let appended = vec![u16::MAX; capacity * width];
+        ring.key = DeviceBuffer::from_host(&appended)?;
+        ring.value = DeviceBuffer::from_host(&appended)?;
+        ring.record_replay_position(25)?;
+        rewind.rewind(&mut ring, 2, &stream)?;
+        assert_eq!(ring.position(), 22);
+        let key = ring.key.copy_to_host(&stream)?.into_vec();
+        for slot in 0..capacity {
+            let expected = if (6..9).contains(&slot) {
+                original[slot * width]
+            } else {
+                u16::MAX
+            };
+            assert_eq!(key[slot * width], expected, "slot {slot}");
+        }
+        Ok(())
     }
 
     #[test]
