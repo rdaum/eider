@@ -552,11 +552,23 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_tiled_kernel(
                 const auto a1 = dequant_pair(w[row1 * 8 + quad], s1);
                 const auto a2 = dequant_pair(w[row0 * 8 + quad + 4], s0);
                 const auto a3 = dequant_pair(w[row1 * 8 + quad + 4], s1);
+                // One ldmatrix.x4 loads the K16 B fragments of two groups:
+                // matrices are (group, k 0-7), (group, k 8-15), then group + 1.
+                // Columns past `count` were staged as zeros.
+                const unsigned matrix = lane >> 3;
+                const std::uint32_t* b_row =
+                    staged[(matrix >> 1) * 8 + (lane & 7)] + kt * 8 + (matrix & 1) * 4;
                 #pragma unroll
-                for (unsigned g = 0; g < Groups; ++g) {
+                for (unsigned g = 0; g < Groups; g += 2) {
                     if (g * 8 >= count) break;
-                    const std::uint32_t* b = staged[g * 8 + row0] + kt * 8 + quad;
-                    mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b[0], b[4]);
+                    std::uint32_t b[4];
+                    const auto address = static_cast<std::uint32_t>(
+                        __cvta_generic_to_shared(b_row + g * 8 * Stride));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                        : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(address));
+                    mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b[0], b[1]);
+                    mma_m16n8k16(d[g + 1][0], d[g + 1][1], d[g + 1][2], d[g + 1][3],
+                                 a0, a1, a2, a3, b[2], b[3]);
                 }
             }
         }
