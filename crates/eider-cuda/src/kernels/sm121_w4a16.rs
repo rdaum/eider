@@ -828,15 +828,15 @@ impl Sm121W4A16GateUp {
         &self.output_bf16
     }
 
-    /// Runs every grouped route of a routed batch, decoding each expert tile
-    /// once per work item of routes. `routes` route rows are written as BF16
-    /// values in F32 storage. Route `r` reads input row `r / top_k`, or row `r`
-    /// with `per_route_input`. Decode-sized batches split K across warps;
+    /// Runs every grouped route of a routed batch over BF16 inputs, decoding
+    /// each expert tile once per work item of routes. `routes` route rows are
+    /// written as BF16 values in F32 storage. Route `r` reads input row
+    /// `r / top_k`, or row `r` with `per_route_input`. Decode-sized batches split K across warps;
     /// larger batches stage route activations and tile 128 output rows per CTA.
     pub fn run_route_groups_on_stream(
         &self,
         groups: &MoeRouteGroups,
-        input: &DeviceBuffer<f32>,
+        input: &DeviceBuffer<u16>,
         mut output: DeviceOutput<'_, f32>,
         routes: usize,
         per_route_input: bool,
@@ -1415,6 +1415,13 @@ mod tests {
             .map(|i| ((i * 13 % 29) as f32 - 14.0) / 8.0)
             .collect::<Vec<_>>();
         let input = DeviceBuffer::from_host(&input_values)?;
+        // The inputs are BF16-exact, so both paths see the same values.
+        let input_bf16 = DeviceBuffer::from_host(
+            &input_values
+                .iter()
+                .map(|&x| f32_to_bf16(x))
+                .collect::<Vec<_>>(),
+        )?;
         let stream = CudaStream::new_non_blocking()?;
         let workspace = experts.new_batch_workspace(rows)?;
         let mut expected = DeviceBuffer::zeroed(routes * out_features)?;
@@ -1432,7 +1439,7 @@ mod tests {
         let mut output = DeviceBuffer::zeroed(routes * out_features)?;
         experts.run_route_groups_on_stream(
             &groups,
-            &input,
+            &input_bf16,
             output.output(),
             routes,
             false,
@@ -1446,7 +1453,7 @@ mod tests {
         output.copy_from_host(&vec![0.0; routes * out_features])?;
         experts.run_route_groups_on_stream(
             &few_groups,
-            &input,
+            &input_bf16,
             output.output(),
             few,
             false,
@@ -1464,7 +1471,7 @@ mod tests {
         output.copy_from_host(&vec![0.0; routes * out_features])?;
         experts.run_route_groups_on_stream(
             &narrow_groups,
-            &input,
+            &input_bf16,
             output.output(),
             narrow,
             false,
@@ -1477,6 +1484,7 @@ mod tests {
         let per_route = DeviceBuffer::from_host(
             &(0..routes)
                 .flat_map(|r| input_values[r / top_k * in_features..][..in_features].to_vec())
+                .map(f32_to_bf16)
                 .collect::<Vec<_>>(),
         )?;
         experts.run_route_groups_on_stream(

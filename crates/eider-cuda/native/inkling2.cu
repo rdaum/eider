@@ -44,15 +44,18 @@ __global__ void embed_kernel(const uint16_t* embedding, const uint32_t* tokens,
 }
 
 __global__ void rms_kernel(const float* x, const float* gamma, float* out,
-                           uint32_t width, float eps) {
+                           uint16_t* out_bf16, uint32_t width, float eps) {
     __shared__ float partial[256];
     const int lane=threadIdx.x;
     const size_t offset=size_t(blockIdx.x)*width;
     float sum=0;
     for(int i=lane;i<width;i+=blockDim.x) sum+=x[offset+i]*x[offset+i];
     const float inv=rsqrtf(block_sum(sum,partial)/width+eps);
-    for(int i=lane;i<width;i+=blockDim.x)
-        out[offset+i]=gamma ? bf(gamma[i]*bf(x[offset+i]*inv)) : bf(x[offset+i]*inv);
+    for(int i=lane;i<width;i+=blockDim.x) {
+        const float y=gamma ? bf(gamma[i]*bf(x[offset+i]*inv)) : bf(x[offset+i]*inv);
+        out[offset+i]=y;
+        if(out_bf16) out_bf16[offset+i]=__bfloat16_as_ushort(__float2bfloat16_rn(y));
+    }
 }
 
 // One normalized pseudo-query over at most five previous block outputs.
@@ -269,7 +272,7 @@ __global__ void router_kernel(const float* logits, const float* bias, uint32_t* 
 }
 
 __global__ void capped_swiglu_kernel(const float* gate_up, const float* gammas,
-    float* out, uint32_t routes, uint32_t intermediate,
+    uint16_t* out, uint32_t routes, uint32_t intermediate,
     float gate_cap, float up_cap) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=routes*intermediate) return;
@@ -277,7 +280,8 @@ __global__ void capped_swiglu_kernel(const float* gate_up, const float* gammas,
     const float raw_gate=gate_up[i*2], raw_up=gate_up[i*2+1];
     const float gate=gate_cap*tanhf(raw_gate/gate_cap);
     const float up=up_cap*tanhf(raw_up/up_cap);
-    out[i]=bf(gate*(1.f/(1.f+expf(-raw_gate)))*up*gammas[route]);
+    out[i]=__bfloat16_as_ushort(__float2bfloat16_rn(
+        gate*(1.f/(1.f+expf(-raw_gate)))*up*gammas[route]));
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float low, float high) {
@@ -314,7 +318,7 @@ __device__ __forceinline__ uint32_t mxfp8_pair(const uint8_t* w, const uint8_t* 
 template<unsigned Warps, unsigned Groups>
 __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
-    const uint32_t* item_count, const uint32_t* items, const float* input,
+    const uint32_t* item_count, const uint32_t* items, const uint16_t* input,
     const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
     bool per_route_input, uint32_t outputs, uint32_t inputs) {
     const unsigned item=blockIdx.y;
@@ -327,7 +331,7 @@ __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
     const uint8_t* sc=weight_scales+base*(inputs/32);
     __shared__ float partial[Warps][Groups][128];
     for(unsigned first=0;first<count;first+=Groups*8) {
-        const float* rows[Groups];
+        const uint16_t* rows[Groups];
         #pragma unroll
         for(unsigned g=0;g<Groups;++g) {
             const unsigned column=first+g*8+row0;
@@ -348,9 +352,9 @@ __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
                 if(first+g*8>=count) break;
                 uint32_t b0=0,b1=0;
                 if(rows[g]) {
-                    const float* x=rows[g]+k+pair;
-                    b0=pack_bf16(x[0],x[1]);
-                    b1=pack_bf16(x[8],x[9]);
+                    const uint32_t* x=reinterpret_cast<const uint32_t*>(rows[g]+k+pair);
+                    b0=x[0];
+                    b1=x[4];
                 }
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -384,12 +388,12 @@ __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
 // once per 64-wide K chunk, so each activation is read once per CTA.
 __global__ __launch_bounds__(256) void grouped_mxfp8_expert_tiled_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
-    const uint32_t* item_count, const uint32_t* items, const float* input,
+    const uint32_t* item_count, const uint32_t* items, const uint16_t* input,
     const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
     bool per_route_input, uint32_t outputs, uint32_t inputs) {
     constexpr unsigned Warps=8, Columns=64, Groups=Columns/8, Chunk=64, Words=Chunk/2, Stride=Words+4;
     __shared__ uint32_t staged[Columns][Stride];
-    __shared__ const float* rows[Columns];
+    __shared__ const uint16_t* rows[Columns];
     const unsigned item=blockIdx.y;
     if(item>=items[0]) return;
     const unsigned lane=threadIdx.x&31, warp=threadIdx.x>>5;
@@ -413,12 +417,8 @@ __global__ __launch_bounds__(256) void grouped_mxfp8_expert_tiled_kernel(
         for(unsigned index=threadIdx.x;index<Columns*(Words/4);index+=blockDim.x) {
             const unsigned column=index/(Words/4), word=index%(Words/4)*4;
             uint4 packed=make_uint4(0,0,0,0);
-            if(rows[column] && k0+word*2<inputs) {
-                const float4 lo=*reinterpret_cast<const float4*>(rows[column]+k0+word*2);
-                const float4 hi=*reinterpret_cast<const float4*>(rows[column]+k0+word*2+4);
-                packed=make_uint4(pack_bf16(lo.x,lo.y),pack_bf16(lo.z,lo.w),
-                                  pack_bf16(hi.x,hi.y),pack_bf16(hi.z,hi.w));
-            }
+            if(rows[column] && k0+word*2<inputs)
+                packed=*reinterpret_cast<const uint4*>(rows[column]+k0+word*2);
             *reinterpret_cast<uint4*>(&staged[column][word])=packed;
         }
         __syncthreads();
@@ -525,8 +525,8 @@ extern "C" int infer_inkling2_embed(const uint16_t* embedding, const uint32_t* t
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_rms(const float* x, const float* gamma, float* out,
-    uint32_t rows, uint32_t width, float eps, cudaStream_t stream) {
-    rms_kernel<<<rows,256,0,stream>>>(x,gamma,out,width,eps);
+    uint16_t* out_bf16, uint32_t rows, uint32_t width, float eps, cudaStream_t stream) {
+    rms_kernel<<<rows,256,0,stream>>>(x,gamma,out,out_bf16,width,eps);
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_attn_res(const float* const* unused,
@@ -580,7 +580,7 @@ extern "C" int infer_inkling2_router(const float* logits, const float* bias,
     return cudaGetLastError();
 }
 extern "C" int infer_inkling2_capped_swiglu(const float* gate_up,
-    const float* gammas, float* out, uint32_t routes, uint32_t intermediate,
+    const float* gammas, uint16_t* out, uint32_t routes, uint32_t intermediate,
     float gate_cap, float up_cap, cudaStream_t stream) {
     const uint32_t count=routes*intermediate;
     capped_swiglu_kernel<<<(count+255)/256,256,0,stream>>>(gate_up,gammas,out,routes,intermediate,gate_cap,up_cap);
@@ -588,7 +588,7 @@ extern "C" int infer_inkling2_capped_swiglu(const float* gate_up,
 }
 extern "C" int infer_inkling2_grouped_mxfp8_expert(const uint32_t* sorted,
     const uint32_t* item_expert, const uint32_t* item_start, const uint32_t* item_count,
-    const uint32_t* items, uint32_t max_items, const float* input, const uint8_t* weights,
+    const uint32_t* items, uint32_t max_items, const uint16_t* input, const uint8_t* weights,
     const uint8_t* scales, float* out, uint32_t top_k, bool per_route_input, uint32_t outputs,
     uint32_t inputs, bool tiled, uint32_t max_columns, cudaStream_t stream) {
     if(outputs%16 || inputs%32 || !max_items) return cudaErrorInvalidValue;

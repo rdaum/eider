@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -17,17 +18,6 @@ __device__ __forceinline__ std::uint32_t pack_bf16_pair(float low, float high) {
            << 16u);
 }
 
-__device__ __forceinline__ float e2m1_value(std::uint8_t code) {
-    const std::uint32_t magnitude = code & 0x7u;
-    const std::uint32_t exponent = magnitude >> 1u;
-    const std::uint32_t mantissa = magnitude & 1u;
-    const std::uint32_t magnitude_bits = exponent == 0
-        ? mantissa * 0x3f000000u
-        : ((exponent + 126u) << 23u) | (mantissa << 22u);
-    const std::uint32_t sign = static_cast<std::uint32_t>(code & 0x8u) << 28u;
-    return __uint_as_float(sign | magnitude_bits);
-}
-
 __device__ __forceinline__ float e4m3_value(std::uint8_t code) {
     const std::uint32_t sign = static_cast<std::uint32_t>(code & 0x80u) << 24u;
     const std::uint32_t exponent = (code >> 3u) & 0x0fu;
@@ -42,12 +32,19 @@ __device__ __forceinline__ float e4m3_value(std::uint8_t code) {
     return __uint_as_float(sign | ((exponent + 120U) << 23U) | (mantissa << 20U));
 }
 
+// The hardware conversions are exact: every E2M1 and E4M3 value is an F16.
+__device__ __forceinline__ float2 e2m1x2_values(std::uint32_t packed) {
+    std::uint32_t half2;
+    asm("{.reg .b8 byte; cvt.u8.u32 byte, %1; cvt.rn.f16x2.e2m1x2 %0, byte;}"
+        : "=r"(half2) : "r"(packed));
+    return __half22float2(*reinterpret_cast<const __half2*>(&half2));
+}
+
 __device__ __forceinline__ std::uint32_t dequant_pair(
     std::uint8_t packed,
     float scale) {
-    return pack_bf16_pair(
-        e2m1_value(packed & 0x0fu) * scale,
-        e2m1_value(packed >> 4u) * scale);
+    const float2 values = e2m1x2_values(packed);
+    return pack_bf16_pair(values.x * scale, values.y * scale);
 }
 
 __device__ __forceinline__ void mma_m16n8k16(
@@ -406,7 +403,7 @@ template <unsigned Warps, unsigned Groups>
 __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
     const std::uint32_t* __restrict__ sorted, const std::uint32_t* __restrict__ item_expert,
     const std::uint32_t* __restrict__ item_start, const std::uint32_t* __restrict__ item_count,
-    const std::uint32_t* __restrict__ items, const float* __restrict__ input,
+    const std::uint32_t* __restrict__ items, const std::uint16_t* __restrict__ input,
     const std::uint8_t* __restrict__ tiled_weight, const std::uint8_t* __restrict__ tiled_scales,
     const float* __restrict__ global_scales, float* __restrict__ output, unsigned top_k,
     bool per_route_input, unsigned out_features, unsigned in_features) {
@@ -422,7 +419,7 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
     const float global = global_scales[expert];
     __shared__ float partial[Warps][Groups][16 * 8];
     for (unsigned first = 0; first < count; first += Groups * 8) {
-        const float* rows[Groups];
+        const std::uint16_t* rows[Groups];
         #pragma unroll
         for (unsigned g = 0; g < Groups; ++g) {
             const unsigned column = first + g * 8 + row0;
@@ -453,9 +450,10 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
                 if (first + g * 8 >= count) break;
                 unsigned b0 = 0, b1 = 0;
                 if (rows[g]) {
-                    const float* x = rows[g] + k * kTileK + pair;
-                    b0 = pack_bf16_pair(x[0], x[1]);
-                    b1 = pack_bf16_pair(x[8], x[9]);
+                    const auto* x =
+                        reinterpret_cast<const std::uint32_t*>(rows[g] + k * kTileK + pair);
+                    b0 = x[0];
+                    b1 = x[4];
                 }
                 mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b0, b1);
             }
@@ -483,21 +481,45 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_kernel(
     }
 }
 
-// Prefill-sized batches: one CTA computes 16 * Warps output rows for one work
-// item, each warp owning a 16-row tile over the full K. Route activations are
-// staged once per 64-wide K chunk as BF16 pairs, so every weight fragment is
-// decoded once per item and every activation is read once per CTA.
-template <unsigned Warps>
+__device__ __forceinline__ void copy_async_16(void* shared, const void* global, bool valid) {
+    const auto address = static_cast<std::uint32_t>(__cvta_generic_to_shared(shared));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(address), "l"(global), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ float2 e4m3x2_values(std::uint32_t packed) {
+    std::uint32_t half2;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(half2) : "h"(static_cast<std::uint16_t>(packed)));
+    return __half22float2(*reinterpret_cast<const __half2*>(&half2));
+}
+
+// Prefill-sized batches: one CTA computes `Warps` 16-row output tiles for one
+// work item of up to 64 routes, each warp owning one tile over the full K.
+// Each 64-wide K chunk of BF16 route activations, packed weight tiles, and
+// scales is copied to shared memory asynchronously, `Stages - 1` chunks ahead
+// of the MMAs. A warp's four weight tiles per chunk are contiguous, so each
+// lane copies 16 bytes of them.
+template <unsigned Warps, unsigned Stages>
+struct GroupedTiledStage {
+    static constexpr unsigned Chunk = 64, Words = Chunk / 2, Stride = Words + 4;
+    std::uint32_t activations[kGroupColumns][Stride];
+    std::uint8_t weights[Warps][Chunk / kTileK * kPackedTileBytes];
+    std::uint8_t scales[Warps][Chunk / kTileK * kScaleTileBytes];
+};
+
+template <unsigned Warps, unsigned Stages>
 __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_tiled_kernel(
     const std::uint32_t* __restrict__ sorted, const std::uint32_t* __restrict__ item_expert,
     const std::uint32_t* __restrict__ item_start, const std::uint32_t* __restrict__ item_count,
-    const std::uint32_t* __restrict__ items, const float* __restrict__ input,
+    const std::uint32_t* __restrict__ items, const std::uint16_t* __restrict__ input,
     const std::uint8_t* __restrict__ tiled_weight, const std::uint8_t* __restrict__ tiled_scales,
     const float* __restrict__ global_scales, float* __restrict__ output, unsigned top_k,
     bool per_route_input, unsigned out_features, unsigned in_features) {
-    constexpr unsigned Groups = kGroupColumns / 8, Chunk = 64, Words = Chunk / 2, Stride = Words + 4;
-    __shared__ std::uint32_t staged[kGroupColumns][Stride];
-    __shared__ const float* rows[kGroupColumns];
+    using Stage = GroupedTiledStage<Warps, Stages>;
+    constexpr unsigned Groups = kGroupColumns / 8, Chunk = Stage::Chunk, Stride = Stage::Stride;
+    constexpr unsigned ChunkTiles = Chunk / kTileK, Segments = Chunk / 8;
+    __shared__ Stage stages[Stages];
+    __shared__ const std::uint16_t* rows[kGroupColumns];
     const unsigned item = blockIdx.y;
     if (item >= items[0]) return;
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -512,68 +534,79 @@ __global__ __launch_bounds__(Warps * 32) void grouped_w4a16_tiled_kernel(
     }
     const unsigned out_tile = blockIdx.x * Warps + warp;
     const bool active = out_tile * kTileM < out_features;
-    const unsigned tiles = in_features / kTileK;
-    const std::uint8_t* weight =
-        tiled_weight + size_t(expert) * out_features * in_features / 2;
-    const std::uint8_t* scales = tiled_scales + size_t(expert) * out_features * in_features / kTileK;
+    const unsigned tiles = in_features / kTileK, chunks = (in_features + Chunk - 1) / Chunk;
+    const std::uint8_t* weight = tiled_weight + size_t(expert) * out_features * in_features / 2
+        + size_t(out_tile) * tiles * kPackedTileBytes;
+    const std::uint8_t* scales = tiled_scales + size_t(expert) * out_features * in_features / kTileK
+        + size_t(out_tile) * tiles * kScaleTileBytes;
     const float global = global_scales[expert];
-    float d[Groups][4] = {};
     __syncthreads();
-    for (unsigned k0 = 0; k0 < in_features; k0 += Chunk) {
-        // Each thread converts four F32 pairs of one route row.
-        for (unsigned index = threadIdx.x; index < kGroupColumns * (Words / 4); index += blockDim.x) {
-            const unsigned column = index / (Words / 4), word = index % (Words / 4) * 4;
-            uint4 packed = make_uint4(0, 0, 0, 0);
-            if (rows[column] && k0 + word * 2 < in_features) {
-                const float4 lo = *reinterpret_cast<const float4*>(rows[column] + k0 + word * 2);
-                const float4 hi = *reinterpret_cast<const float4*>(rows[column] + k0 + word * 2 + 4);
-                packed = make_uint4(pack_bf16_pair(lo.x, lo.y), pack_bf16_pair(lo.z, lo.w),
-                                    pack_bf16_pair(hi.x, hi.y), pack_bf16_pair(hi.z, hi.w));
-            }
-            *reinterpret_cast<uint4*>(&staged[column][word]) = packed;
+    // Columns past `count` and K past `in_features` are zero-filled.
+    const auto load = [&](unsigned chunk) {
+        if (chunk >= chunks) return;
+        Stage& stage = stages[chunk % Stages];
+        const unsigned k0 = chunk * Chunk;
+        for (unsigned index = threadIdx.x; index < kGroupColumns * Segments; index += blockDim.x) {
+            const unsigned column = index / Segments, segment = index % Segments;
+            const bool valid = rows[column] && k0 + segment * 8 < in_features;
+            copy_async_16(&stage.activations[column][segment * 4],
+                          valid ? rows[column] + k0 + segment * 8 : input, valid);
         }
-        __syncthreads();
-        if (active) {
-            #pragma unroll
-            for (unsigned kt = 0; kt < Chunk / kTileK; ++kt) {
-                const unsigned k = k0 / kTileK + kt;
-                if (k >= tiles) break;
-                const size_t tile = size_t(out_tile) * tiles + k;
-                const auto* w = weight + tile * kPackedTileBytes;
-                const auto* sc = scales + tile * kScaleTileBytes;
-                float s0 = 0.f, s1 = 0.f;
-                if (quad == 0) {
-                    s0 = e4m3_value(sc[row0]) * global;
-                    s1 = e4m3_value(sc[row1]) * global;
-                }
-                s0 = __shfl_sync(0xffffffffu, s0, row0 * 4);
-                s1 = __shfl_sync(0xffffffffu, s1, row0 * 4);
-                const auto a0 = dequant_pair(w[row0 * 8 + quad], s0);
-                const auto a1 = dequant_pair(w[row1 * 8 + quad], s1);
-                const auto a2 = dequant_pair(w[row0 * 8 + quad + 4], s0);
-                const auto a3 = dequant_pair(w[row1 * 8 + quad + 4], s1);
-                // One ldmatrix.x4 loads the K16 B fragments of two groups:
-                // matrices are (group, k 0-7), (group, k 8-15), then group + 1.
-                // Columns past `count` were staged as zeros.
-                const unsigned matrix = lane >> 3;
-                const std::uint32_t* b_row =
-                    staged[(matrix >> 1) * 8 + (lane & 7)] + kt * 8 + (matrix & 1) * 4;
-                #pragma unroll
-                for (unsigned g = 0; g < Groups; g += 2) {
-                    if (g * 8 >= count) break;
-                    std::uint32_t b[4];
-                    const auto address = static_cast<std::uint32_t>(
-                        __cvta_generic_to_shared(b_row + g * 8 * Stride));
-                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                        : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(address));
-                    mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b[0], b[1]);
-                    mma_m16n8k16(d[g + 1][0], d[g + 1][1], d[g + 1][2], d[g + 1][3],
-                                 a0, a1, a2, a3, b[2], b[3]);
-                }
-            }
+        if (!active) return;
+        const unsigned tile = chunk * ChunkTiles + lane / (kPackedTileBytes / 16);
+        copy_async_16(&stage.weights[warp][lane * 16],
+                      weight + size_t(tile) * kPackedTileBytes + lane % 8 * 16, tile < tiles);
+        if (lane < ChunkTiles) {
+            const unsigned scale_tile = chunk * ChunkTiles + lane;
+            copy_async_16(&stage.scales[warp][lane * kScaleTileBytes],
+                          scales + size_t(scale_tile) * kScaleTileBytes, scale_tile < tiles);
         }
-        __syncthreads();
+    };
+    #pragma unroll
+    for (unsigned chunk = 0; chunk + 1 < Stages; ++chunk) {
+        load(chunk);
+        asm volatile("cp.async.commit_group;\n");
     }
+    float d[Groups][4] = {};
+    const unsigned matrix = lane >> 3;
+    for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(Stages - 2));
+        __syncthreads();
+        // The stage refilled here was consumed before the barrier above.
+        load(chunk + Stages - 1);
+        asm volatile("cp.async.commit_group;\n");
+        if (!active) continue;
+        const Stage& stage = stages[chunk % Stages];
+        #pragma unroll
+        for (unsigned kt = 0; kt < ChunkTiles; ++kt) {
+            if (chunk * ChunkTiles + kt >= tiles) break;
+            const std::uint8_t* w = stage.weights[warp] + kt * kPackedTileBytes;
+            const std::uint8_t* sc = stage.scales[warp] + kt * kScaleTileBytes;
+            const float2 scale = e4m3x2_values(sc[row0] | std::uint32_t(sc[row1]) << 8);
+            const float s0 = scale.x * global, s1 = scale.y * global;
+            const auto a0 = dequant_pair(w[row0 * 8 + quad], s0);
+            const auto a1 = dequant_pair(w[row1 * 8 + quad], s1);
+            const auto a2 = dequant_pair(w[row0 * 8 + quad + 4], s0);
+            const auto a3 = dequant_pair(w[row1 * 8 + quad + 4], s1);
+            // One ldmatrix.x4 loads the K16 B fragments of two groups:
+            // matrices are (group, k 0-7), (group, k 8-15), then group + 1.
+            const std::uint32_t* b_row =
+                stage.activations[(matrix >> 1) * 8 + (lane & 7)] + kt * 8 + (matrix & 1) * 4;
+            #pragma unroll
+            for (unsigned g = 0; g < Groups; g += 2) {
+                if (g * 8 >= count) break;
+                std::uint32_t b[4];
+                const auto address = static_cast<std::uint32_t>(
+                    __cvta_generic_to_shared(b_row + g * 8 * Stride));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(address));
+                mma_m16n8k16(d[g][0], d[g][1], d[g][2], d[g][3], a0, a1, a2, a3, b[0], b[1]);
+                mma_m16n8k16(d[g + 1][0], d[g + 1][1], d[g + 1][2], d[g + 1][3],
+                             a0, a1, a2, a3, b[2], b[3]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n");
     if (!active) return;
     #pragma unroll
     for (unsigned g = 0; g < Groups; ++g) {
@@ -605,7 +638,7 @@ extern "C" unsigned infer_moe_group_columns() { return kGroupColumns; }
 extern "C" cudaError_t infer_sm121_w4a16_grouped_routes_on_stream(
     const std::uint32_t* sorted, const std::uint32_t* item_expert,
     const std::uint32_t* item_start, const std::uint32_t* item_count,
-    const std::uint32_t* items, unsigned max_items, const float* input,
+    const std::uint32_t* items, unsigned max_items, const std::uint16_t* input,
     const std::uint8_t* tiled_weight, const std::uint8_t* tiled_scales,
     const float* global_scales, float* output, unsigned top_k, bool per_route_input,
     unsigned out_features, unsigned in_features, bool tiled, unsigned max_columns,
@@ -617,7 +650,7 @@ extern "C" cudaError_t infer_sm121_w4a16_grouped_routes_on_stream(
     if (tiled) {
         constexpr unsigned Warps = 8;
         if (in_features % 8) return cudaErrorInvalidValue;
-        grouped_w4a16_tiled_kernel<Warps>
+        grouped_w4a16_tiled_kernel<Warps, 3>
             <<<dim3((out_features / kTileM + Warps - 1) / Warps, max_items), Warps * 32, 0, stream>>>(
                 sorted, item_expert, item_start, item_count, items, input, tiled_weight,
                 tiled_scales, global_scales, output, top_k, per_route_input, out_features,

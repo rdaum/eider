@@ -3,7 +3,10 @@
 //! `[2304, 1152]` over per-route inputs. Both are validated against the
 //! routed batch kernel before timing.
 
-use eider_cuda::{CudaEvent, CudaStream, DeviceBuffer, MoeRouteGroups, Result, Sm121W4A16GateUp};
+use eider_cuda::{
+    CudaEvent, CudaStream, DeviceBuffer, MoeRouteGroups, Result, Sm121W4A16GateUp,
+    format::f32_to_bf16,
+};
 use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -24,7 +27,7 @@ struct GroupedExperts<const OUT: usize, const IN: usize> {
     stop: CudaEvent,
     plan: Sm121W4A16GateUp,
     groups: MoeRouteGroups,
-    input: DeviceBuffer<f32>,
+    input: DeviceBuffer<u16>,
     per_route_input: bool,
     output: DeviceBuffer<f32>,
 }
@@ -73,8 +76,9 @@ impl<const OUT: usize, const IN: usize> GroupedExperts<OUT, IN> {
         let indices = DeviceBuffer::from_host(&ids)?;
         let mut groups = MoeRouteGroups::new(ROUTES, EXPERTS)?;
         groups.group_on_stream(&indices, ROUTES, &stream)?;
+        // BF16-exact inputs, so the F32 reference sees the same values.
         let rows = (0..ROWS * IN)
-            .map(|i| (hash(i, 3) % 61) as f32 / 30.0 - 1.0)
+            .map(|i| (hash(i, 3) % 61) as f32 / 32.0 - 1.0)
             .collect::<Vec<_>>();
         let row_input = DeviceBuffer::from_host(&rows)?;
         // The down projection reads one input per route.
@@ -83,10 +87,11 @@ impl<const OUT: usize, const IN: usize> GroupedExperts<OUT, IN> {
             DeviceBuffer::from_host(
                 &(0..ROUTES)
                     .flat_map(|route| rows[route / TOP_K * IN..][..IN].to_vec())
+                    .map(f32_to_bf16)
                     .collect::<Vec<_>>(),
             )?
         } else {
-            DeviceBuffer::from_host(&rows)?
+            DeviceBuffer::from_host(&rows.iter().map(|&x| f32_to_bf16(x)).collect::<Vec<_>>())?
         };
         let mut expected = DeviceBuffer::zeroed(ROUTES * OUT)?;
         plan.run_batch_f32_prefix_on_stream(

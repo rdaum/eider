@@ -3298,7 +3298,7 @@ unsafe extern "C" {
         item_count: *const u32,
         items: *const u32,
         max_items: u32,
-        input: *const f32,
+        input: *const u16,
         tiled_weight: *const u8,
         weight_scale: *const u8,
         global_scale: *const f32,

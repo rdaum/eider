@@ -25,6 +25,7 @@ unsafe extern "C" {
         x: *const f32,
         gamma: *const f32,
         out: *mut f32,
+        out_bf16: *mut u16,
         rows: u32,
         width: u32,
         eps: f32,
@@ -121,7 +122,7 @@ unsafe extern "C" {
     fn infer_inkling2_capped_swiglu(
         gate_up: *const f32,
         gammas: *const f32,
-        out: *mut f32,
+        out: *mut u16,
         routes: u32,
         intermediate: u32,
         gate_cap: f32,
@@ -135,7 +136,7 @@ unsafe extern "C" {
         item_count: *const u32,
         items: *const u32,
         max_items: u32,
-        input: *const f32,
+        input: *const u16,
         weights: *const u8,
         scales: *const u8,
         out: *mut f32,
@@ -243,15 +244,46 @@ pub fn embed(
 pub fn rms_norm(
     x: &DeviceBuffer<f32>,
     gamma: Option<&DeviceBuffer<f32>>,
+    out: DeviceOutput<'_, f32>,
+    rows: usize,
+    width: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    rms_norm_into(x, gamma, out, None, rows, width, eps, stream)
+}
+
+/// Applies [`rms_norm`] and also writes the same BF16 values as `u16` bits.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_with_bf16(
+    x: &DeviceBuffer<f32>,
+    gamma: Option<&DeviceBuffer<f32>>,
+    out: DeviceOutput<'_, f32>,
+    out_bf16: DeviceOutput<'_, u16>,
+    rows: usize,
+    width: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    rms_norm_into(x, gamma, out, Some(out_bf16), rows, width, eps, stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rms_norm_into(
+    x: &DeviceBuffer<f32>,
+    gamma: Option<&DeviceBuffer<f32>>,
     mut out: DeviceOutput<'_, f32>,
+    mut out_bf16: Option<DeviceOutput<'_, u16>>,
     rows: usize,
     width: usize,
     eps: f32,
     stream: &CudaStream,
 ) -> Result<()> {
     let (rows, width) = launch_dimensions(rows, width)?;
-    if x.len() < rows as usize * width as usize
-        || out.len() < rows as usize * width as usize
+    let len = rows as usize * width as usize;
+    if x.len() < len
+        || out.len() < len
+        || out_bf16.as_ref().is_some_and(|o| o.len() < len)
         || gamma.is_some_and(|g| g.len() != width as usize)
         || !eps.is_finite()
         || eps <= 0.0
@@ -265,6 +297,9 @@ pub fn rms_norm(
                 x.ptr,
                 gamma.map_or(std::ptr::null(), |g| g.ptr),
                 out.buffer_mut().ptr,
+                out_bf16
+                    .as_mut()
+                    .map_or(std::ptr::null_mut(), |o| o.buffer_mut().ptr),
                 rows,
                 width,
                 eps,
@@ -627,7 +662,7 @@ pub fn router(
 pub fn capped_swiglu(
     gate_up: &DeviceBuffer<f32>,
     gammas: &DeviceBuffer<f32>,
-    mut out: DeviceOutput<'_, f32>,
+    mut out: DeviceOutput<'_, u16>,
     routes: usize,
     intermediate: usize,
     gate_cap: f32,
@@ -666,14 +701,14 @@ pub fn capped_swiglu(
 }
 
 /// Runs MXFP8 expert weights `[experts, outputs, inputs]` (E4M3 values with one
-/// E8M0 scale per 32 inputs) for grouped routes. Route `r` reads input row
+/// E8M0 scale per 32 inputs) for grouped BF16 routes. Route `r` reads input row
 /// `r / top_k`, or row `r` with `per_route_input`, and writes BF16-rounded
 /// output row `r`. Decode-sized batches split K across warps; larger batches
 /// stage route activations.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_mxfp8_expert(
     groups: &MoeRouteGroups,
-    input: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<u16>,
     weights: &DeviceBuffer<u8>,
     scales: &DeviceBuffer<u8>,
     mut out: DeviceOutput<'_, f32>,
@@ -1170,6 +1205,48 @@ mod tests {
     }
 
     #[test]
+    fn rms_norm_bf16_copy_matches_f32_output() -> Result<()> {
+        crate::set_cuda_device(0)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let (rows, width) = (3, 300);
+        let x = (0..rows * width)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) / 7.0)
+            .collect::<Vec<_>>();
+        let gamma = (0..width)
+            .map(|i| 0.5 + (i % 11) as f32 / 10.0)
+            .collect::<Vec<_>>();
+        let x_device = DeviceBuffer::from_host(&x)?;
+        let gamma_device = DeviceBuffer::from_host(&gamma)?;
+        let mut out = DeviceBuffer::zeroed(rows * width)?;
+        let mut out_bf16 = DeviceBuffer::<u16>::zeroed(rows * width)?;
+        rms_norm_with_bf16(
+            &x_device,
+            Some(&gamma_device),
+            out.output(),
+            out_bf16.output(),
+            rows,
+            width,
+            1e-6,
+            &stream,
+        )?;
+        let out = out.copy_to_host(&stream)?;
+        let expected = (0..rows * width)
+            .map(|i| {
+                let row = &x[i / width * width..][..width];
+                let inv =
+                    1.0 / (row.iter().map(|v| v * v).sum::<f32>() / width as f32 + 1e-6).sqrt();
+                bf(gamma[i % width] * bf(x[i] * inv))
+            })
+            .collect::<Vec<_>>();
+        close_bf16(&out, &expected, 1e-6)?;
+        let copied = out_bf16.copy_to_host(&stream)?;
+        for (index, (&value, &bits)) in out.iter().zip(copied.iter()).enumerate() {
+            assert_eq!(value.to_bits(), u32::from(bits) << 16, "index {index}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn grouped_mxfp8_experts_match_cpu_for_shared_and_per_route_inputs() -> Result<()> {
         crate::set_cuda_device(0)?;
         let stream = CudaStream::new_non_blocking()?;
@@ -1221,7 +1298,12 @@ mod tests {
             let input = (0..input_rows * inputs)
                 .map(|i| bf(((i * 13 % 29) as f32 - 14.0) / 8.0))
                 .collect::<Vec<_>>();
-            let input_device = DeviceBuffer::from_host(&input)?;
+            let input_device = DeviceBuffer::from_host(
+                &input
+                    .iter()
+                    .map(|&x| crate::format::f32_to_bf16(x))
+                    .collect::<Vec<_>>(),
+            )?;
             let mut output = DeviceBuffer::zeroed(routes * outputs)?;
             grouped_mxfp8_expert(
                 &groups,

@@ -200,11 +200,13 @@ pub struct Inkling2Workspace<'m> {
     message_mlp: DeviceBuffer<f32>,
     mixed_mlp: DeviceBuffer<f32>,
     mlp_normalized: DeviceBuffer<f32>,
+    /// `mlp_normalized` as BF16 bits, the routed experts' input.
+    expert_input: DeviceBuffer<u16>,
     router: DeviceBuffer<f32>,
     routes: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
     expert_gate_up: DeviceBuffer<f32>,
-    expert_hidden: DeviceBuffer<f32>,
+    expert_hidden: DeviceBuffer<u16>,
     expert_down: DeviceBuffer<f32>,
     mlp_projected: DeviceBuffer<f32>,
     mlp_output: DeviceBuffer<f32>,
@@ -386,6 +388,7 @@ impl Inkling2Model {
             message_mlp: rows(h)?,
             mixed_mlp: rows(h)?,
             mlp_normalized: rows(h)?,
+            expert_input: DeviceBuffer::zeroed(capacity * h)?,
             router: rows(c.n_routed_experts)?,
             routes: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
@@ -1218,10 +1221,11 @@ impl Inkling2Model {
             let controller = &layer.controllers.as_ref().expect("core controller").mlp;
             self.mix_controller(w, controller, 3, rows)?;
         }
-        inkling2::rms_norm(
+        inkling2::rms_norm_with_bf16(
             &w.mlp_input,
             Some(&layer.mlp_norm),
             w.mlp_normalized.output(),
+            w.expert_input.output(),
             rows,
             h,
             c.rms_norm_eps,
@@ -1310,7 +1314,7 @@ impl Inkling2Model {
         match &layer.mlp.storage {
             ExpertStorage::Nvfp4(experts) => experts.gate_up.run_route_groups_on_stream(
                 &w.groups,
-                &w.mlp_normalized,
+                &w.expert_input,
                 w.expert_gate_up.output(),
                 routes,
                 false,
@@ -1318,7 +1322,7 @@ impl Inkling2Model {
             )?,
             ExpertStorage::Mxfp8(experts) => inkling2::grouped_mxfp8_expert(
                 &w.groups,
-                &w.mlp_normalized,
+                &w.expert_input,
                 &experts.gate_up.values,
                 &experts.gate_up.scales,
                 w.expert_gate_up.output(),
