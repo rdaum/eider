@@ -240,6 +240,192 @@ extern "C" cudaError_t infer_causal_sink_attention(
     return cudaGetLastError();
 }
 
+namespace flash {
+constexpr unsigned Rows=64, Keys=64, Dim=128, KeyStride=Dim+8, ValueStride=Keys+8;
+constexpr float Scale=0.08838834764831845f, Log2e=1.4426950408889634f, Ln2=0.6931471805599453f;
+
+__device__ __forceinline__ uint32_t pack(float low, float high) {
+    const __nv_bfloat162 pair=__floats2bfloat162_rn(low,high);
+    return *reinterpret_cast<const uint32_t*>(&pair);
+}
+
+__device__ __forceinline__ void mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float quad_max(float x) {
+    x=fmaxf(x,__shfl_xor_sync(0xffffffff,x,1));
+    return fmaxf(x,__shfl_xor_sync(0xffffffff,x,2));
+}
+
+__device__ __forceinline__ float quad_sum(float x) {
+    x+=__shfl_xor_sync(0xffffffff,x,1);
+    return x+__shfl_xor_sync(0xffffffff,x,2);
+}
+}
+
+// Tensor-core prompt attention for Inkling's relative-bias, LSE-sink-gated
+// heads. Each block owns 64 queries of one head and streams 64-key BF16
+// tiles from the cache (`token < end`) or the chunk's own K/V. Scores and
+// softmax statistics stay in F32; probabilities enter the PV product as BF16.
+// The sink gate is applied in the epilogue, so no partials are written.
+template <bool Paged>
+__global__ void __launch_bounds__(128) relative_flash_attention(
+    const float* q, const __nv_bfloat16* ck, const __nv_bfloat16* cv,
+    const __nv_bfloat16* const* pages, uint32_t layer_offset, const float* k, const float* v,
+    const float* relative, const float* gate, const float* sinks, float* out, uint32_t end,
+    const uint32_t* position, uint32_t rows, uint32_t qheads, uint32_t kvheads,
+    uint32_t capacity, uint32_t rel_extent) {
+    using namespace flash;
+    __shared__ __align__(16) __nv_bfloat16 keys[Keys*KeyStride];
+    // Values are stored transposed, [dimension][key], for the PV B operand.
+    __shared__ __align__(16) __nv_bfloat16 values[Dim*ValueStride];
+    const unsigned lane=threadIdx.x%32, warp=threadIdx.x/32, g=lane/4, t=lane%4;
+    const unsigned head=blockIdx.x, kvhead=head/(qheads/kvheads);
+    const unsigned block_first=blockIdx.y*Rows;
+    if(position) end=position[0];
+    const unsigned row_of[2]={block_first+warp*16+g, block_first+warp*16+g+8};
+    const size_t width=size_t(kvheads)*Dim;
+
+    uint32_t query[8][4];
+    #pragma unroll
+    for(unsigned kk=0;kk<8;++kk) {
+        #pragma unroll
+        for(unsigned half=0;half<2;++half) {
+            #pragma unroll
+            for(unsigned r=0;r<2;++r) {
+                const unsigned row=row_of[r], col=kk*16+half*8+2*t;
+                float2 x=make_float2(0.f,0.f);
+                if(row<rows) x=*reinterpret_cast<const float2*>(q+(size_t(row)*qheads+head)*Dim+col);
+                query[kk][half*2+r]=pack(x.x,x.y);
+            }
+        }
+    }
+
+    const unsigned last_row=min(block_first+Rows,rows)-1;
+    const uint64_t first_position=uint64_t(end)+block_first;
+    const uint64_t stop=uint64_t(end)+last_row+1;
+    const uint64_t start=first_position+1>capacity ? first_position+1-capacity : 0;
+    float acc[16][4]={}, mx[2]={-INFINITY,-INFINITY}, total[2]={};
+    for(uint64_t tile=start;tile<stop;tile+=Keys) {
+        for(unsigned item=threadIdx.x;item<Keys*Dim/8;item+=blockDim.x) {
+            const unsigned key=item/(Dim/8), col=item%(Dim/8)*8;
+            const uint64_t token=tile+key;
+            uint4 kx=make_uint4(0,0,0,0), vx=kx;
+            if(token<stop) {
+                if(token<end) {
+                    const size_t row=Paged ? (token&127) : token%capacity;
+                    const __nv_bfloat16* pk=Paged ? pages[token>>7]+layer_offset : ck;
+                    const __nv_bfloat16* pv=Paged ? pk+128*width : cv;
+                    kx=*reinterpret_cast<const uint4*>(pk+row*width+kvhead*Dim+col);
+                    vx=*reinterpret_cast<const uint4*>(pv+row*width+kvhead*Dim+col);
+                } else {
+                    const size_t base=(token-end)*width+kvhead*Dim+col;
+                    const float4 k0=*reinterpret_cast<const float4*>(k+base);
+                    const float4 k1=*reinterpret_cast<const float4*>(k+base+4);
+                    const float4 v0=*reinterpret_cast<const float4*>(v+base);
+                    const float4 v1=*reinterpret_cast<const float4*>(v+base+4);
+                    kx=make_uint4(pack(k0.x,k0.y),pack(k0.z,k0.w),pack(k1.x,k1.y),pack(k1.z,k1.w));
+                    vx=make_uint4(pack(v0.x,v0.y),pack(v0.z,v0.w),pack(v1.x,v1.y),pack(v1.z,v1.w));
+                }
+            }
+            *reinterpret_cast<uint4*>(keys+key*KeyStride+col)=kx;
+            const __nv_bfloat16* vs=reinterpret_cast<const __nv_bfloat16*>(&vx);
+            #pragma unroll
+            for(unsigned i=0;i<8;++i) values[(col+i)*ValueStride+key]=vs[i];
+        }
+        __syncthreads();
+
+        float score[8][4]={};
+        #pragma unroll
+        for(unsigned kk=0;kk<8;++kk) {
+            #pragma unroll
+            for(unsigned n=0;n<8;++n) {
+                const __nv_bfloat16* base=keys+(n*8+g)*KeyStride+kk*16+2*t;
+                mma(score[n],query[kk],*reinterpret_cast<const uint32_t*>(base),
+                    *reinterpret_cast<const uint32_t*>(base+8));
+            }
+        }
+        float tile_max[2]={-INFINITY,-INFINITY};
+        #pragma unroll
+        for(unsigned n=0;n<8;++n) {
+            #pragma unroll
+            for(unsigned e=0;e<4;++e) {
+                const unsigned row=row_of[e/2];
+                const uint64_t token=tile+n*8+2*t+e%2, query_position=uint64_t(end)+row;
+                float x=-INFINITY;
+                if(row<rows && token<=query_position && query_position-token<capacity) {
+                    x=score[n][e]*Scale;
+                    const uint64_t distance=query_position-token;
+                    if(distance<rel_extent)
+                        x+=relative[(size_t(row)*qheads+head)*rel_extent+distance];
+                    x*=Log2e;
+                }
+                score[n][e]=x;
+                tile_max[e/2]=fmaxf(tile_max[e/2],x);
+            }
+        }
+        float keep[2], base_max[2];
+        #pragma unroll
+        for(unsigned r=0;r<2;++r) {
+            const float next=fmaxf(mx[r],quad_max(tile_max[r]));
+            base_max[r]=next==-INFINITY ? 0.f : next;
+            keep[r]=exp2f(mx[r]-base_max[r]);
+            mx[r]=next;
+            total[r]*=keep[r];
+        }
+        #pragma unroll
+        for(unsigned n=0;n<8;++n) {
+            #pragma unroll
+            for(unsigned e=0;e<4;++e) {
+                score[n][e]=exp2f(score[n][e]-base_max[e/2]);
+                total[e/2]+=score[n][e];
+            }
+        }
+        #pragma unroll
+        for(unsigned n=0;n<16;++n) {
+            #pragma unroll
+            for(unsigned e=0;e<4;++e) acc[n][e]*=keep[e/2];
+        }
+        #pragma unroll
+        for(unsigned kk=0;kk<4;++kk) {
+            const uint32_t p[4]={pack(score[2*kk][0],score[2*kk][1]),
+                pack(score[2*kk][2],score[2*kk][3]),pack(score[2*kk+1][0],score[2*kk+1][1]),
+                pack(score[2*kk+1][2],score[2*kk+1][3])};
+            #pragma unroll
+            for(unsigned n=0;n<16;++n) {
+                const __nv_bfloat16* base=values+(n*8+g)*ValueStride+kk*16+2*t;
+                mma(acc[n],p,*reinterpret_cast<const uint32_t*>(base),
+                    *reinterpret_cast<const uint32_t*>(base+8));
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for(unsigned r=0;r<2;++r) {
+        const unsigned row=row_of[r];
+        const float sum=quad_sum(total[r]);
+        if(row>=rows) continue;
+        const size_t index=size_t(row)*qheads+head;
+        const float lse=(mx[r]+log2f(sum))*Ln2;
+        const float sink=1.f/(1.f+expf(-(lse-sinks[index])));
+        #pragma unroll
+        for(unsigned n=0;n<16;++n) {
+            #pragma unroll
+            for(unsigned e=0;e<2;++e) {
+                const unsigned col=n*8+2*t+e;
+                const float gated=acc[n][r*2+e]/sum*sink/(1.f+expf(-gate[index*Dim+col]));
+                out[index*Dim+col]=__bfloat162float(__float2bfloat16_rn(gated));
+            }
+        }
+    }
+}
+
 template <bool Paged>
 cudaError_t relative_attention(
     const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
@@ -252,6 +438,14 @@ cudaError_t relative_attention(
     // A device position replaces `end` at execution time; `end_bound` then
     // bounds the partitions so a captured launch stays valid as it grows.
     const uint64_t extent=position ? uint64_t(end_bound) : uint64_t(end)+rows;
+    if(rows>=flash::Rows) {
+        relative_flash_attention<Paged><<<dim3(qheads,(rows+flash::Rows-1)/flash::Rows),128,0,stream>>>(
+            q,ck,cv,pages,layer_offset,k,v,relative,gate,sinks,out,end,position,rows,qheads,
+            kvheads,capacity,rel_extent);
+        append_kv<Paged><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
+            k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,PageTokens,position);
+        return cudaGetLastError();
+    }
     for(uint32_t first=0;first<rows;) {
         const uint32_t splits=(min(extent,uint64_t(capacity))+255)/256;
         const uint64_t per_row=uint64_t(qheads)*splits*130;

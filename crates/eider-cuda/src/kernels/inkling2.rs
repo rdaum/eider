@@ -845,6 +845,18 @@ mod tests {
         f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) & 0xffff0000)
     }
 
+    /// Allows one BF16 rounding step of the expected value plus `floor`.
+    fn close_bf16(actual: &[f32], expected: &[f32], floor: f32) -> Result<()> {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= floor + expected.abs() / 128.0,
+                "index {index}: actual {actual}, expected {expected}"
+            );
+        }
+        Ok(())
+    }
+
     fn close(actual: &[f32], expected: &[f32], tolerance: f32) -> Result<()> {
         assert_eq!(actual.len(), expected.len());
         for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -1402,11 +1414,16 @@ mod tests {
             Ok(outputs)
         };
         let expected = run(&mut SinkAttentionWorkspace::new(1, heads, 256)?, &[1; 113])?;
-        // The large workspace uses the multi-query prefill kernel for 70 rows;
-        // the small one evaluates every chunk in one-row groups.
+        // Chunks of 64 or more rows use the tensor-core kernel, whose BF16
+        // queries and probabilities differ from the F32 row path by rounding.
         let chunked = run(&mut SinkAttentionWorkspace::new(128, heads, 256)?, &chunks)?;
-        let grouped = run(&mut SinkAttentionWorkspace::new(1, heads, 256)?, &chunks)?;
-        close(&chunked, &expected, 2e-5)?;
+        close_bf16(&chunked, &expected, 1e-3)?;
+        // A 60-row chunk keeps the row-grouped kernel, which a one-row
+        // workspace evaluates in one-row groups with identical arithmetic.
+        let grouped = run(
+            &mut SinkAttentionWorkspace::new(1, heads, 256)?,
+            &[3, 60, 50],
+        )?;
         close(&grouped, &expected, 0.0)?;
 
         // Global pages have no window: compare with a ring holding all rows.
@@ -1464,7 +1481,7 @@ mod tests {
             paged.extend_from_slice(&out.copy_to_host(&stream)?);
             first += rows;
         }
-        close(&paged, &full, 2e-5)?;
+        close_bf16(&paged, &full, 1e-3)?;
         Ok(())
     }
 }
