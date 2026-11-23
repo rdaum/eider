@@ -5,7 +5,7 @@
 
 use eider_cuda::{
     CudaEvent, CudaStream, DeviceBuffer, MoeRouteGroups, Result, Sm121W4A16GateUp,
-    format::f32_to_bf16,
+    format::{bf16_to_f32, f32_to_bf16},
 };
 use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
@@ -29,7 +29,7 @@ struct GroupedExperts<const OUT: usize, const IN: usize> {
     groups: MoeRouteGroups,
     input: DeviceBuffer<u16>,
     per_route_input: bool,
-    output: DeviceBuffer<f32>,
+    output: DeviceBuffer<u16>,
 }
 
 impl<const OUT: usize, const IN: usize> BenchContext for GroupedExperts<OUT, IN> {
@@ -113,7 +113,12 @@ impl<const OUT: usize, const IN: usize> GroupedExperts<OUT, IN> {
             output: DeviceBuffer::zeroed(ROUTES * OUT)?,
         };
         bench.run()?;
-        let actual = bench.output.copy_to_host(&bench.stream)?;
+        let actual = bench
+            .output
+            .copy_to_host(&bench.stream)?
+            .iter()
+            .map(|&bits| bf16_to_f32(bits))
+            .collect::<Vec<_>>();
         let expected = expected.copy_to_host(&bench.stream)?;
         for (index, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
             if (a - e).abs() > 0.02 * e.abs().max(1.0) {

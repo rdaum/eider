@@ -829,15 +829,15 @@ impl Sm121W4A16GateUp {
     }
 
     /// Runs every grouped route of a routed batch over BF16 inputs, decoding
-    /// each expert tile once per work item of routes. `routes` route rows are
-    /// written as BF16 values in F32 storage. Route `r` reads input row
+    /// each expert tile once per work item of routes, and writes `routes` BF16
+    /// route rows. Route `r` reads input row
     /// `r / top_k`, or row `r` with `per_route_input`. Decode-sized batches split K across warps;
     /// larger batches stage route activations and tile 128 output rows per CTA.
     pub fn run_route_groups_on_stream(
         &self,
         groups: &MoeRouteGroups,
         input: &DeviceBuffer<u16>,
-        mut output: DeviceOutput<'_, f32>,
+        mut output: DeviceOutput<'_, u16>,
         routes: usize,
         per_route_input: bool,
         stream: &CudaStream,
@@ -1436,7 +1436,14 @@ mod tests {
         let expected = expected.copy_to_host(&stream)?.to_vec();
         let mut groups = MoeRouteGroups::new(routes, 3)?;
         groups.group_on_stream(&indices, routes, &stream)?;
-        let mut output = DeviceBuffer::zeroed(routes * out_features)?;
+        let mut output = DeviceBuffer::<u16>::zeroed(routes * out_features)?;
+        let host = |output: &DeviceBuffer<u16>| -> Result<Vec<f32>> {
+            Ok(output
+                .copy_to_host(&stream)?
+                .iter()
+                .map(|&bits| bf16_to_f32(bits))
+                .collect())
+        };
         experts.run_route_groups_on_stream(
             &groups,
             &input_bf16,
@@ -1445,12 +1452,12 @@ mod tests {
             false,
             &stream,
         )?;
-        close(&output.copy_to_host(&stream)?, &expected);
+        close(&host(&output)?, &expected);
         // Fewer routes select the decode-sized split-K variant.
         let few = TILED_ROUTES - top_k;
         let mut few_groups = MoeRouteGroups::new(few, 3)?;
         few_groups.group_on_stream(&indices, few, &stream)?;
-        output.copy_from_host(&vec![0.0; routes * out_features])?;
+        output.copy_from_host(&vec![0; routes * out_features])?;
         experts.run_route_groups_on_stream(
             &few_groups,
             &input_bf16,
@@ -1460,7 +1467,7 @@ mod tests {
             &stream,
         )?;
         assert_eq!(
-            &output.copy_to_host(&stream)?[..few * out_features],
+            &host(&output)?[..few * out_features],
             &expected[..few * out_features]
         );
         // At most eight rows select the 16-warp single-group variant. These ids
@@ -1468,7 +1475,7 @@ mod tests {
         let narrow = 8 * top_k;
         let mut narrow_groups = MoeRouteGroups::new(narrow, 3)?;
         narrow_groups.group_on_stream(&indices, narrow, &stream)?;
-        output.copy_from_host(&vec![0.0; routes * out_features])?;
+        output.copy_from_host(&vec![0; routes * out_features])?;
         experts.run_route_groups_on_stream(
             &narrow_groups,
             &input_bf16,
@@ -1478,7 +1485,7 @@ mod tests {
             &stream,
         )?;
         close(
-            &output.copy_to_host(&stream)?[..narrow * out_features],
+            &host(&output)?[..narrow * out_features],
             &expected[..narrow * out_features],
         );
         let per_route = DeviceBuffer::from_host(
@@ -1495,7 +1502,7 @@ mod tests {
             true,
             &stream,
         )?;
-        close(&output.copy_to_host(&stream)?, &expected);
+        close(&host(&output)?, &expected);
         Ok(())
     }
 

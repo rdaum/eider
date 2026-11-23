@@ -120,7 +120,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn infer_inkling2_capped_swiglu(
-        gate_up: *const f32,
+        gate_up: *const u16,
         gammas: *const f32,
         out: *mut u16,
         routes: u32,
@@ -139,7 +139,7 @@ unsafe extern "C" {
         input: *const u16,
         weights: *const u8,
         scales: *const u8,
-        out: *mut f32,
+        out: *mut u16,
         top_k: u32,
         per_route_input: bool,
         outputs: u32,
@@ -158,7 +158,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn infer_inkling2_routed_sum(
-        routes: *const f32,
+        routes: *const u16,
         out: *mut f32,
         rows: u32,
         top_k: u32,
@@ -657,10 +657,11 @@ pub fn router(
     }
 }
 
-/// Applies Inkling's interleaved capped SwiGLU and per-route gamma before down.
+/// Applies Inkling's interleaved capped SwiGLU to BF16 gate/up rows and the
+/// per-route gamma before down, writing BF16.
 #[allow(clippy::too_many_arguments)]
 pub fn capped_swiglu(
-    gate_up: &DeviceBuffer<f32>,
+    gate_up: &DeviceBuffer<u16>,
     gammas: &DeviceBuffer<f32>,
     mut out: DeviceOutput<'_, u16>,
     routes: usize,
@@ -702,8 +703,8 @@ pub fn capped_swiglu(
 
 /// Runs MXFP8 expert weights `[experts, outputs, inputs]` (E4M3 values with one
 /// E8M0 scale per 32 inputs) for grouped BF16 routes. Route `r` reads input row
-/// `r / top_k`, or row `r` with `per_route_input`, and writes BF16-rounded
-/// output row `r`. Decode-sized batches split K across warps; larger batches
+/// `r / top_k`, or row `r` with `per_route_input`, and writes BF16 output row
+/// `r`. Decode-sized batches split K across warps; larger batches
 /// stage route activations.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_mxfp8_expert(
@@ -711,7 +712,7 @@ pub fn grouped_mxfp8_expert(
     input: &DeviceBuffer<u16>,
     weights: &DeviceBuffer<u8>,
     scales: &DeviceBuffer<u8>,
-    mut out: DeviceOutput<'_, f32>,
+    mut out: DeviceOutput<'_, u16>,
     routes: usize,
     top_k: usize,
     outputs: usize,
@@ -809,9 +810,9 @@ pub fn bf16_matvec(
     }
 }
 
-/// Sums already gamma-weighted routed down outputs for each row.
+/// Sums already gamma-weighted BF16 routed down outputs for each row.
 pub fn routed_sum(
-    routes: &DeviceBuffer<f32>,
+    routes: &DeviceBuffer<u16>,
     mut out: DeviceOutput<'_, f32>,
     rows: usize,
     top_k: usize,
@@ -1304,7 +1305,14 @@ mod tests {
                     .map(|&x| crate::format::f32_to_bf16(x))
                     .collect::<Vec<_>>(),
             )?;
-            let mut output = DeviceBuffer::zeroed(routes * outputs)?;
+            let mut output = DeviceBuffer::<u16>::zeroed(routes * outputs)?;
+            let host = |output: &DeviceBuffer<u16>| -> Result<Vec<f32>> {
+                Ok(output
+                    .copy_to_host(&stream)?
+                    .iter()
+                    .map(|&bits| crate::format::bf16_to_f32(bits))
+                    .collect())
+            };
             grouped_mxfp8_expert(
                 &groups,
                 &input_device,
@@ -1331,7 +1339,7 @@ mod tests {
                     expected.push(bf(w.iter().zip(x).map(|(a, b)| a * b).sum::<f32>()));
                 }
             }
-            close(&output.copy_to_host(&stream)?, &expected, 0.05)?;
+            close(&host(&output)?, &expected, 0.05)?;
             // Eight rows select the single-group kernel; these ids repeat
             // experts within a token, so its items still loop.
             let narrow = 8 * top_k;
@@ -1351,7 +1359,7 @@ mod tests {
                 &stream,
             )?;
             close(
-                &output.copy_to_host(&stream)?[..narrow * outputs],
+                &host(&output)?[..narrow * outputs],
                 &expected[..narrow * outputs],
                 0.05,
             )?;
@@ -1373,7 +1381,7 @@ mod tests {
                 &stream,
             )?;
             close(
-                &output.copy_to_host(&stream)?[..few * outputs],
+                &host(&output)?[..few * outputs],
                 &expected[..few * outputs],
                 0.05,
             )?;

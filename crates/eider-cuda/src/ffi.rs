@@ -3302,7 +3302,7 @@ unsafe extern "C" {
         tiled_weight: *const u8,
         weight_scale: *const u8,
         global_scale: *const f32,
-        output: *mut f32,
+        output: *mut u16,
         top_k: u32,
         per_route_input: bool,
         out_features: u32,

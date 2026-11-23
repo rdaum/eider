@@ -60,8 +60,9 @@ in its epilogue; only shorter chunks materialize the bias. Like the reference's 
 probabilities to BF16. Smaller chunks and decode use the F32 row-grouped
 kernel, whose groups' softmax partials fit the attention workspace. Routed experts are sorted
 by expert on the device; each work item of up to 64 routes decodes an expert
-tile once. Expert inputs are BF16: the MLP norm writes a BF16 copy and capped
-SwiGLU writes BF16. Prefill-sized batches tile 128 output rows per CTA and copy
+tile once. Expert inputs and outputs are BF16: the MLP norm writes a BF16 copy,
+capped SwiGLU reads BF16 gate/up rows and writes BF16, and the routed sum reads
+BF16 down rows. Prefill-sized batches tile 128 output rows per CTA and copy
 each 64-wide K chunk of activations, weight tiles, and scales to shared memory
 asynchronously, two chunks ahead of the MMAs; decode-sized batches split K
 across warps.
@@ -226,7 +227,7 @@ reasoning followed by text. Chunked prefill produced the same greedy tokens as
 single-token prefill for the 26-token prompt. With 1024-token chunks, the
 3527-token prompt prefilled at about 965 tokens/s (3.7 s to the first token)
 before the tensor-core prompt attention; `inkling2_prefill` now measures about
-2230 tokens/s for a 4096-token prompt;
+2400 tokens/s for a 4096-token prompt;
 decode runs at about 25 tokens/s on GB10 (about 24 at a 3.5k-token context).
 Decode is GPU-bound: dense projections, NVFP4 experts, and the LM head read
 about 5 GB of weights per token.

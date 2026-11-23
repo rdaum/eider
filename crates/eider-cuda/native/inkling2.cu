@@ -271,13 +271,14 @@ __global__ void router_kernel(const float* logits, const float* bias, uint32_t* 
         weights[k]=route_scale*expf(selected_logits[k]-maximum)/total;
 }
 
-__global__ void capped_swiglu_kernel(const float* gate_up, const float* gammas,
+__global__ void capped_swiglu_kernel(const uint32_t* gate_up, const float* gammas,
     uint16_t* out, uint32_t routes, uint32_t intermediate,
     float gate_cap, float up_cap) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=routes*intermediate) return;
     const uint32_t route=i/intermediate;
-    const float raw_gate=gate_up[i*2], raw_up=gate_up[i*2+1];
+    const uint32_t pair=gate_up[i];
+    const float raw_gate=__uint_as_float(pair<<16), raw_up=__uint_as_float(pair&0xffff0000u);
     const float gate=gate_cap*tanhf(raw_gate/gate_cap);
     const float up=up_cap*tanhf(raw_up/up_cap);
     out[i]=__bfloat16_as_ushort(__float2bfloat16_rn(
@@ -319,7 +320,7 @@ template<unsigned Warps, unsigned Groups>
 __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
     const uint32_t* item_count, const uint32_t* items, const uint16_t* input,
-    const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
+    const uint8_t* weights, const uint8_t* weight_scales, uint16_t* out, uint32_t top_k,
     bool per_route_input, uint32_t outputs, uint32_t inputs) {
     const unsigned item=blockIdx.y;
     if(item>=items[0]) return;
@@ -377,7 +378,8 @@ __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
             float sum=0.f;
             #pragma unroll
             for(unsigned i=0;i<Warps;++i) sum+=partial[i][g][cell];
-            out[size_t(sorted[start+column])*outputs+blockIdx.x*16+cell/8]=bf(sum);
+            out[size_t(sorted[start+column])*outputs+blockIdx.x*16+cell/8]=
+                __bfloat16_as_ushort(__float2bfloat16_rn(sum));
         }
         __syncthreads();
     }
@@ -389,7 +391,7 @@ __global__ __launch_bounds__(Warps*32) void grouped_mxfp8_expert_kernel(
 __global__ __launch_bounds__(256) void grouped_mxfp8_expert_tiled_kernel(
     const uint32_t* sorted, const uint32_t* item_expert, const uint32_t* item_start,
     const uint32_t* item_count, const uint32_t* items, const uint16_t* input,
-    const uint8_t* weights, const uint8_t* weight_scales, float* out, uint32_t top_k,
+    const uint8_t* weights, const uint8_t* weight_scales, uint16_t* out, uint32_t top_k,
     bool per_route_input, uint32_t outputs, uint32_t inputs) {
     constexpr unsigned Warps=8, Columns=64, Groups=Columns/8, Chunk=64, Words=Chunk/2, Stride=Words+4;
     __shared__ uint32_t staged[Columns][Stride];
@@ -452,9 +454,9 @@ __global__ __launch_bounds__(256) void grouped_mxfp8_expert_tiled_kernel(
         for(unsigned half=0;half<2;++half) {
             const unsigned column=g*8+quad*2+half;
             if(column>=count) continue;
-            float* o=out+size_t(sorted[start+column])*outputs+tile*16;
-            o[row0]=bf(d[g][half]);
-            o[row1]=bf(d[g][2+half]);
+            uint16_t* o=out+size_t(sorted[start+column])*outputs+tile*16;
+            o[row0]=__bfloat16_as_ushort(__float2bfloat16_rn(d[g][half]));
+            o[row1]=__bfloat16_as_ushort(__float2bfloat16_rn(d[g][2+half]));
         }
     }
 }
@@ -501,13 +503,14 @@ __global__ __launch_bounds__(256) void bf16_matvec_kernel(const float* __restric
     }
 }
 
-__global__ void routed_sum_kernel(const float* routes, float* out, uint32_t rows,
+__global__ void routed_sum_kernel(const uint16_t* routes, float* out, uint32_t rows,
                                   uint32_t top_k, uint32_t hidden) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=rows*hidden) return;
     const uint32_t row=i/hidden, c=i%hidden;
     float sum=0;
-    for(uint32_t k=0;k<top_k;++k) sum+=routes[(size_t(row)*top_k+k)*hidden+c];
+    for(uint32_t k=0;k<top_k;++k)
+        sum+=__uint_as_float(uint32_t(routes[(size_t(row)*top_k+k)*hidden+c])<<16);
     out[i]=sum;
 }
 
@@ -579,7 +582,7 @@ extern "C" int infer_inkling2_router(const float* logits, const float* bias,
     router_kernel<<<rows,32,0,stream>>>(logits,bias,ids,weights,experts,route_scale);
     return cudaGetLastError();
 }
-extern "C" int infer_inkling2_capped_swiglu(const float* gate_up,
+extern "C" int infer_inkling2_capped_swiglu(const uint32_t* gate_up,
     const float* gammas, uint16_t* out, uint32_t routes, uint32_t intermediate,
     float gate_cap, float up_cap, cudaStream_t stream) {
     const uint32_t count=routes*intermediate;
@@ -589,7 +592,7 @@ extern "C" int infer_inkling2_capped_swiglu(const float* gate_up,
 extern "C" int infer_inkling2_grouped_mxfp8_expert(const uint32_t* sorted,
     const uint32_t* item_expert, const uint32_t* item_start, const uint32_t* item_count,
     const uint32_t* items, uint32_t max_items, const uint16_t* input, const uint8_t* weights,
-    const uint8_t* scales, float* out, uint32_t top_k, bool per_route_input, uint32_t outputs,
+    const uint8_t* scales, uint16_t* out, uint32_t top_k, bool per_route_input, uint32_t outputs,
     uint32_t inputs, bool tiled, uint32_t max_columns, cudaStream_t stream) {
     if(outputs%16 || inputs%32 || !max_items) return cudaErrorInvalidValue;
     if(tiled) {
@@ -613,7 +616,7 @@ extern "C" int infer_inkling2_bf16_matvec(const float* x, const uint16_t* weight
     bf16_matvec_kernel<8><<<(outputs+7)/8,256,0,stream>>>(x,weight,y,rows,outputs,inputs);
     return cudaGetLastError();
 }
-extern "C" int infer_inkling2_routed_sum(const float* routes, float* out,
+extern "C" int infer_inkling2_routed_sum(const uint16_t* routes, float* out,
     uint32_t rows, uint32_t top_k, uint32_t hidden, cudaStream_t stream) {
     routed_sum_kernel<<<(rows*hidden+255)/256,256,0,stream>>>(routes,out,rows,top_k,hidden);
     return cudaGetLastError();
