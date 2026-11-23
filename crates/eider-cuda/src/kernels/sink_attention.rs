@@ -70,6 +70,8 @@ unsafe extern "C" {
         layer_offset: u32,
         k: *const f32,
         v: *const f32,
+        rel: *const f32,
+        projection: *const u16,
         relative: *const f32,
         gate: *const f32,
         sinks: *const f32,
@@ -393,6 +395,22 @@ pub struct ReplayPosition<'a> {
     pub end_bound: usize,
 }
 
+/// Chunks of at least this many rows project the relative bias inside the
+/// tensor-core attention kernel; shorter chunks project it into scratch first.
+pub const RELATIVE_FLASH_ROWS: usize = 64;
+
+/// Inkling's relative-distance bias inputs.
+pub struct RelativeBias<'a> {
+    /// Clipped `[rows, heads, 16]` relative queries.
+    pub r: &'a DeviceBuffer<f32>,
+    /// BF16 `[16, extent]` distance projection.
+    pub projection: &'a DeviceBuffer<u16>,
+    /// `[rows, heads, extent]` projected bias, used below [`RELATIVE_FLASH_ROWS`].
+    pub scratch: &'a mut DeviceBuffer<f32>,
+    /// Distances that receive a bias.
+    pub extent: usize,
+}
+
 /// K/V storage read and appended by relative attention.
 pub enum RelativeKv<'a> {
     /// A bounded local ring that tracks its own position.
@@ -615,15 +633,15 @@ impl SinkAttentionWorkspace {
         q: &DeviceBuffer<f32>,
         k: &DeviceBuffer<f32>,
         v: &DeviceBuffer<f32>,
-        relative: &DeviceBuffer<f32>,
+        bias: RelativeBias<'_>,
         gate: &DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
         out: &mut DeviceBuffer<f32>,
-        rel_extent: usize,
         rows: usize,
         replay: Option<ReplayPosition<'_>>,
         stream: &CudaStream,
     ) -> Result<()> {
+        let rel_extent = bias.extent;
         let (position, kv_heads, capacity) = match &kv {
             RelativeKv::Ring(cache) => (cache.position, cache.kv_heads, cache.capacity),
             RelativeKv::Pages {
@@ -642,7 +660,9 @@ impl SinkAttentionWorkspace {
             || out.len() < rows * self.heads * 128
             || k.len() < rows * kv_heads * 128
             || v.len() < rows * kv_heads * 128
-            || relative.len() < rows * self.heads * rel_extent
+            || bias.r.len() < rows * self.heads * 16
+            || bias.projection.len() != 16 * rel_extent
+            || (rows < RELATIVE_FLASH_ROWS && bias.scratch.len() < rows * self.heads * rel_extent)
             || gate.len() < rows * self.heads * 128
             || sinks.len() < rows * self.heads
             || rel_extent == 0
@@ -656,6 +676,17 @@ impl SinkAttentionWorkspace {
             })
         {
             return Err(invalid("relative attention buffer or capacity mismatch"));
+        }
+        if rows < RELATIVE_FLASH_ROWS {
+            super::inkling2::relative_projection(
+                bias.r,
+                bias.projection,
+                bias.scratch.output(),
+                rows,
+                self.heads,
+                rel_extent,
+                stream,
+            )?;
         }
         let (ck, cv, pages, layer_offset) = match &kv {
             RelativeKv::Ring(cache) => (cache.key.ptr, cache.value.ptr, std::ptr::null(), 0),
@@ -681,7 +712,9 @@ impl SinkAttentionWorkspace {
                     layer_offset,
                     k.ptr,
                     v.ptr,
-                    relative.ptr,
+                    bias.r.ptr,
+                    bias.projection.ptr,
+                    bias.scratch.ptr,
                     gate.ptr,
                     sinks.ptr,
                     self.partial.ptr,

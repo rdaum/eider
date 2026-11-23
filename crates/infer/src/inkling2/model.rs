@@ -14,9 +14,10 @@ use super::sequence::{
 use super::weights::{Controller, ExpertStorage, ShortConvolution, Weights};
 use eider_cuda::{
     CudaGraphExec, CudaStream, DeviceBuffer, F32DenseGemm, GemmPrecision, MoeRouteGroups,
-    PinnedHostBuffer, RelativeKv, ReplayPosition, Result, SinkAttentionCache, SinkAttentionRewind,
-    SinkAttentionWorkspace, add_f32_prefix_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, inkling2, round_f32_to_bf16_prefix_in_place_on_stream,
+    PinnedHostBuffer, RELATIVE_FLASH_ROWS, RelativeBias, RelativeKv, ReplayPosition, Result,
+    SinkAttentionCache, SinkAttentionRewind, SinkAttentionWorkspace, add_f32_prefix_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream, inkling2,
+    round_f32_to_bf16_prefix_in_place_on_stream,
 };
 use seqcache::AppendReservation;
 use std::path::Path;
@@ -374,7 +375,10 @@ impl Inkling2Model {
             q_clipped: rows(q)?,
             r_clipped: rows(c.num_attention_heads * c.d_rel)?,
             v_normalized: rows(kv)?,
-            relative: rows(c.num_attention_heads * c.rel_extent)?,
+            // Only chunks below the flash-attention threshold materialize the bias.
+            relative: DeviceBuffer::zeroed(
+                capacity.min(RELATIVE_FLASH_ROWS - 1) * c.num_attention_heads * c.rel_extent,
+            )?,
             attention_raw: rows(q)?,
             attention_projected: rows(h)?,
             attention_output: rows(h)?,
@@ -1133,15 +1137,6 @@ impl Inkling2Model {
             c.rms_norm_eps,
             stream,
         )?;
-        inkling2::relative_projection(
-            &w.r_clipped,
-            &a.rel_projection,
-            w.relative.output(),
-            rows,
-            c.num_attention_heads,
-            c.rel_extent,
-            stream,
-        )?;
         if verify && let Some(ring) = state.cache.as_mut() {
             w.verify
                 .as_mut()
@@ -1164,11 +1159,15 @@ impl Inkling2Model {
             &w.q_clipped,
             &w.k_clipped,
             &w.v_normalized,
-            &w.relative,
+            RelativeBias {
+                r: &w.r_clipped,
+                projection: &a.rel_projection,
+                scratch: &mut w.relative,
+                extent: c.rel_extent,
+            },
             &w.gate,
             &w.sinks,
             &mut w.attention_raw,
-            c.rel_extent,
             rows,
             replay.map(|end_bound| ReplayPosition {
                 position: &s.device_position,

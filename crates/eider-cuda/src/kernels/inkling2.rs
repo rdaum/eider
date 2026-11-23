@@ -838,7 +838,9 @@ pub fn finish_logits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeviceAddress, RelativeKv, SinkAttentionCache, SinkAttentionWorkspace};
+    use crate::{
+        DeviceAddress, RelativeBias, RelativeKv, SinkAttentionCache, SinkAttentionWorkspace,
+    };
 
     fn bf(x: f32) -> f32 {
         let bits = x.to_bits();
@@ -1309,21 +1311,35 @@ mod tests {
         let sinks = DeviceBuffer::zeroed(2)?;
         let mut out = DeviceBuffer::zeroed(2 * 128)?;
         let v1 = DeviceBuffer::from_host(&vec![1.0; 128])?;
-        let r1 = DeviceBuffer::from_host(
-            &(0..8)
-                .map(|i| if i == 0 { 1.0 } else { 0.0 })
-                .collect::<Vec<_>>(),
-        )?;
+        // Projection dimension 0 biases distance 0 and dimension 1 distance 1;
+        // head 1 has a zero R row and so no bias.
+        let mut projection = vec![0u16; 16 * 4];
+        projection[0] = 0x3f80;
+        projection[4 + 1] = 0x3f80;
+        let projection = DeviceBuffer::from_host(&projection)?;
+        let mut scratch = DeviceBuffer::zeroed(2 * 4)?;
+        let unit = |dimension: usize| {
+            DeviceBuffer::from_host(
+                &(0..32)
+                    .map(|i| if i == dimension { 1.0 } else { 0.0 })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let r1 = unit(0)?;
         workspace.run_relative(
             RelativeKv::Ring(&mut cache),
             &query,
             &key,
             &v1,
-            &r1,
+            RelativeBias {
+                r: &r1,
+                projection: &projection,
+                scratch: &mut scratch,
+                extent: 4,
+            },
             &gate,
             &sinks,
             &mut out,
-            4,
             1,
             None,
             &stream,
@@ -1331,21 +1347,21 @@ mod tests {
         let first = [vec![bf(0.5 / (1.0 + (-1f32).exp())); 128], vec![0.25; 128]].concat();
         close(&out.copy_to_host(&stream)?, &first, 0.0001)?;
         let v2 = DeviceBuffer::from_host(&vec![2.0; 128])?;
-        let r2 = DeviceBuffer::from_host(
-            &(0..8)
-                .map(|i| if i == 1 { 1.0 } else { 0.0 })
-                .collect::<Vec<_>>(),
-        )?;
+        let r2 = unit(1)?;
         workspace.run_relative(
             RelativeKv::Ring(&mut cache),
             &query,
             &key,
             &v2,
-            &r2,
+            RelativeBias {
+                r: &r2,
+                projection: &projection,
+                scratch: &mut scratch,
+                extent: 4,
+            },
             &gate,
             &sinks,
             &mut out,
-            4,
             1,
             None,
             &stream,
@@ -1382,7 +1398,13 @@ mod tests {
         let q = rows_for(1, total, heads * 128);
         let k = rows_for(2, total, 128);
         let v = rows_for(3, total, 128);
-        let rel = rows_for(4, total, heads * extent);
+        let rel = rows_for(4, total, heads * 16);
+        let projection = DeviceBuffer::from_host(
+            &rows_for(7, 16, extent)
+                .iter()
+                .map(|x| (x.to_bits() >> 16) as u16)
+                .collect::<Vec<_>>(),
+        )?;
         let gate = rows_for(5, total, heads * 128);
         let sinks = rows_for(6, total, heads);
         let slice = |values: &[f32], width: usize, first: usize, rows: usize| {
@@ -1399,11 +1421,15 @@ mod tests {
                     &slice(&q, heads * 128, first, rows)?,
                     &slice(&k, 128, first, rows)?,
                     &slice(&v, 128, first, rows)?,
-                    &slice(&rel, heads * extent, first, rows)?,
+                    RelativeBias {
+                        r: &slice(&rel, heads * 16, first, rows)?,
+                        projection: &projection,
+                        scratch: &mut DeviceBuffer::zeroed(rows * heads * extent)?,
+                        extent,
+                    },
                     &slice(&gate, heads * 128, first, rows)?,
                     &slice(&sinks, heads, first, rows)?,
                     &mut out,
-                    extent,
                     rows,
                     None,
                     &stream,
@@ -1438,11 +1464,15 @@ mod tests {
                     &slice(&q, heads * 128, first, 1)?,
                     &slice(&k, 128, first, 1)?,
                     &slice(&v, 128, first, 1)?,
-                    &slice(&rel, heads * extent, first, 1)?,
+                    RelativeBias {
+                        r: &slice(&rel, heads * 16, first, 1)?,
+                        projection: &projection,
+                        scratch: &mut DeviceBuffer::zeroed(heads * extent)?,
+                        extent,
+                    },
                     &slice(&gate, heads * 128, first, 1)?,
                     &slice(&sinks, heads, first, 1)?,
                     &mut out,
-                    extent,
                     1,
                     None,
                     &stream,
@@ -1469,11 +1499,15 @@ mod tests {
                 &slice(&q, heads * 128, first, rows)?,
                 &slice(&k, 128, first, rows)?,
                 &slice(&v, 128, first, rows)?,
-                &slice(&rel, heads * extent, first, rows)?,
+                RelativeBias {
+                    r: &slice(&rel, heads * 16, first, rows)?,
+                    projection: &projection,
+                    scratch: &mut DeviceBuffer::zeroed(rows * heads * extent)?,
+                    extent,
+                },
                 &slice(&gate, heads * 128, first, rows)?,
                 &slice(&sinks, heads, first, rows)?,
                 &mut out,
-                extent,
                 rows,
                 None,
                 &stream,

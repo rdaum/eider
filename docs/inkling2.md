@@ -53,9 +53,10 @@ convolution history, so each visit processes every chunk row before the next
 visit starts. Dense projections are BF16 GEMMs over the chunk; attention reads
 earlier chunk rows directly and appends the chunk to its cache afterwards.
 Chunks of 64 or more rows use a tensor-core flash-attention kernel: each block
-streams 64-key BF16 tiles for 64 queries of one head, adds the relative bias
-and causal/window masks to F32 scores, and applies the output and LSE sink
-gates in its epilogue. Like the reference's attention, it rounds queries and
+streams 64-key BF16 tiles for 64 queries of one head, projects the relative
+bias per score from R and the tile's projection columns, adds it and the
+causal/window masks to F32 scores, and applies the output and LSE sink gates
+in its epilogue; only shorter chunks materialize the bias. Like the reference's attention, it rounds queries and
 probabilities to BF16. Smaller chunks and decode use the F32 row-grouped
 kernel, whose groups' softmax partials fit the attention workspace. Routed experts are sorted
 by expert on the device; each work item of up to 64 routes decodes an expert
@@ -222,7 +223,7 @@ reasoning followed by text. Chunked prefill produced the same greedy tokens as
 single-token prefill for the 26-token prompt. With 1024-token chunks, the
 3527-token prompt prefilled at about 965 tokens/s (3.7 s to the first token)
 before the tensor-core prompt attention; `inkling2_prefill` now measures about
-1610 tokens/s for a 4096-token prompt;
+1860 tokens/s for a 4096-token prompt;
 decode runs at about 25 tokens/s on GB10 (about 24 at a 3.5k-token context).
 Decode is GPU-bound: dense projections, NVFP4 experts, and the LM head read
 about 5 GB of weights per token.

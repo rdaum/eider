@@ -241,7 +241,11 @@ extern "C" cudaError_t infer_causal_sink_attention(
 }
 
 namespace flash {
-constexpr unsigned Rows=64, Keys=64, Dim=128, KeyStride=Dim+8, ValueStride=Keys+8;
+// K and V tiles are [key][dimension]; the padded stride keeps fragment reads
+// and ldmatrix rows on distinct banks.
+constexpr unsigned Rows=64, Keys=64, Dim=128, KeyStride=Dim+8;
+// Relative bias: R has 16 dimensions; a tile spans Rows+Keys-1 distances.
+constexpr unsigned RelDim=16, Distances=Rows+Keys-1, BiasStride=RelDim+8;
 constexpr float Scale=0.08838834764831845f, Log2e=1.4426950408889634f, Ln2=0.6931471805599453f;
 
 __device__ __forceinline__ uint32_t pack(float low, float high) {
@@ -255,6 +259,17 @@ __device__ __forceinline__ void mma(float* c, const uint32_t* a, uint32_t b0, ui
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// B fragments of two adjacent 8-dimension tiles for 16 keys of a [key][dim]
+// tile: {b0,b1} of dimensions `dim`..+7, then of `dim`+8..+15.
+__device__ __forceinline__ void value_fragments(const __nv_bfloat16* tile, unsigned key,
+                                                unsigned dim, uint32_t* b) {
+    const unsigned lane=threadIdx.x%32, matrix=lane/8;
+    const __nv_bfloat16* row=tile+(key+(matrix&1)*8+lane%8)*KeyStride+dim+(matrix>>1)*8;
+    const uint32_t address=static_cast<uint32_t>(__cvta_generic_to_shared(row));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(address));
 }
 
 __device__ __forceinline__ float quad_max(float x) {
@@ -272,18 +287,21 @@ __device__ __forceinline__ float quad_sum(float x) {
 // heads. Each block owns 64 queries of one head and streams 64-key BF16
 // tiles from the cache (`token < end`) or the chunk's own K/V. Scores and
 // softmax statistics stay in F32; probabilities enter the PV product as BF16.
-// The sink gate is applied in the epilogue, so no partials are written.
+// The relative bias is projected per score from R and the tile's projection
+// columns with the arithmetic of `rel_projection_kernel`. The sink gate is
+// applied in the epilogue, so no partials are written.
 template <bool Paged>
 __global__ void __launch_bounds__(128) relative_flash_attention(
     const float* q, const __nv_bfloat16* ck, const __nv_bfloat16* cv,
     const __nv_bfloat16* const* pages, uint32_t layer_offset, const float* k, const float* v,
-    const float* relative, const float* gate, const float* sinks, float* out, uint32_t end,
-    const uint32_t* position, uint32_t rows, uint32_t qheads, uint32_t kvheads,
-    uint32_t capacity, uint32_t rel_extent) {
+    const float* rel, const uint16_t* projection, const float* gate, const float* sinks,
+    float* out, uint32_t end, const uint32_t* position, uint32_t rows, uint32_t qheads,
+    uint32_t kvheads, uint32_t capacity, uint32_t rel_extent) {
     using namespace flash;
+    // Projection columns for this tile's distances, [distance - base][dimension].
+    __shared__ __align__(16) uint16_t bias_columns[Distances*BiasStride];
     __shared__ __align__(16) __nv_bfloat16 keys[Keys*KeyStride];
-    // Values are stored transposed, [dimension][key], for the PV B operand.
-    __shared__ __align__(16) __nv_bfloat16 values[Dim*ValueStride];
+    __shared__ __align__(16) __nv_bfloat16 values[Keys*KeyStride];
     const unsigned lane=threadIdx.x%32, warp=threadIdx.x/32, g=lane/4, t=lane%4;
     const unsigned head=blockIdx.x, kvhead=head/(qheads/kvheads);
     const unsigned block_first=blockIdx.y*Rows;
@@ -304,6 +322,14 @@ __global__ void __launch_bounds__(128) relative_flash_attention(
                 query[kk][half*2+r]=pack(x.x,x.y);
             }
         }
+    }
+
+    float r_row[2][RelDim];
+    #pragma unroll
+    for(unsigned r=0;r<2;++r) {
+        #pragma unroll
+        for(unsigned d=0;d<RelDim;++d)
+            r_row[r][d]=row_of[r]<rows ? rel[(size_t(row_of[r])*qheads+head)*RelDim+d] : 0.f;
     }
 
     const unsigned last_row=min(block_first+Rows,rows)-1;
@@ -334,9 +360,15 @@ __global__ void __launch_bounds__(128) relative_flash_attention(
                 }
             }
             *reinterpret_cast<uint4*>(keys+key*KeyStride+col)=kx;
-            const __nv_bfloat16* vs=reinterpret_cast<const __nv_bfloat16*>(&vx);
-            #pragma unroll
-            for(unsigned i=0;i<8;++i) values[(col+i)*ValueStride+key]=vs[i];
+            *reinterpret_cast<uint4*>(values+key*KeyStride+col)=vx;
+        }
+        // Distances in this tile are first_position - tile - (Keys-1) + j.
+        const int64_t base=int64_t(first_position)-int64_t(tile)-int64_t(Keys-1);
+        for(unsigned item=threadIdx.x;item<Distances*RelDim;item+=blockDim.x) {
+            const unsigned d=item/Distances, j=item%Distances;
+            const int64_t distance=base+j;
+            bias_columns[j*BiasStride+d]=distance>=0 && distance<int64_t(rel_extent)
+                ? projection[size_t(d)*rel_extent+distance] : 0;
         }
         __syncthreads();
 
@@ -361,8 +393,19 @@ __global__ void __launch_bounds__(128) relative_flash_attention(
                 if(row<rows && token<=query_position && query_position-token<capacity) {
                     x=score[n][e]*Scale;
                     const uint64_t distance=query_position-token;
-                    if(distance<rel_extent)
-                        x+=relative[(size_t(row)*qheads+head)*rel_extent+distance];
+                    if(distance<rel_extent) {
+                        const unsigned j=row-block_first+Keys-1-(n*8+2*t+e%2);
+                        const uint4* column=reinterpret_cast<const uint4*>(bias_columns+j*BiasStride);
+                        const uint4 low=column[0], high=column[1];
+                        const uint32_t words[8]={low.x,low.y,low.z,low.w,high.x,high.y,high.z,high.w};
+                        float bias=0.f;
+                        #pragma unroll
+                        for(unsigned d=0;d<RelDim;++d) {
+                            const uint32_t bits=(words[d/2]>>(16*(d%2)))<<16;
+                            bias=__fmaf_rn(r_row[e/2][d],__uint_as_float(bits),bias);
+                        }
+                        x+=__bfloat162float(__float2bfloat16_rn(bias));
+                    }
                     x*=Log2e;
                 }
                 score[n][e]=x;
@@ -397,10 +440,11 @@ __global__ void __launch_bounds__(128) relative_flash_attention(
                 pack(score[2*kk][2],score[2*kk][3]),pack(score[2*kk+1][0],score[2*kk+1][1]),
                 pack(score[2*kk+1][2],score[2*kk+1][3])};
             #pragma unroll
-            for(unsigned n=0;n<16;++n) {
-                const __nv_bfloat16* base=values+(n*8+g)*ValueStride+kk*16+2*t;
-                mma(acc[n],p,*reinterpret_cast<const uint32_t*>(base),
-                    *reinterpret_cast<const uint32_t*>(base+8));
+            for(unsigned n=0;n<16;n+=2) {
+                uint32_t b[4];
+                value_fragments(values,kk*16,n*8,b);
+                mma(acc[n],p,b[0],b[1]);
+                mma(acc[n+1],p,b[2],b[3]);
             }
         }
         __syncthreads();
@@ -429,19 +473,19 @@ __global__ void __launch_bounds__(128) relative_flash_attention(
 template <bool Paged>
 cudaError_t relative_attention(
     const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
-    uint32_t layer_offset, const float* k, const float* v, const float* relative,
-    const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
-    const uint32_t* position, uint32_t end_bound, uint32_t rows, uint32_t qheads,
-    uint32_t kvheads, uint32_t capacity, uint32_t rel_extent, uint64_t partial_capacity,
-    cudaStream_t stream) {
+    uint32_t layer_offset, const float* k, const float* v, const float* rel,
+    const uint16_t* projection, const float* relative, const float* gate, const float* sinks,
+    float* partial, float* out, uint32_t end, const uint32_t* position, uint32_t end_bound,
+    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
+    uint64_t partial_capacity, cudaStream_t stream) {
     constexpr uint32_t PageTokens=128;
     // A device position replaces `end` at execution time; `end_bound` then
     // bounds the partitions so a captured launch stays valid as it grows.
     const uint64_t extent=position ? uint64_t(end_bound) : uint64_t(end)+rows;
     if(rows>=flash::Rows) {
         relative_flash_attention<Paged><<<dim3(qheads,(rows+flash::Rows-1)/flash::Rows),128,0,stream>>>(
-            q,ck,cv,pages,layer_offset,k,v,relative,gate,sinks,out,end,position,rows,qheads,
-            kvheads,capacity,rel_extent);
+            q,ck,cv,pages,layer_offset,k,v,rel,projection,gate,sinks,out,end,position,rows,
+            qheads,kvheads,capacity,rel_extent);
         append_kv<Paged><<<(size_t(rows)*kvheads*128+255)/256,256,0,stream>>>(
             k,v,ck,cv,end,rows,kvheads*128,capacity,pages,layer_offset,PageTokens,position);
         return cudaGetLastError();
@@ -477,19 +521,20 @@ cudaError_t relative_attention(
 // unbounded; otherwise they live in a `capacity`-position local ring.
 extern "C" cudaError_t infer_causal_relative_attention(
     const float* q, __nv_bfloat16* ck, __nv_bfloat16* cv, __nv_bfloat16* const* pages,
-    uint32_t layer_offset, const float* k, const float* v, const float* relative,
-    const float* gate, const float* sinks, float* partial, float* out, uint32_t end,
-    const uint32_t* position, uint32_t end_bound, uint32_t rows, uint32_t qheads,
-    uint32_t kvheads, uint32_t capacity, uint32_t rel_extent, uint64_t partial_capacity,
-    cudaStream_t stream) {
-    if(!q || !k || !v || !relative || !gate || !sinks || !partial || !out || !rel_extent || !rows
-        || (pages ? (ck || cv) : (!ck || !cv))) return cudaErrorInvalidValue;
+    uint32_t layer_offset, const float* k, const float* v, const float* rel,
+    const uint16_t* projection, const float* relative, const float* gate, const float* sinks,
+    float* partial, float* out, uint32_t end, const uint32_t* position, uint32_t end_bound,
+    uint32_t rows, uint32_t qheads, uint32_t kvheads, uint32_t capacity, uint32_t rel_extent,
+    uint64_t partial_capacity, cudaStream_t stream) {
+    if(!q || !k || !v || !rel || !projection || !relative || !gate || !sinks || !partial || !out
+        || !rel_extent || !rows || (pages ? (ck || cv) : (!ck || !cv))) return cudaErrorInvalidValue;
     if(pages)
-        return relative_attention<true>(q,nullptr,nullptr,pages,layer_offset,k,v,relative,gate,
-            sinks,partial,out,end,position,end_bound,rows,qheads,kvheads,UINT32_MAX,rel_extent,
-            partial_capacity,stream);
-    return relative_attention<false>(q,ck,cv,nullptr,0,k,v,relative,gate,sinks,partial,out,end,
-        position,end_bound,rows,qheads,kvheads,capacity,rel_extent,partial_capacity,stream);
+        return relative_attention<true>(q,nullptr,nullptr,pages,layer_offset,k,v,rel,projection,
+            relative,gate,sinks,partial,out,end,position,end_bound,rows,qheads,kvheads,UINT32_MAX,
+            rel_extent,partial_capacity,stream);
+    return relative_attention<false>(q,ck,cv,nullptr,0,k,v,rel,projection,relative,gate,sinks,
+        partial,out,end,position,end_bound,rows,qheads,kvheads,capacity,rel_extent,
+        partial_capacity,stream);
 }
 
 // Page bundles hold [global layer][K/V][page token][KV head][dimension].
